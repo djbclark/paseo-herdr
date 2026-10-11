@@ -1,0 +1,6 @@
+{
+  "id": "herdr-harness",
+  "requirements": {
+    "paseo": ">=0.11.1"
+  }
+}
