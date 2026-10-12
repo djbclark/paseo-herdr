@@ -63,8 +63,9 @@ export function lastTurnEndOf(chain: readonly OmpSessionEntry[]): NativeTurnEnd 
     const entry = chain[index];
     if (entry.type !== "message") continue;
     const message = entry.message;
-    if (!message || typeof message !== "object" || message.role !== "assistant") continue;
-    return mapStopReason(message.stopReason);
+    if (!message || typeof message !== "object") continue;
+    if (message.role === "user" || message.role === "toolResult") return undefined;
+    if (message.role === "assistant") return mapStopReason(message.stopReason);
   }
   return undefined;
 }
@@ -73,5 +74,29 @@ function mapStopReason(stopReason: unknown): NativeTurnEnd {
   if (typeof stopReason !== "string") return "unknown";
   if (stopReason === "aborted") return "aborted";
   if (stopReason === "error") return "error";
-  return "completed";
+  return stopReason === "stop" || stopReason === "length" ? "completed" : "unknown";
+}
+
+export function turnStateOf(chain: readonly OmpSessionEntry[]): "idle" | "working" | "unknown" {
+  for (let index = chain.length - 1; index >= 0; index--) {
+    const entry = chain[index];
+    if (entry.type !== "message" || !entry.message) continue;
+    const message = entry.message;
+    if (message.role === "user" || message.role === "toolResult") return "working";
+    if (message.role === "assistant") {
+      const end = mapStopReason(message.stopReason);
+      return end === "unknown" ? (message.stopReason === "toolUse" ? "working" : "unknown") : "idle";
+    }
+  }
+  return "idle";
+}
+
+export function lastTurnEndIdOf(chain: readonly OmpSessionEntry[]): string | undefined {
+  for (let index = chain.length - 1; index >= 0; index--) {
+    const entry = chain[index];
+    if (entry.type !== "message" || !entry.message) continue;
+    if (entry.message.role === "user" || entry.message.role === "toolResult") return undefined;
+    if (entry.message.role === "assistant") return entry.id;
+  }
+  return undefined;
 }

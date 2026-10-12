@@ -5,6 +5,8 @@ import type {
   TranscriptSnapshot,
 } from "../server/harness/types.js";
 import type { AgentSessionRef } from "../server/herdr/schema.js";
+import { classifyHerdrPrompt } from "../server/prompt.js";
+import type { NativeTurnEnd } from "../server/harness/types.js";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 
 /**
@@ -20,11 +22,15 @@ export interface FakeTranscriptEntry {
   id: string;
   kind: "user" | "assistant";
   text: string;
+  end?: NativeTurnEnd;
 }
 
 /** A mutable in-memory transcript shared with a FakeHerdr `agent.list` reply. */
 export class FakeTranscript {
   private entries: FakeTranscriptEntry[] = [];
+  readonly listeners = new Set<() => void>();
+  get lastEntry(): FakeTranscriptEntry | undefined { return this.entries.at(-1); }
+  notify(): void { for (const listener of this.listeners) listener(); }
   readonly nativeSessionKey = "fake-session-1";
 
   set(entries: FakeTranscriptEntry[]): void {
@@ -57,23 +63,44 @@ export function makeFakeAdapter(transcript?: FakeTranscript): HarnessAdapter {
     resolveTranscript: async (ref) =>
       ref?.kind === "id" ? { path: `memory://${ref.value}`, nativeSessionKey: ref.value } : null,
     nativeSessionKey: (ref) => ref.value,
-    openTranscript: (locator: TranscriptLocator): TranscriptReader => ({
-      async snapshot(): Promise<TranscriptSnapshot> {
-        const items = store.items;
-        const timestamps: Record<string, string> = {};
-        for (const item of items) timestamps[item.id] = "";
-        return {
-          items,
-          timestamps,
-          chainHead: items.at(-1)?.id ?? null,
-          chainIds: items.map((item) => item.id),
-          extendsPrevious: (previous: TranscriptSnapshot) =>
-            previous.chainIds.length === 0 ||
-            previous.chainIds.every((id, i) => items[i]?.id === id),
-        };
-      },
-      close() {},
-    }),
+    openTranscript: (locator: TranscriptLocator): TranscriptReader & { notify(): void } => {
+      const listeners = store.listeners;
+      return {
+        async snapshot(): Promise<TranscriptSnapshot> {
+          const items = store.items;
+          const timestamps: Record<string, string> = {};
+          for (const item of items) timestamps[item.id] = "";
+          return {
+            items,
+            timestamps,
+            turnState: !store.lastEntry || store.lastEntry.kind === "assistant" ? "idle" : "working",
+            ...(store.lastEntry?.kind === "assistant" ? { lastTurnEnd: store.lastEntry.end ?? "completed", lastTurnEndId: store.lastEntry.id } : {}),
+            chainHead: items.at(-1)?.id ?? null,
+            chainIds: items.map((item) => item.id),
+            extendsPrevious: (previous: TranscriptSnapshot) =>
+              previous.chainIds.length === 0 ||
+              previous.chainIds.every((id, i) => items[i]?.id === id),
+          };
+        },
+        subscribe(listener: () => void): () => void {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        notify(): void {
+          for (const listener of listeners) listener();
+        },
+        close() {},
+      };
+    },
+    inspectInput: async ({ pid }) => ({ pid, instanceId: "fake-instance" }),
+    submitPrompt: async (target, text, ctx) => {
+      const binding = { harness: FAKE_HARNESS_ID, terminalId: target.terminalId, sessionRef: target.ref,
+        herdrSession: null, agentName: null, cwd: "/work", submittedMessages: {} };
+      try {
+        const result = await ctx.request("agent.prompt", { target: target.paneId, text }, { signal: ctx.signal });
+        return classifyHerdrPrompt(result, undefined, binding);
+      } catch (error) { return classifyHerdrPrompt(undefined, error, binding); }
+    },
     interruptKeys: ["ctrl+c"],
     promptWhileWorking: "reject",
     launchArgs: () => [],

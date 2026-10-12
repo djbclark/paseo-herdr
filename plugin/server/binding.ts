@@ -20,6 +20,7 @@ export interface Binding {
   sessionRef: AgentSessionRef | null;
   cwd: string;
   submittedMessages: Record<string, string>;
+  occupant?: { pid: number; tty: string | null; instanceId: string };
 }
 
 /** The `{kind, value}` session identity from a wire agent (strips `source`/`agent`). */
@@ -59,6 +60,7 @@ export function persistenceOf(binding: Binding): ProviderPersistence {
       sessionRef: binding.sessionRef ? { kind: binding.sessionRef.kind, value: binding.sessionRef.value } : null,
       cwd: binding.cwd,
       submittedMessages: capSubmittedMessages(binding.submittedMessages),
+      ...(binding.occupant ? { occupant: binding.occupant } : {}),
     },
   };
 }
@@ -73,6 +75,7 @@ export function parseBinding(persistence: ProviderPersistence, adapter: HarnessA
     cwd: z.string(),
     sessionRef: z.object({ kind: z.enum(["path", "id"]), value: z.string().min(1) }).nullable(),
     submittedMessages: z.record(z.string(), z.string()).default({}),
+    occupant: z.object({ pid: z.number().int().positive(), tty: z.string().nullable(), instanceId: z.string().min(1) }).optional(),
   }).parse(persistence.data);
   if (parsed.harness !== adapter.id) throw new Error("Herdr session belongs to another harness");
   return {
@@ -83,6 +86,7 @@ export function parseBinding(persistence: ProviderPersistence, adapter: HarnessA
     sessionRef: parsed.sessionRef ? { kind: parsed.sessionRef.kind, value: parsed.sessionRef.value } : null,
     cwd: parsed.cwd,
     submittedMessages: capSubmittedMessages(parsed.submittedMessages),
+    ...(parsed.occupant ? { occupant: parsed.occupant } : {}),
   };
 }
 

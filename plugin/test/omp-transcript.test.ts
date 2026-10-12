@@ -84,7 +84,6 @@ describe("OMP adapter replay", () => {
       { id: "omp:key1:e2:assistant_message:0", type: "assistant_message", text: "hi there" },
       { id: "omp:key1:e3:user_message:0", type: "user_message", text: "bye" },
     ]);
-    expect(snapshot.lastTurnEnd).toBe("completed");
     expect(snapshot.title).toBe("Old title");
   });
 
@@ -150,17 +149,17 @@ describe("OMP adapter replay", () => {
       "user_message",
       "reasoning",
       "tool_call",
-      "tool_call",
       "assistant_message",
     ]);
     const reasoning = items.find((item) => item.type === "reasoning");
     expect(reasoning && "text" in reasoning && reasoning.text).toBe("planning");
-    // running + completed tool rows share the stable :tool:<callId> id; the
-    // core diff (Map keyed by id) keeps the terminal (completed) state.
+    // The running and completed tool rows share the stable :tool:<callId> id;
+    // mapping keeps only the terminal (completed) state, so the live diff never
+    // re-emits a superseded running row.
     const toolRows = items.filter((item) => item.type === "tool_call");
-    expect(toolRows).toHaveLength(2);
-    expect(toolRows.every((item) => item.id === `omp:key1:tool:${callId}`)).toBe(true);
-    expect(toolRows.at(-1)).toMatchObject({ status: "completed" });
+    expect(toolRows).toHaveLength(1);
+    expect(toolRows[0].id).toBe(`omp:key1:m2:tool:${callId}`);
+    expect(toolRows[0]).toMatchObject({ status: "completed" });
     expect(snapshot.lastTurnEnd).toBe("completed");
   });
 

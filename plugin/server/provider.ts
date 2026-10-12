@@ -7,7 +7,7 @@ import {
   type ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
 import type { HarnessAdapter } from "./harness/types.js";
-import { HerdrClient, checkHerdrStatus } from "./herdr/client.js";
+import { HerdrClient, checkHerdrStatus, type SubscriptionDescriptor } from "./herdr/client.js";
 import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
 import { parseBinding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
@@ -34,9 +34,14 @@ export function createHerdrProvider(
       try {
         const herdr = await client();
         const result = await checkHerdrStatus(herdr, adapter.herdrIntegration);
-        return result.available
-          ? { available: true, diagnostic: result.diagnostic }
-          : { available: false, diagnostic: result.diagnostic ?? "Herdr unavailable" };
+        if (!result.available) return { available: false, diagnostic: result.diagnostic ?? "Herdr unavailable" };
+        // Import still works read-only without the companion, so the provider stays available.
+        let companion: { ok: boolean; diagnostic?: string } | undefined;
+        try { companion = await adapter.inputCompanionStatus?.(); }
+        catch (error) { companion = { ok: false, diagnostic: `Input companion check failed: ${String(error)}` }; }
+        return companion && !companion.ok
+          ? { available: true, diagnostic: companion.diagnostic }
+          : { available: true, diagnostic: result.diagnostic };
       } catch (error) {
         return { available: false, diagnostic: `Herdr unavailable: ${String(error)}` };
       }
@@ -57,6 +62,8 @@ export function createHerdrProvider(
         listAgents: (signal?: AbortSignal) => list(signal),
         request: (method: string, params: Record<string, unknown> = {}, options?: { signal?: AbortSignal }) =>
           client().then((herdr) => herdr.request(method, params, options)),
+        subscribe: (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) =>
+          client().then((herdr) => herdr.subscribe(subscriptions, options)),
         emit,
         getHerdrSession: hooks.getHerdrSession,
       });
@@ -82,6 +89,7 @@ export function createHerdrProvider(
             try {
               await session.open(input.config, input.history, input.requestId);
             } catch (error) {
+              session.close();
               sessions.delete(input.sessionId);
               throw error;
             }
@@ -91,6 +99,12 @@ export function createHerdrProvider(
             const session = sessions.get(input.sessionId);
             if (!session) throw new Error("Unknown session");
             await session.prompt(input.prompt);
+            return;
+          }
+          case "session.interrupt": {
+            const session = sessions.get(input.sessionId);
+            if (!session) throw new Error("Unknown session");
+            await session.interrupt(input.requestId);
             return;
           }
           case "session.close":

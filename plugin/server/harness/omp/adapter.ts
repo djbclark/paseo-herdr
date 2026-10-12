@@ -7,8 +7,10 @@ import type {
 import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import type { PaneProcessInfo } from "../../herdr/schema.js";
 import { FileTail } from "../../file-tail.js";
-import { activeChain, lastTurnEndOf, parseOmpEntries, titleOf } from "./transcript.js";
+import { inspectOmpInput, submitOmpInput } from "./input.js";
+import { activeChain, lastTurnEndOf, lastTurnEndIdOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
+import { companionInstallStatus } from "./companion-install.js";
 
 /**
  * OMP adapter. OMP (oh-my-pi) is the only harness that reports a transcript
@@ -26,7 +28,6 @@ export const ompAdapter: HarnessAdapter = {
   openTranscript: (locator: TranscriptLocator): TranscriptReader => {
     const namespace = `omp:${locator.nativeSessionKey}`;
     const tail = new FileTail(locator.path);
-    let lastSnapshot: TranscriptSnapshot | null = null;
     return {
       async snapshot(): Promise<TranscriptSnapshot> {
         const { lines, updatedAt, exists } = await tail.snapshot();
@@ -35,22 +36,24 @@ export const ompAdapter: HarnessAdapter = {
             items: [],
             timestamps: {},
             updatedAt,
+            turnState: "idle",
             chainHead: null,
             chainIds: [],
             extendsPrevious: () => true,
           };
-          lastSnapshot = empty;
           return empty;
         }
         const entries = parseOmpEntries(lines);
         const chain = activeChain(entries);
         const { items, timestamps } = mapChainToProviderItems(chain, namespace);
-        const chainIds = items.map((item) => item.id);
+        const chainIds = chain.flatMap((entry) => typeof entry.id === "string" ? [entry.id] : []);
         const snapshot: TranscriptSnapshot = {
           items,
           timestamps,
           ...(titleOf(entries) ? { title: titleOf(entries) } : {}),
           updatedAt,
+          turnState: turnStateOf(chain),
+          lastTurnEndId: lastTurnEndIdOf(chain),
           chainHead: chainIds.at(-1) ?? null,
           chainIds,
           ...(lastTurnEndOf(chain) ? { lastTurnEnd: lastTurnEndOf(chain) } : {}),
@@ -59,14 +62,18 @@ export const ompAdapter: HarnessAdapter = {
             (chainIds.length >= previous.chainIds.length &&
               previous.chainIds.every((id, index) => chainIds[index] === id)),
         };
-        lastSnapshot = snapshot;
         return snapshot;
       },
       close(): void {
         tail.close();
       },
+      subscribe(listener: () => void): () => void {
+        return tail.subscribe(listener);
+      },
     };
   },
+  inspectInput: ({ pid, ref }, signal) => inspectOmpInput(pid, ref, signal),
+  submitPrompt: ({ pid, ref, instanceId }, text, { signal }) => submitOmpInput(pid, ref, instanceId, text, signal),
   interruptKeys: ["esc"],
   promptWhileWorking: "reject",
   launchArgs: (config: ProviderSessionConfig): string[] => {
@@ -78,6 +85,15 @@ export const ompAdapter: HarnessAdapter = {
   isOccupant: (proc: PaneProcessInfo): boolean =>
     proc.foreground_process_group_id !== null &&
     proc.foreground_process_group_id !== undefined &&
-    proc.foreground_processes.some((p) => p.pid === proc.foreground_process_group_id),
+    proc.foreground_processes.some((p) => p.pid === proc.foreground_process_group_id &&
+      (p.name === "omp" || /(?:^|\/)omp$/.test(p.argv0 ?? "")) &&
+      !p.argv?.some((arg) => arg.startsWith("__omp_worker_"))),
   blockedHint: "OMP needs approval in the terminal — run: herdr agent attach <target>",
+  inputCompanionStatus: async () => {
+    const status = await companionInstallStatus();
+    if (status.state === "current") return { ok: true };
+    if (status.state === "missing") return { ok: false, diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents." };
+    if (status.state === "outdated") return { ok: false, diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents." };
+    return { ok: false, diagnostic: `A different file exists at ${status.path}. Rerun the installer with --force to replace it.` };
+  },
 };

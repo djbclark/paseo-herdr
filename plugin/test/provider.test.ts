@@ -5,14 +5,17 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { createHerdrProvider } from "../server/provider.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
-import { ProviderEventSchema, type ProviderEvent, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
+import { classifyHerdrPrompt } from "../server/prompt.js";
+import { ProviderEventSchema, type ProviderConnection, type ProviderEvent, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 
 const config: ProviderSessionConfig = {
   cwd: "/work", env: {}, mcpServers: {}, settings: {}, persist: true,
 };
 let server: Server | undefined;
 let directory: string | undefined;
+const connections: ProviderConnection[] = [];
 afterEach(async () => {
+  for (const connection of connections.splice(0)) await connection.close();
   if (server) await new Promise<void>((resolve) => server?.close(() => resolve()));
   if (directory) await rm(directory, { recursive: true, force: true });
   server = undefined;
@@ -26,7 +29,7 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
   await writeFile(transcript, [
     JSON.stringify({ type: "session", id: "native" }),
     JSON.stringify({ type: "message", id: "u1", parentId: null, message: { role: "user", content: [{ type: "text", text: "Hello" }] } }),
-    JSON.stringify({ type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } }),
+    JSON.stringify({ type: "message", id: "a1", parentId: "u1", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Hi" }] } }),
     "",
   ].join("\n"));
   const modifiedAt = new Date("2026-10-11T17:05:00.000Z");
@@ -48,7 +51,14 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
       if (!bytes.includes("\n")) return;
       const request = JSON.parse(bytes.slice(0, bytes.indexOf("\n"))) as { id: string; method: string; params: Record<string, unknown> };
       sent.push({ method: request.method, params: request.params });
-      const result = request.method === "ping" ? { type: "pong", version: "0.9.3", protocol: 22 } :
+      if (request.method === "events.subscribe") {
+        stream.write(JSON.stringify({ id: request.id, result: { type: "subscription_started" } }) + "\n");
+        return;
+      }
+      const result = request.method === "pane.process_info" ? { type: "pane_process_info", process_info: {
+        pane_id: "pane-1", foreground_process_group_id: 1234, tty: "/dev/pts/fake",
+        foreground_processes: [{ pid: 1234, name: "omp", argv: ["omp"] }],
+      } } : request.method === "ping" ? { type: "pong", version: "0.9.3", protocol: 22 } :
         request.method === "agent.list" ? { type: "agent_list", agents: [agent] } :
         request.method === "agent.prompt" ? { type: "agent_prompted", agent } :
         request.method === "integration.list" ? { type: "integration_list", integrations: [{ target: "omp", label: "OMP", command: "omp", available: true, state: "current" }] } :
@@ -57,9 +67,26 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
     });
   });
   await new Promise<void>((resolve) => server?.listen(socket, resolve));
-  const provider = createHerdrProvider(ompAdapter, async () => socket);
+  const provider = createHerdrProvider({ ...ompAdapter,
+    inputCompanionStatus: async () => ({ ok: true }),
+    inspectInput: async ({ pid }) => ({ pid, instanceId: "test-instance" }),
+    submitPrompt: async (target, text, ctx) => {
+      const result = await ctx.request("agent.prompt", { target: target.paneId, text }, { signal: ctx.signal });
+      return classifyHerdrPrompt(result, undefined, { harness: "omp", terminalId: target.terminalId, sessionRef: target.ref,
+        agentName: "demo", herdrSession: null, cwd: "/work", submittedMessages: {} });
+    },
+  }, async () => socket);
   expect(await provider.status?.({})).toEqual({ available: true });
+  const missingCompanion = createHerdrProvider({ ...ompAdapter,
+    inputCompanionStatus: async () => ({ ok: false, diagnostic: "companion missing" }),
+  }, async () => socket);
+  expect(await missingCompanion.status?.({})).toEqual({ available: true, diagnostic: "companion missing" });
+  const throwingCompanion = createHerdrProvider({ ...ompAdapter,
+    inputCompanionStatus: async () => { throw new Error("EACCES"); },
+  }, async () => socket);
+  expect(await throwingCompanion.status?.({})).toMatchObject({ available: true, diagnostic: expect.stringContaining("EACCES") });
   const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message"] });
+  connections.push(connection);
   const events: ProviderEvent[] = [];
   connection.onEvent((event) => events.push(ProviderEventSchema.parse(event)));
   await connection.send({ type: "sessions", requestId: "list", cwd: "/work" });
@@ -84,16 +111,16 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
   await writeFile(transcript, [
     JSON.stringify({ type: "session", id: "native" }),
     JSON.stringify({ type: "message", id: "u1", parentId: null, message: { role: "user", content: [{ type: "text", text: "Hello" }] } }),
-    JSON.stringify({ type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } }),
-    JSON.stringify({ type: "message", id: "u2", parentId: "a1", message: { role: "user", content: [{ type: "text", text: "dNext" }] } }),
-    JSON.stringify({ type: "message", id: "a2", parentId: "u2", message: { role: "assistant", content: [{ type: "text", text: "Done" }] } }),
+    JSON.stringify({ type: "message", id: "a1", parentId: "u1", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Hi" }] } }),
+    JSON.stringify({ type: "message", id: "u2", parentId: "a1", message: { role: "user", content: [{ type: "text", text: "Next" }] } }),
+    JSON.stringify({ type: "message", id: "a2", parentId: "u2", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Done" }] } }),
     "",
   ].join("\n"));
   await vi.waitFor(() => expect(events.some((event) => event.type === "session.turn" && event.state === "completed")).toBe(true), { timeout: 2500 });
   const committed = events.find((event) => event.type === "timeline.item" && event.item.type === "user_message" && event.item.id.includes(":u2:"));
-  expect(committed).toMatchObject({ item: { text: "dNext", clientMessageId: "message-1" } });
-  expect(events.some((event) => event.type === "session.notice" && event.notice.title === "Native prompt text differed")).toBe(true);
-  const persisted = events.find((event) => event.type === "session.persistence");
+  expect(committed).toMatchObject({ item: { text: "Next", clientMessageId: "message-1" } });
+  const persisted = events.find((event) => event.type === "session.persistence" &&
+    Object.values((event.persistence.data as { submittedMessages: Record<string, string> }).submittedMessages).includes("message-1"));
   if (!persisted || persisted.type !== "session.persistence") throw new Error("Missing native message correlation");
   await connection.send({ type: "session.close", sessionId: "local", requestId: "close" });
   await vi.waitFor(() => expect(events.some((event) => event.type === "request.completed" && event.requestId === "close")).toBe(true));
