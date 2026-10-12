@@ -1,0 +1,75 @@
+{
+  "captureDate": "2026-10-12",
+  "source": "Read-only copies of existing isolated Herdr OMP session files; no session input or mutation.",
+  "scrubbing": {
+    "preserved": "Entry IDs, parentId references, tool call/result IDs, record order, timestamps, roles, stop reasons, and compaction firstKeptEntryId.",
+    "paths": "Isolated working-directory paths normalized to /workspace.",
+    "omittedFields": [
+      "credentialId",
+      "responseId",
+      "providerPayload",
+      "contextSnapshot",
+      "textSignature",
+      "thinkingSignature",
+      "preserveData",
+      "retryRecovery",
+      "errorMessage",
+      "errorId",
+      "errorStatus"
+    ],
+    "redacted": "Credential fingerprints and hidden eager-todo-prelude instructions; abort-partial-prefix retains the first real sentence and marks the unrelated essay continuation as scrubbed."
+  },
+  "fixtures": [
+    {
+      "file": "plain-chat.jsonl",
+      "source": "/tmp/paseo-spike-c/omp-sessions/2026-10-12T09-37-25-427Z_01a12f79-5db2-760f-87fd-7f32420eb566.jsonl",
+      "entryCount": 8
+    },
+    {
+      "file": "thinking-tools.jsonl",
+      "source": "/tmp/paseo-spike-c/omp-sessions/2026-10-12T09-37-43-131Z_01a12f79-a2db-7053-85ed-904386ad364a.jsonl",
+      "entryCount": 11
+    },
+    {
+      "file": "compaction.jsonl",
+      "source": "/tmp/paseo-spike-c/omp-sessions/2026-10-12T09-37-46-253Z_01a12f79-af0d-75cd-a1db-6c72b4b672dc.jsonl",
+      "entryCount": 15
+    },
+    {
+      "file": "abort-empty.jsonl",
+      "source": "/tmp/paseo-spike-d/omp-sessions/2026-10-12T14-27-58-808Z_01a13083-60d8-7534-aab0-a7a7843c1864.jsonl",
+      "entryCount": 16
+    },
+    {
+      "file": "error-empty-prefix.jsonl",
+      "source": "/tmp/paseo-spike-d/omp-sessions/2026-10-11T16-19-54-076Z_01a12bc3-7c5c-73d5-b9cb-b2e7d39b1d46.jsonl",
+      "prefixThrough": "af11fd33",
+      "note": "Historical transcript prefix through the named real record, not a separate live session.",
+      "entryCount": 11
+    },
+    {
+      "file": "abort-partial-prefix.jsonl",
+      "source": "/tmp/paseo-spike-d/omp-sessions/2026-10-11T16-16-40-662Z_01a12bc0-88d6-7598-95c1-f7277fa97462.jsonl",
+      "prefixThrough": "8659baa5",
+      "note": "Historical transcript prefix through the named real record, not a separate live session.",
+      "entryCount": 11
+    },
+    {
+      "file": "thinking-tools-working.jsonl",
+      "source": "Derived read-only prefix of thinking-tools.jsonl truncated after the last toolResult record; exercises turnState=working without mutating the source capture.",
+      "prefixThrough": "35aba334",
+      "note": "No resolved assistant outcome in this prefix, so turnState is working.",
+      "entryCount": 10
+    }
+  ],
+  "missingCaptures": [
+    {
+      "scenario": "displayable custom_message",
+      "reason": "Every captured custom_message currently has customType eager-todo-prelude and display:false; hidden suppression is covered, visible custom-message mapping is not."
+    },
+    {
+      "scenario": "header-only /new",
+      "reason": "No scanned existing spike-c/d transcript is header-only; deriving a header prefix from a populated file would not prove /new."
+    }
+  ]
+}
