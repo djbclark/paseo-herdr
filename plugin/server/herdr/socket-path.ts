@@ -82,3 +82,14 @@ export function resolveSocketPath(options: ResolveSocketOptions = {}): string {
   }
   return isWindows(options) ? namedPipe(resolved) : resolved;
 }
+
+/**
+ * Herdr session name to stamp into bindings and attach/pane-read hints; `null` means the default session.
+ * Precedence: configured setting > `HERDR_SESSION` > `sessions/<name>/herdr.sock` in the resolved socket path.
+ */
+export function herdrSessionName(options: { readonly setting?: string; readonly env?: Readonly<Record<string, string | undefined>>; readonly socketPath?: string }): string | null {
+  const session = options.setting || options.env?.HERDR_SESSION;
+  // "default" names the root socket in resolveSocketPath, so it is the default session here too.
+  if (session) return session === "default" ? null : session;
+  return options.socketPath?.match(/[\\/]sessions[\\/]([^\\/]+)[\\/]herdr\.sock$/)?.[1] ?? null;
+}

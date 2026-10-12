@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveSocketPath } from "../server/herdr/socket-path.js";
+import { herdrSessionName, resolveSocketPath } from "../server/herdr/socket-path.js";
 
 const env = (overrides: Record<string, string | undefined> = {}) =>
   ({ XDG_CONFIG_HOME: undefined, HOME: "/home/u", APPDATA: undefined, USERPROFILE: undefined, ...overrides });
@@ -50,5 +50,39 @@ describe("resolveSocketPath", () => {
   it("does not double-wrap an existing named pipe path", () => {
     expect(resolveSocketPath({ platform: "win32", path: "\\\\.\\pipe\\herdr\\herdr.sock", env: env() }))
       .toBe("\\\\.\\pipe\\herdr\\herdr.sock");
+  });
+});
+
+describe("herdrSessionName", () => {
+  it("treats \"default\" as the default session", () => {
+    expect(herdrSessionName({ setting: "default" })).toBeNull();
+    expect(herdrSessionName({ env: { HERDR_SESSION: "default" } })).toBeNull();
+  });
+  it("prefers the configured setting over HERDR_SESSION and the socket path", () => {
+    expect(herdrSessionName({ setting: "work", env: env({ HERDR_SESSION: "env" }), socketPath: "/x/sessions/paseo-spike-e/herdr.sock" }))
+      .toBe("work");
+  });
+
+  it("falls back to HERDR_SESSION when the setting is empty", () => {
+    expect(herdrSessionName({ setting: "", env: env({ HERDR_SESSION: "spike" }), socketPath: "/home/u/.config/herdr/herdr.sock" }))
+      .toBe("spike");
+  });
+
+  it("derives the name from a sessions/<name>/herdr.sock socket path", () => {
+    expect(herdrSessionName({ env: env(), socketPath: "/x/sessions/paseo-spike-e/herdr.sock" })).toBe("paseo-spike-e");
+  });
+
+  it("derives the name from a Windows named pipe wrapping a session socket", () => {
+    expect(herdrSessionName({ env: env(), socketPath: "\\\\.\\pipe\\C:\\Users\\u\\AppData\\Roaming\\herdr\\sessions\\spike\\herdr.sock" }))
+      .toBe("spike");
+  });
+
+  it("returns null for the default socket path", () => {
+    expect(herdrSessionName({ env: env(), socketPath: resolveSocketPath({ env: env() }) })).toBeNull();
+  });
+
+  it("ignores empty strings", () => {
+    expect(herdrSessionName({ setting: "", env: env({ HERDR_SESSION: "" }), socketPath: resolveSocketPath({ env: env() }) })).toBeNull();
+    expect(herdrSessionName({ setting: "", env: env({ HERDR_SESSION: "" }), socketPath: "/x/sessions/spike/herdr.sock" })).toBe("spike");
   });
 });
