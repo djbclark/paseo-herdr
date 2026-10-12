@@ -2,8 +2,11 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, test } from "vitest";
-import { readOmpTranscript } from "../server/harness/omp/transcript.js";
+import { ompAdapter } from "../server/harness/omp/adapter.js";
+import type { TranscriptSnapshot } from "../server/harness/types.js";
+import { ProviderEventSchema } from "@getpaseo/plugin/server/provider";
 
+const tmpRoot = join(tmpdir(), "omp-transcript-tests");
 let dir: string;
 
 beforeEach(async () => {
@@ -14,12 +17,19 @@ afterAll(async () => {
   await rm(tmpRoot, { recursive: true, force: true });
 });
 
-const tmpRoot = join(tmpdir(), "omp-transcript-tests");
-
 async function write(name: string, lines: unknown[]): Promise<string> {
   const path = join(dir, name);
   await writeFile(path, lines.map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
   return path;
+}
+
+async function snapshotAt(path: string, namespace = "omp:key1"): Promise<TranscriptSnapshot> {
+  const reader = ompAdapter.openTranscript({ path, nativeSessionKey: namespace.slice("omp:".length) });
+  try {
+    return await reader.snapshot();
+  } finally {
+    reader.close();
+  }
 }
 
 // Shapes grounded in real transcripts from ~/.omp/agent/sessions (OMP 18.4.12).
@@ -39,6 +49,18 @@ const message = (id: string, parentId: string | null, role: string, content: unk
   timestamp: "2026-10-06T15:56:50.000Z",
   message: { role, content },
 });
+const assistantMessage = (
+  id: string,
+  parentId: string | null,
+  content: unknown,
+  stopReason = "stop",
+) => ({
+  type: "message",
+  id,
+  parentId,
+  timestamp: "2026-10-06T15:56:50.000Z",
+  message: { role: "assistant", content, stopReason },
+});
 const thinking = (text: string) => ({ type: "thinking", thinking: text });
 const toolCall = (id: string, name: string) => ({
   type: "toolCall",
@@ -47,25 +69,26 @@ const toolCall = (id: string, name: string) => ({
   arguments: { command: "ls" },
 });
 
-describe("readOmpTranscript", () => {
-  test("returns items for user and assistant text on the active chain", async () => {
+describe("OMP adapter replay", () => {
+  test("returns Phase 0 text ids for user and assistant text on the active chain", async () => {
     const path = await write("linear.jsonl", [
       titleRow,
       sessionRow,
       message("e1", null, "user", userText("hello")),
-      message("e2", "e1", "assistant", userText("hi there")),
+      assistantMessage("e2", "e1", userText("hi there"), "stop"),
       message("e3", "e2", "user", userText("bye")),
     ]);
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([
+    const snapshot = await snapshotAt(path);
+    expect(snapshot.items).toEqual([
       { id: "omp:key1:e1:user_message:0", type: "user_message", text: "hello" },
       { id: "omp:key1:e2:assistant_message:0", type: "assistant_message", text: "hi there" },
       { id: "omp:key1:e3:user_message:0", type: "user_message", text: "bye" },
     ]);
+    expect(snapshot.lastTurnEnd).toBe("completed");
+    expect(snapshot.title).toBe("Old title");
   });
 
   test("follows the parentId chain, skipping off-branch siblings", async () => {
-    // e2b was appended first, then e2 extends e1: the chain through e2 wins
-    // because it is the file's last leaf; e2b must not appear.
     const path = await write("branch.jsonl", [
       titleRow,
       sessionRow,
@@ -74,7 +97,7 @@ describe("readOmpTranscript", () => {
       message("e2", "e1", "assistant", userText("fresh answer")),
       message("e3", "e2", "user", userText("follow-up")),
     ]);
-    const items = await readOmpTranscript(path, "omp:key1");
+    const items = (await snapshotAt(path)).items;
     expect(items.map((item) => ("text" in item ? item.text : null))).toEqual([
       "q",
       "fresh answer",
@@ -89,7 +112,7 @@ describe("readOmpTranscript", () => {
       sessionRow,
       message("e2", "missing-parent", "assistant", userText("orphan root")),
     ]);
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([
+    expect((await snapshotAt(path)).items).toEqual([
       { id: "omp:key1:e2:assistant_message:0", type: "assistant_message", text: "orphan root" },
     ]);
   });
@@ -100,55 +123,69 @@ describe("readOmpTranscript", () => {
       sessionRow,
       message("a", null, "user", userText("a")),
       message("b", "a", "assistant", userText("b")),
-      message("a", "b", "user", userText("a again")), // id collision closes the loop
+      message("a", "b", "user", userText("a again")),
     ]);
-    // The last leaf reuses id "a", so the duplicate wins the id map and the
-    // seen-guard halts the walk immediately: no walkable chain, no items —
-    // but also no hang and no garbage in the timeline.
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([]);
+    expect((await snapshotAt(path)).items).toEqual([]);
   });
 
-  test("text parts join with newlines; tool calls, thinking, and other roles skip", async () => {
-    const path = await write("parts.jsonl", [
+  test("replays thinking and tool calls with stable tool ids", async () => {
+    const callId = "call-1";
+    const path = await write("tools.jsonl", [
       titleRow,
       sessionRow,
-      message("m1", null, "user", [
-        { type: "text", text: "part one" },
-        { type: "text", text: "part two" },
-        { type: "image", data: "x", mimeType: "image/png" },
-      ]),
-      message("m2", "m1", "assistant", [thinking("hmm"), toolCall("c1", "bash")]),
-      message("m3", "m2", "toolResult", [userText("tool output")]),
-    ]);
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([
-      { id: "omp:key1:m1:user_message:0", type: "user_message", text: "part one\npart two" },
-    ]);
-  });
-
-  test("control rows (title, session, model_change, custom) never become items", async () => {
-    const path = await write("controls.jsonl", [
-      titleRow,
-      sessionRow,
+      message("m1", null, "user", userText("run ls")),
+      assistantMessage("m2", "m1", [thinking("planning"), toolCall(callId, "bash")], "toolUse"),
       {
-        type: "model_change",
-        id: "mc1",
-        parentId: null,
-        model: "ollama-cloud/glm",
+        type: "message",
+        id: "m3",
+        parentId: "m2",
+        timestamp: "2026-10-06T15:56:50.000Z",
+        message: { role: "toolResult", toolCallId: callId, toolName: "bash", content: userText("tool output") },
       },
-      { type: "custom", id: "c1", parentId: "mc1", customType: "tool_execution_start", data: {} },
-      message("m1", "c1", "assistant", userText("only real text")),
+      assistantMessage("m4", "m3", userText("done"), "stop"),
     ]);
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([
-      { id: "omp:key1:m1:assistant_message:0", type: "assistant_message", text: "only real text" },
+    const snapshot = await snapshotAt(path);
+    const items = snapshot.items;
+    expect(items.map((item) => item.type)).toEqual([
+      "user_message",
+      "reasoning",
+      "tool_call",
+      "tool_call",
+      "assistant_message",
     ]);
+    const reasoning = items.find((item) => item.type === "reasoning");
+    expect(reasoning && "text" in reasoning && reasoning.text).toBe("planning");
+    // running + completed tool rows share the stable :tool:<callId> id; the
+    // core diff (Map keyed by id) keeps the terminal (completed) state.
+    const toolRows = items.filter((item) => item.type === "tool_call");
+    expect(toolRows).toHaveLength(2);
+    expect(toolRows.every((item) => item.id === `omp:key1:tool:${callId}`)).toBe(true);
+    expect(toolRows.at(-1)).toMatchObject({ status: "completed" });
+    expect(snapshot.lastTurnEnd).toBe("completed");
+  });
+
+  test("maps a compaction row and an aborted stopReason outcome", async () => {
+    const path = await write("compaction.jsonl", [
+      titleRow,
+      sessionRow,
+      message("u1", null, "user", userText("long context")),
+      assistantMessage("a1", "u1", userText("reply"), "stop"),
+      { type: "compaction", id: "c1", parentId: "a1", tokensBefore: 17921, tokensAfter: 21422 },
+      message("u2", "c1", "user", userText("after compaction")),
+      assistantMessage("a2", "u2", userText("partial"), "aborted"),
+    ]);
+    const snapshot = await snapshotAt(path);
+    expect(snapshot.items.some((item) => item.type === "compaction")).toBe(true);
+    expect(snapshot.items.find((item) => item.type === "compaction")).toMatchObject({
+      id: "omp:key1:c1:compaction:0",
+      status: "completed",
+      preTokens: 17921,
+    });
+    expect(snapshot.lastTurnEnd).toBe("aborted");
   });
 
   test("torn final JSON line is tolerated", async () => {
-    const base = [
-      titleRow,
-      sessionRow,
-      message("e1", null, "user", userText("stable")),
-    ];
+    const base = [titleRow, sessionRow, message("e1", null, "user", userText("stable"))];
     const torn = JSON.stringify(message("e2", "e1", "assistant", userText("cut off in the middle")));
     const path = join(dir, "torn.jsonl");
     await writeFile(
@@ -156,82 +193,96 @@ describe("readOmpTranscript", () => {
       base.map((line) => JSON.stringify(line)).join("\n") + "\n" + torn.slice(0, 40),
       "utf8",
     );
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([
+    expect((await snapshotAt(path)).items).toEqual([
       { id: "omp:key1:e1:user_message:0", type: "user_message", text: "stable" },
     ]);
   });
 
-  test("missing file resolves to empty list (path reported before first write)", async () => {
-    const missing = join(dir, "does-not-exist.jsonl");
-    await expect(readOmpTranscript(missing, "omp:key1")).resolves.toEqual([]);
+  test("missing file resolves to empty list", async () => {
+    expect((await snapshotAt(join(dir, "does-not-exist.jsonl"))).items).toEqual([]);
   });
 
   test("header-only file resolves to empty list", async () => {
     const path = await write("header-only.jsonl", [sessionRow]);
-    await expect(readOmpTranscript(path, "omp:key1")).resolves.toEqual([]);
+    expect((await snapshotAt(path)).items).toEqual([]);
   });
 
-  test("ids are stable across reads and namespaced by the caller", async () => {
+  test("ids are stable across reads and namespaced by the session key", async () => {
     const path = await write("stable.jsonl", [
       titleRow,
       sessionRow,
       message("e1", null, "user", userText("q")),
     ]);
-    const first = await readOmpTranscript(path, "omp:sessA");
-    const second = await readOmpTranscript(path, "omp:sessA");
-    const otherNamespace = await readOmpTranscript(path, "omp:sessB");
-    expect(second).toEqual(first);
-    expect(otherNamespace[0]?.id).not.toBe(first[0]?.id);
-    expect(first[0]?.id.startsWith("omp:sessA:e1:")).toBe(true);
+    const first = await snapshotAt(path, "omp:sessA");
+    const second = await snapshotAt(path, "omp:sessA");
+    const other = await snapshotAt(path, "omp:sessB");
+    expect(second.items).toEqual(first.items);
+    expect(other.items[0]?.id).not.toBe(first.items[0]?.id);
+    expect(first.items[0]?.id.startsWith("omp:sessA:e1:")).toBe(true);
   });
 
-  test("empty namespace throws TypeError", async () => {
-    await expect(readOmpTranscript(join(dir, "x.jsonl"), "")).rejects.toThrow(TypeError);
-  });
-
-  test("real captured transcript round-trips (fixture semantics)", async () => {
-    // Minimal capture mirroring a real ~18.4.12 file: short ids, session header,
-    // mixed roles, custom instrumentation rows interleaved.
-    const path = await write("real-like.jsonl", [
+  test("chain ids are stable and extendsPrevious accepts a prefix extension", async () => {
+    const path = await write("extend.jsonl", [
       titleRow,
       sessionRow,
-      { type: "model_change", id: "ad561dec", parentId: null, model: "ollama-cloud/glm" },
-      {
-        type: "model_usage",
-        id: "72d3b725",
-        parentId: "ad561dec",
-        role: "assistant",
-        model: "ollama-cloud/glm",
-        usage: {},
-      },
-      {
-        type: "custom",
-        id: "06a0fac1",
-        parentId: "f5669f59",
-        customType: "tool_execution_start",
-        data: { toolName: "bash" },
-      },
-      message("f5669f59", "bf082ada", "assistant", [
-        thinking("The user wants an answer"),
-        { type: "text", text: "Here is the answer." },
-      ]),
-      message("bf082ada", "cf94cd82", "user", userText("Goal: do the thing")),
-      {
-        type: "custom_message",
-        id: "cf94cd82",
-        parentId: "72d3b725",
-        content: [{ type: "text", text: "injected notice" }],
-        customType: "hub",
-        display: true,
-      },
+      message("e1", null, "user", userText("q")),
+      message("e2", "e1", "assistant", userText("a")),
     ]);
-    await expect(readOmpTranscript(path, "omp:nk")).resolves.toEqual([
-      { id: "omp:nk:bf082ada:user_message:0", type: "user_message", text: "Goal: do the thing" },
-      {
-        id: "omp:nk:f5669f59:assistant_message:0",
-        type: "assistant_message",
-        text: "Here is the answer.",
-      },
+    const first = await snapshotAt(path);
+    await writeFile(
+      path,
+      [
+        titleRow,
+        sessionRow,
+        message("e1", null, "user", userText("q")),
+        message("e2", "e1", "assistant", userText("a")),
+        message("e3", "e2", "user", userText("follow up")),
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n") + "\n",
+      "utf8",
+    );
+    const second = await snapshotAt(path);
+    expect(second.chainIds.slice(0, 2)).toEqual(first.chainIds);
+    expect(second.extendsPrevious(first)).toBe(true);
+  });
+
+  test("non-content telemetry rows (credential_pin etc.) never become items", async () => {
+    const path = await write("telemetry.jsonl", [
+      titleRow,
+      sessionRow,
+      message("u1", null, "user", userText("hello")),
+      assistantMessage("a1", "u1", userText("hi"), "stop"),
+      { type: "credential_pin", id: "cp1", parentId: "a1", provider: "openai-codex", hash: "abc" },
+      { type: "model_usage", id: "mu1", parentId: "cp1", role: "assistant", model: "gpt", usage: {} },
+      { type: "service_tier_change", id: "st1", parentId: "mu1", serviceTier: null },
     ]);
+    const snapshot = await snapshotAt(path);
+    expect(snapshot.items.map((item) => item.type)).toEqual(["user_message", "assistant_message"]);
+    expect(snapshot.items.some((item) => ("text" in item && (item.text as string).includes("Unsupported")))).toBe(false);
+  });
+
+  test("every replayed item passes the provider event schema", async () => {
+    const path = await write("schema.jsonl", [
+      titleRow,
+      sessionRow,
+      message("u1", null, "user", userText("question")),
+      assistantMessage("a1", "u1", [thinking("hmm"), toolCall("call-1", "bash")], "toolUse"),
+      {
+        type: "message",
+        id: "r1",
+        parentId: "a1",
+        timestamp: "2026-10-06T15:56:50.000Z",
+        message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: userText("output") },
+      },
+      message("a2", "r1", "assistant", userText("answer")),
+      { type: "compaction", id: "c1", parentId: "a2", tokensBefore: 100 },
+    ]);
+    const snapshot = await snapshotAt(path);
+    for (const item of snapshot.items) {
+      expect(() =>
+        ProviderEventSchema.parse({ type: "timeline.item", sessionId: "s", item }),
+      ).not.toThrow();
+    }
   });
 });

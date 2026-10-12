@@ -32,8 +32,12 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
   const modifiedAt = new Date("2026-10-11T17:05:00.000Z");
   await utimes(transcript, modifiedAt, modifiedAt);
   const agent = {
-    terminal_id: "term-1", pane_id: "pane-1", agent: "omp", name: "demo", cwd: "/work",
-    agent_status: "idle", agent_session: { source: "herdr:omp", agent: "omp", kind: "path", value: transcript },
+    terminal_id: "term-1", pane_id: "pane-1", agent: "omp", name: "demo", title: "Demo", cwd: "/work",
+    terminal_title: null, terminal_title_stripped: null, display_agent: "omp", agent_status: "idle",
+    screen_detection_skipped: false, state_labels: {}, tokens: {},
+    agent_session: { source: "herdr:omp", agent: "omp", kind: "path", value: transcript },
+    workspace_id: "w1", tab_id: "t1", focused: true, launch_pending: false, interactive_ready: true,
+    state_change_seq: 0, completion_seq: null, foreground_cwd: "/work", revision: 0,
   };
   const sent: Array<{ method: string; params: Record<string, unknown> }> = [];
   server = createServer((stream) => {
@@ -46,7 +50,9 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
       sent.push({ method: request.method, params: request.params });
       const result = request.method === "ping" ? { type: "pong", version: "0.9.3", protocol: 22 } :
         request.method === "agent.list" ? { type: "agent_list", agents: [agent] } :
-        request.method === "agent.prompt" ? { type: "agent_prompted", agent } : { type: "unknown" };
+        request.method === "agent.prompt" ? { type: "agent_prompted", agent } :
+        request.method === "integration.list" ? { type: "integration_list", integrations: [{ target: "omp", label: "OMP", command: "omp", available: true, state: "current" }] } :
+        { type: "unknown" };
       stream.end(JSON.stringify({ id: request.id, result }) + "\n");
     });
   });
