@@ -60,16 +60,21 @@
       "prefixThrough": "35aba334",
       "note": "No resolved assistant outcome in this prefix, so turnState is working.",
       "entryCount": 10
-    }
-  ],
-  "missingCaptures": [
-    {
-      "scenario": "displayable custom_message",
-      "reason": "Every captured custom_message currently has customType eager-todo-prelude and display:false; hidden suppression is covered, visible custom-message mapping is not."
     },
     {
-      "scenario": "header-only /new",
-      "reason": "No scanned existing spike-c/d transcript is header-only; deriving a header prefix from a populated file would not prove /new."
+      "file": "new-header-only.jsonl",
+      "source": "/tmp/paseo-spike-c/omp-sessions/2026-10-12T17-57-51-687Z_01a13143-87c7-72ba-b070-b619874256f5.jsonl",
+      "note": "Copied immediately after a real /new in a fresh paseo-spike-c agent (c14-new), before any prompt: title, session, thinking_level_change, service_tier_change only (684 bytes).",
+      "captureDate": "2026-10-12",
+      "entryCount": 4
+    },
+    {
+      "file": "custom-message-visible.jsonl",
+      "source": "/tmp/paseo-spike-c/omp-sessions/2026-10-12T17-57-51-687Z_01a13143-87c7-72ba-b070-b619874256f5.jsonl",
+      "note": "Same session after two prompts: a background bash job collected with the wait tool, then 'sleep 8' backgrounded with the turn ended early, so OMP injected a displayable custom_message (customType async-result, display:true) and answered it in a turn with no user entry. Model fell back to ollama-cloud/deepseek-v4-pro after a quota prompt; tool call ids are ollama:<n>:<tool>. Paths normalized to /workspace and /sessions.",
+      "captureDate": "2026-10-12",
+      "entryCount": 22
     }
-  ]
+  ],
+  "missingCaptures": []
 }

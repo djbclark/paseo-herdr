@@ -98,6 +98,21 @@ const CASES: readonly CaseSpec[] = [
       "63036aee", "082b2cad", "21f1cf4d", "8659baa5",
     ],
   },
+  {
+    file: "custom-message-visible.jsonl",
+    outcome: "completed",
+    turnState: "idle",
+    lastTurnEndId: "59d672c1",
+    itemTypes: [
+      "user_message", "reasoning", "tool_call", "tool_call", "assistant_message",
+      "user_message", "tool_call", "assistant_message", "notification", "assistant_message",
+    ],
+    nativeChainIds: [
+      "0f7ea605", "52450510", "a850fe5a", "e9a6428e", "5fd92fc4", "af98d1aa", "5bdbabdd",
+      "d7de1c30", "f5ccecea", "59514729", "a29cf95b", "9c763a8c", "ed5905e5", "15151317",
+      "86da0b76", "8f430db4", "0bc401ff", "64520173", "12af6181", "59d672c1",
+    ],
+  },
 ];
 
 async function snapshot(file: string): Promise<TranscriptSnapshot> {
@@ -194,8 +209,32 @@ describe("OMP captured fixtures", () => {
     expect(snap.items.at(-1)).toMatchObject({ type: "tool_call", status: "completed" });
   });
 
+  test("a header-only /new session replays nothing and is idle with no outcome", async () => {
+    const snap = await snapshot("new-header-only.jsonl");
+    expect(snap.items).toEqual([]);
+    expect(snap.turnState).toBe("idle");
+    expect(snap.lastTurnEnd).toBeUndefined();
+    expect(snap.lastTurnEndId).toBeUndefined();
+    expect(snap.chainIds).toEqual(["0f7ea605", "52450510"]);
+  });
+
+  test("a displayable custom message maps to a notification row; hidden ones stay suppressed", async () => {
+    const snap = await snapshot("custom-message-visible.jsonl");
+    expect(snap.items.filter((item) => item.type === "notification")).toEqual([{
+      id: "omp:custom-message-visible.jsonl:12af6181:notification:0",
+      type: "notification",
+      level: "info",
+      message: "Background job bg_2 has completed. Resume your work using the result below.",
+    }]);
+    // eager-todo-prelude (display:false) stays in the native chain but renders no row.
+    expect(snap.chainIds).toContain("5fd92fc4");
+    expect(snap.items.some((item) => item.id.includes("5fd92fc4"))).toBe(false);
+    // The notice starts a turn with no user entry; its reply is the native turn end.
+    expect(snap.items.at(-1)).toMatchObject({ type: "assistant_message", id: "omp:custom-message-visible.jsonl:59d672c1:assistant_message:0" });
+  });
+
   test("scrubbed fixtures carry no personal paths, credentials, or hidden injection text", async () => {
-    for (const spec of CASES) {
+    for (const spec of [...CASES, { file: "new-header-only.jsonl" }]) {
       const raw = await readFile(join(FIXTURES, spec.file), "utf8");
       expect(raw).not.toMatch(/\/home\/|~\/|ollama\.com\/api|encrypted_content|paseo-spike/);
       expect(raw).not.toMatch(/Consider calling `todo`/);
