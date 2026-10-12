@@ -86,6 +86,18 @@ export class FakeHerdr {
     });
   }
 
+  /** Convenience: reply with a Herdr error envelope. */
+  replyError(method: string, code: string, message = code): this {
+    return this.handle(method, (request, stream) => {
+      stream.end(JSON.stringify({ id: request.id, error: { code, message } }) + "\n");
+    });
+  }
+
+  /** Requests recorded so far for one method, in arrival order. */
+  requestsFor(method: string): FakeRequest[] {
+    return this.requests.filter((request) => request.method === method);
+  }
+
   /** Write a raw JSON line to every open `events.subscribe` socket. */
   pushEvent(value: unknown): void {
     for (const stream of [...this.openSubscriptions]) {

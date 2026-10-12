@@ -155,6 +155,51 @@ export const PaneProcessInfoResultSchema = z.object({
 });
 export type PaneProcessInfoResult = z.infer<typeof PaneProcessInfoResultSchema>;
 
+/* ---- create-path (launch) responses; only the fields the launcher needs ---- */
+
+const createdPaneSchema = z.object({
+  pane_id: z.string(),
+  terminal_id: z.string(),
+  workspace_id: z.string(),
+  tab_id: z.string(),
+  cwd: z.string().nullish(),
+  foreground_cwd: z.string().nullish(),
+});
+
+export const WorkspaceCreatedResultSchema = z.object({
+  type: z.literal("workspace_created"),
+  workspace: z.object({ workspace_id: z.string() }),
+  tab: z.object({ tab_id: z.string() }),
+  root_pane: createdPaneSchema,
+});
+export type WorkspaceCreatedResult = z.infer<typeof WorkspaceCreatedResultSchema>;
+
+export const TabCreatedResultSchema = z.object({
+  type: z.literal("tab_created"),
+  tab: z.object({ tab_id: z.string(), workspace_id: z.string() }),
+  root_pane: createdPaneSchema,
+});
+export type TabCreatedResult = z.infer<typeof TabCreatedResultSchema>;
+
+export const PaneListResultSchema = z.object({
+  type: z.literal("pane_list"),
+  panes: z.array(PaneInfoSchema),
+});
+export type PaneListResult = z.infer<typeof PaneListResultSchema>;
+
+/** `agent.start` reply: the pending agent (launch_pending, `agent` unset). */
+export const AgentStartedResultSchema = z.object({
+  type: z.literal("agent_started"),
+  agent: AgentInfoSchema,
+});
+export type AgentStartedResult = z.infer<typeof AgentStartedResultSchema>;
+
+export const PaneReadResultSchema = z.object({
+  type: z.literal("pane_read"),
+  read: z.object({ pane_id: z.string(), text: z.string() }),
+});
+export type PaneReadResult = z.infer<typeof PaneReadResultSchema>;
+
 /* ---- subscription / lifecycle event shapes ---- */
 
 export const paneAgentStatusChangedSchema = z.object({
