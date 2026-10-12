@@ -1,6 +1,7 @@
 import type { HerdrSubscription, SubscriptionEventEnvelope } from "./herdr/client.js";
 import { diffTimeline, hashItem } from "./timeline.js";
 import type { HerdrHarnessSession } from "./session.js";
+import { ForkWatcher } from "./forks.js";
 
 /** Scheduling only: binding, turn, connectivity and transcript state live in SessionState. */
 export class LiveSession {
@@ -10,14 +11,16 @@ export class LiveSession {
   private streamController: AbortController | null = null;
   private streamEpoch = 0;
   private queue: Promise<void> = Promise.resolve();
+  private readonly forks: ForkWatcher;
 
-  constructor(private readonly session: HerdrHarnessSession) {}
+  constructor(private readonly session: HerdrHarnessSession) { this.forks = new ForkWatcher(session); }
   start(): void {
     if (this.running || this.session.isAborted) return;
     this.running = true;
     this.readerUnsubscribe = this.session.state.reader?.subscribe(() => { void this.reconcile(); }) ?? null;
     this.subscribePane();
     this.timer = setInterval(() => { void this.reconcile(); }, 2000);
+    this.forks.start();
     void this.reconcile();
   }
   stop(): void {
@@ -29,6 +32,7 @@ export class LiveSession {
     this.readerUnsubscribe = null;
     clearInterval(this.timer);
     this.timer = undefined;
+    this.forks.stop();
   }
   paneChanged(): void { if (this.running) this.subscribePane(); }
 
