@@ -12,9 +12,8 @@ import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
 import { parseBinding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
 import { launchAgent } from "./launch.js";
-import { HerdrHarnessSession, pendingBinding, type SessionDeps } from "./session.js";
-
-const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
+import { HerdrHarnessSession, capabilitiesFor, pendingBinding, type SessionDeps } from "./session.js";
+import { ModelCache } from "./config.js";
 
 export interface ProviderHooks {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
@@ -29,6 +28,8 @@ export function createHerdrProvider(
   hooks: ProviderHooks = {},
 ): ProviderRegistration {
   const client = async () => new HerdrClient(await getSocketPath());
+  // The model list is install-wide, so it outlives connections.
+  const modelCache = new ModelCache();
   return {
     id: `herdr-${adapter.id}`,
     label: `${adapter.label} (Herdr)`,
@@ -51,7 +52,7 @@ export function createHerdrProvider(
     },
     async connect(request) {
       if (!request.versions.includes(1)) throw new Error("Provider protocol version 1 is required");
-      const capabilities = negotiateProviderCapabilities(request.capabilities, CAPABILITIES);
+      const capabilities = negotiateProviderCapabilities(request.capabilities, capabilitiesFor(adapter));
       const listeners = new Set<(event: ProviderEvent) => void>();
       const sessions = new Map<string, HerdrHarnessSession>();
       let closed = false;
@@ -69,15 +70,23 @@ export function createHerdrProvider(
         subscribe: (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) =>
           client().then((herdr) => herdr.subscribe(subscriptions, options)),
         emit,
+        modelCache,
         getHerdrSession: hooks.getHerdrSession,
         launch: hooks.launch ?? ((config, signal) => launchAgent({ request: herdrRequest, herdrSession: hooks.getHerdrSession?.() ?? null }, adapter, config, signal)),
       });
 
       const dispatch = async (input: ProviderInput): Promise<void> => {
         switch (input.type) {
-          case "catalog":
-            emit({ type: "catalog", requestId: input.requestId, catalog: { models: [], modes: [] } });
+          case "catalog": {
+            if (modelCache.stale) {
+              // Any live, validated session can list the install-wide models; a failure never fails the catalog.
+              for (const session of sessions.values()) {
+                if (await session.config.refreshModels().catch(() => false)) break;
+              }
+            }
+            emit({ type: "catalog", requestId: input.requestId, catalog: modelCache.catalog() });
             return;
+          }
           case "sessions": {
             const agents = await list();
             const summaries = await discoverSessions(adapter, agents, input, hooks);
@@ -131,6 +140,12 @@ export function createHerdrProvider(
             const session = sessions.get(input.sessionId);
             if (!session) throw new Error("Unknown session");
             await session.interrupt(input.requestId);
+            return;
+          }
+          case "session.configure": {
+            const session = sessions.get(input.sessionId);
+            if (!session) throw new Error("Unknown session");
+            await session.configure(input.requestId, input.changes);
             return;
           }
           case "session.close":

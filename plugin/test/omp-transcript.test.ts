@@ -285,3 +285,58 @@ describe("OMP adapter replay", () => {
     }
   });
 });
+
+describe("model and thinking level from the active chain", () => {
+  const modelChange = (id: string, parentId: string | null, model: string, role?: string) => ({
+    type: "model_change", id, parentId, timestamp: "2026-10-06T15:56:50.000Z", model,
+    ...(role === undefined ? {} : { role }), resolvedModelIsFallback: role === "fallback",
+  });
+  const thinkingChange = (id: string, parentId: string | null, thinkingLevel: string | null) => ({
+    type: "thinking_level_change", id, parentId, timestamp: "2026-10-06T15:56:50.000Z", thinkingLevel, configured: thinkingLevel,
+  });
+
+  test("the last role-less or default model_change wins; fallback and other roles are ignored", async () => {
+    const path = await write("models.jsonl", [
+      sessionRow,
+      modelChange("m1", null, "p/start"),
+      modelChange("m2", "m1", "p/chosen", "default"),
+      modelChange("m3", "m2", "p/backup", "fallback"),
+      modelChange("m4", "m3", "p/small", "smol"),
+    ]);
+    expect((await snapshotAt(path)).model).toBe("p/chosen");
+  });
+
+  test("a chain with only fallback model_change entries records no model", async () => {
+    const path = await write("fallback-only.jsonl", [
+      sessionRow,
+      modelChange("m1", null, "p/backup", "fallback"),
+      message("u1", "m1", "user", userText("hi")),
+    ]);
+    const snapshot = await snapshotAt(path);
+    expect(snapshot.model).toBeUndefined();
+    expect(snapshot.thinkingLevel).toBeUndefined();
+  });
+
+  test("a null thinking level (off/cleared) is kept distinct from none recorded", async () => {
+    const path = await write("thinking-null.jsonl", [
+      sessionRow,
+      thinkingChange("t1", null, "high"),
+      thinkingChange("t2", "t1", null),
+    ]);
+    expect((await snapshotAt(path)).thinkingLevel).toBeNull();
+  });
+
+  test("entries on an abandoned branch do not count", async () => {
+    const path = await write("branch.jsonl", [
+      sessionRow,
+      modelChange("m1", null, "p/root"),
+      modelChange("m2", "m1", "p/abandoned"),
+      thinkingChange("t2", "m2", "max"),
+      // New active leaf branches from m1, so m2/t2 are off the active chain.
+      thinkingChange("t3", "m1", "low"),
+    ]);
+    const snapshot = await snapshotAt(path);
+    expect(snapshot.model).toBe("p/root");
+    expect(snapshot.thinkingLevel).toBe("low");
+  });
+});

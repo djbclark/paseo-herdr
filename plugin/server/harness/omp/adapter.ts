@@ -7,10 +7,11 @@ import type {
 import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import type { PaneProcessInfo } from "../../herdr/schema.js";
 import { FileTail } from "../../file-tail.js";
-import { inspectOmpInput, submitOmpInput } from "./input.js";
-import { activeChain, lastTurnEndOf, lastTurnEndIdOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
+import { configureOmp, inspectOmpInput, readOmpConfig, submitOmpInput } from "./input.js";
+import { activeChain, lastTurnEndOf, lastTurnEndIdOf, modelOf, thinkingLevelOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
 import { companionInstallStatus } from "./companion-install.js";
+import { findOmpForks } from "./forks.js";
 
 /**
  * OMP adapter. OMP (oh-my-pi) is the only harness that reports a transcript
@@ -57,6 +58,8 @@ export const ompAdapter: HarnessAdapter = {
           chainHead: chainIds.at(-1) ?? null,
           chainIds,
           ...(lastTurnEndOf(chain) ? { lastTurnEnd: lastTurnEndOf(chain) } : {}),
+          ...(modelOf(chain) !== undefined ? { model: modelOf(chain) } : {}),
+          ...(thinkingLevelOf(chain) !== undefined ? { thinkingLevel: thinkingLevelOf(chain) } : {}),
           extendsPrevious: (previous: TranscriptSnapshot) =>
             previous.chainIds.length === 0 ||
             (chainIds.length >= previous.chainIds.length &&
@@ -74,6 +77,9 @@ export const ompAdapter: HarnessAdapter = {
   },
   inspectInput: ({ pid, ref }, signal) => inspectOmpInput(pid, ref, signal),
   submitPrompt: ({ pid, ref, instanceId }, text, { signal }) => submitOmpInput(pid, ref, instanceId, text, signal),
+  findForks: findOmpForks,
+  readConfig: ({ pid, ref, instanceId }, signal) => readOmpConfig(pid, ref, instanceId, signal),
+  configure: ({ pid, ref, instanceId }, changes, signal) => configureOmp(pid, ref, instanceId, changes, signal),
   interruptKeys: ["esc"],
   promptWhileWorking: "reject",
   launchArgs: (config: ProviderSessionConfig): string[] => {

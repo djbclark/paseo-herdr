@@ -100,3 +100,23 @@ export function lastTurnEndIdOf(chain: readonly OmpSessionEntry[]): string | und
   }
   return undefined;
 }
+
+/** Last user-selected model (`provider/id`): model_change entries with role absent or "default" (fallback/temporary roles are ignored). */
+export function modelOf(chain: readonly OmpSessionEntry[]): string | undefined {
+  for (let index = chain.length - 1; index >= 0; index--) {
+    const entry = chain[index] as Record<string, unknown>;
+    if (entry.type !== "model_change" || (entry.role ?? "default") !== "default") continue;
+    if (typeof entry.model === "string" && entry.model.length > 0) return entry.model;
+  }
+  return undefined;
+}
+
+/** Last thinking_level_change on the chain (`null` = off/cleared); undefined when none was recorded. */
+export function thinkingLevelOf(chain: readonly OmpSessionEntry[]): string | null | undefined {
+  for (let index = chain.length - 1; index >= 0; index--) {
+    const entry = chain[index] as Record<string, unknown>;
+    if (entry.type !== "thinking_level_change") continue;
+    if (entry.thinkingLevel === null || typeof entry.thinkingLevel === "string") return entry.thinkingLevel;
+  }
+  return undefined;
+}

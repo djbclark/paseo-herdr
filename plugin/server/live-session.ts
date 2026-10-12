@@ -167,6 +167,7 @@ export class LiveSession {
     }
     state.timeline = nextTimeline;
     state.snapshot = snapshot;
+    session.onSnapshot(previous, snapshot);
     if (state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
         snapshot.turnState === "idle" && snapshot.lastTurnEndId && snapshot.lastTurnEndId !== state.turnBaselineEndId &&
         snapshot.lastTurnEnd && snapshot.lastTurnEnd !== "unknown") {

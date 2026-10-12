@@ -12,7 +12,7 @@ export interface DiscoveryOptions {
  * Build the Import-picker session list for one harness: filter `agent.list` by
  * `agent === adapter.id` (and `cwd` when supplied), and read each summary's
  * `title`/`updatedAt` through the adapter's transcript reader when the ref is
- * readable. A non-readable ref (e.g. OMP `kind:"id"`) gets an
+ * readable. A ref the adapter cannot resolve gets a
  * "History unavailable" description and the observed timestamp.
  */
 export async function discoverSessions(

@@ -1,4 +1,4 @@
-import type { ProviderEvent, ProviderPrompt, ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
+import type { ProviderConfigChanges, ProviderEvent, ProviderPrompt, ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import type { HarnessAdapter, TranscriptReader, TranscriptSnapshot } from "./harness/types.js";
 import { PaneProcessInfoResultSchema, type AgentInfo, type AgentStatus } from "./herdr/schema.js";
 import type { HerdrSubscription, SubscriptionDescriptor } from "./herdr/client.js";
@@ -9,6 +9,7 @@ import { PromptController } from "./prompt.js";
 import { LiveSession } from "./live-session.js";
 import type { LaunchResult } from "./launch.js";
 import { attachCommand } from "./herdr-commands.js";
+import { ConfigController, supportsConfigure, type ModelCache } from "./config.js";
 
 export interface HerdrRequest {
   (method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown>;
@@ -22,6 +23,8 @@ export interface SessionDeps {
   getHerdrSession?: () => string | null;
   /** Create path: launch a new agent. Absent when the provider cannot create agents. */
   launch?(config: ProviderSessionConfig, signal: AbortSignal): Promise<LaunchResult>;
+  /** Install-wide model list shared by every session of the provider (catalog source). */
+  modelCache?: ModelCache;
 }
 
 /** Placeholder binding for a session whose agent is still being launched. */
@@ -47,12 +50,17 @@ export interface SessionState {
   tracker: TurnTracker;
 }
 const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
+/** Capabilities a session of this adapter supports; provider-level negotiation uses the same list. */
+export function capabilitiesFor(adapter: HarnessAdapter): readonly string[] {
+  return supportsConfigure(adapter) ? [...CAPABILITIES, "session.configure"] : CAPABILITIES;
+}
 
 export class HerdrHarnessSession {
   readonly state: SessionState;
   readonly controller = new AbortController();
   private readonly prompts: PromptController;
   readonly live: LiveSession;
+  readonly config: ConfigController;
 
   constructor(readonly sessionId: string, binding: Binding, readonly deps: SessionDeps) {
     this.state = {
@@ -63,13 +71,16 @@ export class HerdrHarnessSession {
     };
     this.prompts = new PromptController(this);
     this.live = new LiveSession(this);
+    this.config = new ConfigController(this);
   }
   get adapter(): HarnessAdapter { return this.deps.adapter; }
   get signal(): AbortSignal { return this.controller.signal; }
   get isAborted(): boolean { return this.signal.aborted; }
-  get capabilities(): readonly string[] { return CAPABILITIES; }
+  get capabilities(): readonly string[] { return capabilitiesFor(this.adapter); }
   current(generation: number): boolean { return !this.isAborted && this.state.generation === generation; }
   emit(event: ProviderEvent): void { if (!this.isAborted) this.deps.emit(event); }
+  /** Called after every accepted transcript snapshot: terminal-made model/thinking changes surface here. */
+  onSnapshot(previous: TranscriptSnapshot | null, snapshot: TranscriptSnapshot): void { this.config.onSnapshot(previous, snapshot); }
   persist(): void { this.emit({ type: "session.persistence", sessionId: this.sessionId, persistence: persistenceOf(this.state.binding) }); }
 
   /**
@@ -121,14 +132,14 @@ export class HerdrHarnessSession {
       const seeded = seedTimeline(snapshot, this.state.binding.submittedMessages);
       this.state.timeline = seeded.state;
       this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
-        capabilities: CAPABILITIES, persistence: persistenceOf(this.state.binding),
+        capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
         cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
       if (history === "replay") for (const row of seeded.rows) {
         this.emit({ type: "timeline.item", sessionId: this.sessionId, item: row.item, timestamp: row.timestamp });
       }
     } else {
       this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
-        capabilities: CAPABILITIES, persistence: persistenceOf(this.state.binding),
+        capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
         cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
       this.freeze("History unavailable", "This agent has no readable native history; the conversation is read-only.");
     }
@@ -139,6 +150,11 @@ export class HerdrHarnessSession {
       }
     }
     if (this.isAborted) return;
+    // Only a validated occupant is asked for its live model/thinking state.
+    if (this.state.outcome === "active") {
+      await this.config.initialRead();
+      if (this.isAborted) return;
+    }
     this.emit({ type: "session.ready", requestId, sessionId: this.sessionId });
     if (this.state.outcome === "active") {
       this.state.connected = true;
@@ -148,8 +164,10 @@ export class HerdrHarnessSession {
 
   prompt(prompt: ProviderPrompt): Promise<void> { return this.prompts.prompt(prompt); }
   interrupt(requestId: string): Promise<void> { return this.prompts.interrupt(requestId); }
+  configure(requestId: string, changes: ProviderConfigChanges): Promise<void> { return this.config.configure(requestId, changes); }
   close(): void {
     this.controller.abort();
+    this.config.close();
     this.state.generation++;
     this.live.stop();
     this.state.reader?.close();

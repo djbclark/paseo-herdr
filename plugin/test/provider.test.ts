@@ -7,7 +7,7 @@ import { createHerdrProvider } from "../server/provider.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { classifyHerdrPrompt } from "../server/prompt.js";
 import { LaunchError, type LaunchResult } from "../server/launch.js";
-import { FakeTranscript, makeFakeAdapter } from "./fake-harness.js";
+import { FakeConfig, FakeTranscript, makeFakeAdapter } from "./fake-harness.js";
 import { ProviderEventSchema, type ProviderConnection, type ProviderEvent, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 
 const config: ProviderSessionConfig = {
@@ -17,6 +17,7 @@ let server: Server | undefined;
 let directory: string | undefined;
 const connections: ProviderConnection[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   for (const connection of connections.splice(0)) await connection.close();
   if (server) await new Promise<void>((resolve) => server?.close(() => resolve()));
   if (directory) await rm(directory, { recursive: true, force: true });
@@ -143,7 +144,7 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
 });
 
 // --- Create path (no persistence): provider dispatch ---------------------------------------
-async function createRig(options: { companion?: { ok: boolean; diagnostic?: string }; launch: (signal: AbortSignal) => Promise<LaunchResult> }) {
+async function createRig(options: { companion?: { ok: boolean; diagnostic?: string }; launch: (signal: AbortSignal) => Promise<LaunchResult>; config?: FakeConfig }) {
   directory = await mkdtemp(join(tmpdir(), "herdr-create-"));
   const socket = join(directory, "herdr.sock");
   const agent = { terminal_id: "term-new", pane_id: "pane-new", agent: "fake", name: "paseo-abc123", cwd: "/work",
@@ -172,14 +173,14 @@ async function createRig(options: { companion?: { ok: boolean; diagnostic?: stri
     });
   });
   await new Promise<void>((resolve) => server?.listen(socket, resolve));
-  const adapter = makeFakeAdapter(new FakeTranscript());
+  const adapter = makeFakeAdapter(new FakeTranscript(), { config: options.config });
   const launches: AbortSignal[] = [];
   const provider = createHerdrProvider(
     { ...adapter, ...(options.companion ? { inputCompanionStatus: async () => options.companion! } : {}) },
     async () => socket,
     { getHerdrSession: () => "work", launch: async (_config, signal) => { launches.push(signal); return options.launch(signal); } },
   );
-  const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message"] });
+  const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message", "session.configure"] });
   connections.push(connection);
   const events: ProviderEvent[] = [];
   connection.onEvent((event) => events.push(ProviderEventSchema.parse(event)));
@@ -254,4 +255,85 @@ it("OMP launch args pass model and thinking and never disable extensions (the co
   expect(ompAdapter.launchArgs({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
   expect(ompAdapter.launchArgs(config)).toEqual([]);
   expect(ompAdapter.launchArgs({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
+});
+
+// --- P3.5A: configure capability, catalog and dispatch ---------------------------------------
+const catalogOf = (events: ProviderEvent[], requestId: string) => {
+  const event = events.find((candidate) => candidate.type === "catalog" && candidate.requestId === requestId);
+  if (!event || event.type !== "catalog") throw new Error(`Missing catalog ${requestId}`);
+  return event.catalog;
+};
+
+it("advertises session.configure only when the adapter can read and change config", async () => {
+  const plain = await createRig({ companion: { ok: true }, launch: async () => launchedAgent() });
+  expect(plain.connection.capabilities).not.toContain("session.configure");
+  await plain.connection.send(openNew);
+  await vi.waitFor(() => expect(plain.events.some((event) => event.type === "session.ready")).toBe(true));
+  expect(plain.events.find((event) => event.type === "session.opened")).toMatchObject({ capabilities: expect.not.arrayContaining(["session.configure"]) });
+  expect(plain.events.some((event) => event.type === "session.config")).toBe(false);
+  await plain.connection.close();
+
+  const configurable = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), config: new FakeConfig() });
+  expect(configurable.connection.capabilities).toContain("session.configure");
+  await configurable.connection.send(openNew);
+  await vi.waitFor(() => expect(configurable.events.some((event) => event.type === "session.ready")).toBe(true));
+  expect(configurable.events.find((event) => event.type === "session.opened")).toMatchObject({ capabilities: expect.arrayContaining(["session.configure"]) });
+});
+
+it("serves an empty catalog before any config was read, then models from the cache with per-model thinking options", async () => {
+  const config = new FakeConfig();
+  const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), config });
+  await connection.send({ type: "catalog", requestId: "c0", options: { cwd: "/work" } } as never);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "catalog")).toBe(true));
+  expect(catalogOf(events, "c0")).toEqual({ models: [], modes: [] });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  await connection.send({ type: "catalog", requestId: "c1", options: { cwd: "/work" } } as never);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "catalog" && event.requestId === "c1")).toBe(true));
+  const catalog = catalogOf(events, "c1");
+  expect(catalog.modes).toEqual([]);
+  expect(catalog.models).toEqual([
+    { id: "fake/reasoner", label: "Reasoner", description: "fake", contextWindowMaxTokens: 200000, isDefault: true,
+      thinkingOptions: [{ id: "off", label: "Off" }, { id: "low", label: "low" }, { id: "medium", label: "medium" }, { id: "high", label: "high" }],
+      defaultThinkingOptionId: "medium" },
+    { id: "fake/plain", label: "Plain", description: "fake" },
+  ]);
+});
+
+it("refreshes a stale model cache through a live session and survives a failing refresh", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const config = new FakeConfig();
+  const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), config });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  const reads = config.reads;
+  await connection.send({ type: "catalog", requestId: "fresh" } as never);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "catalog")).toBe(true));
+  expect(config.reads).toBe(reads);
+  vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+  config.models = [...config.models, { id: "fake/new", label: "New", provider: "fake", thinkingLevels: [] }];
+  await connection.send({ type: "catalog", requestId: "stale" } as never);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "catalog" && event.requestId === "stale")).toBe(true));
+  expect(config.reads).toBe(reads + 1);
+  expect(catalogOf(events, "stale").models.map((model) => model.id)).toEqual(["fake/reasoner", "fake/plain", "fake/new"]);
+  vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+  config.readError = new Error("companion gone");
+  await connection.send({ type: "catalog", requestId: "failing" } as never);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "catalog" && event.requestId === "failing")).toBe(true));
+  expect(catalogOf(events, "failing").models).toHaveLength(3);
+});
+
+it("dispatches session.configure: config first then completion, and fails an unknown session", async () => {
+  const config = new FakeConfig();
+  const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), config });
+  await connection.send({ type: "session.configure", requestId: "ghost", sessionId: "nope", changes: { model: "fake/plain" } });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.failed" && event.requestId === "ghost")).toBe(true));
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  await connection.send({ type: "session.configure", requestId: "cfg", sessionId: "new", changes: { thinkingOption: "high" } });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.completed" && event.requestId === "cfg")).toBe(true));
+  const tail = events.slice(events.findIndex((event) => event.type === "session.ready"));
+  const configs = tail.filter((event) => event.type === "session.config");
+  expect(configs.at(-1)).toMatchObject({ config: { model: "fake/reasoner", thinkingOption: "high" } });
+  expect(tail.map((event) => event.type).lastIndexOf("session.config")).toBeLessThan(tail.findIndex((event) => event.type === "request.completed"));
 });

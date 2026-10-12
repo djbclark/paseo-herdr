@@ -233,6 +233,23 @@ describe("OMP captured fixtures", () => {
     expect(snap.items.at(-1)).toMatchObject({ type: "assistant_message", id: "omp:custom-message-visible.jsonl:59d672c1:assistant_message:0" });
   });
 
+  test.each([
+    // Role-less startup entries are the user model; role:"fallback" entries never override it.
+    ["plain-chat.jsonl", "openai-codex/gpt-6.1-sol", "off"],
+    ["thinking-tools.jsonl", "openai-codex/gpt-6.1-sol", "high"],
+    ["compaction.jsonl", "openai-codex/gpt-6.1-sol", "high"],
+    ["abort-empty.jsonl", "openai-codex/gpt-6-luna", "low"],
+    ["error-empty-prefix.jsonl", "ollama-cloud/glm-4.6", "low"],
+    ["abort-partial-prefix.jsonl", "openai-codex/gpt-6-luna", "medium"],
+    // Only a fallback model_change exists on this chain, so no user model is recorded.
+    ["custom-message-visible.jsonl", undefined, "low"],
+    ["new-header-only.jsonl", undefined, "medium"],
+  ])("%s reports model %s and thinking level %s from the active chain", async (file, model, thinkingLevel) => {
+    const snap = await snapshot(file);
+    expect(snap.model).toBe(model);
+    expect(snap.thinkingLevel).toBe(thinkingLevel);
+  });
+
   test("scrubbed fixtures carry no personal paths, credentials, or hidden injection text", async () => {
     for (const spec of [...CASES, { file: "new-header-only.jsonl" }]) {
       const raw = await readFile(join(FIXTURES, spec.file), "utf8");

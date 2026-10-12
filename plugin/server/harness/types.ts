@@ -14,8 +14,37 @@ export interface TranscriptSnapshot {
   turnState: "idle" | "working" | "unknown";
   lastTurnEnd?: NativeTurnEnd;
   lastTurnEndId?: string;
+  /** P3.5: last user-selected model (`provider/id`) from the active chain; undefined when the chain records none. */
+  model?: string;
+  /** P3.5: last recorded thinking level (`null` = off/cleared); undefined when the chain records none (use the live config). */
+  thinkingLevel?: string | null;
   extendsPrevious(previous: TranscriptSnapshot): boolean;
 }
+
+/** P3.5 model and thinking selection (contract frozen 2026-10-12 from the P3.5 spike). */
+export interface HarnessModel {
+  /** Exact id Paseo shows and sends back, e.g. `provider/id`. */
+  id: string;
+  label: string;
+  provider: string;
+  /** Allowed thinking levels; empty for a model without reasoning. `off` is implied for reasoning models. */
+  thinkingLevels: readonly string[];
+  defaultThinkingLevel?: string;
+  contextWindow?: number;
+}
+export interface HarnessConfig {
+  model: string | null;
+  /** Resolved current level (`null` when the model has no reasoning or it is off). */
+  thinkingLevel: string | null;
+  models: readonly HarnessModel[];
+}
+export type ConfigureResult =
+  | { type: "configured"; config: HarnessConfig }
+  | { type: "rejected"; code: string; message: string }
+  | { type: "uncertain"; message: string };
+export interface ConfigTarget { pid: number; ref: AgentSessionRef; instanceId: string; }
+/** P3.5B: a sibling native session forked off ours by another process. */
+export interface NativeFork { path: string; sessionId: string; }
 export interface TranscriptReader {
   snapshot(): Promise<TranscriptSnapshot>;
   /** Notify when the underlying transcript may have changed (P2A live sync). */
@@ -47,5 +76,11 @@ export interface HarnessAdapter {
   readonly blockedHint: string;
   /** Optional: input companion install check; a not-ok result keeps import read-only. */
   inputCompanionStatus?(): Promise<{ ok: boolean; diagnostic?: string }>;
+  /** P3.5A: live model/thinking state and the install-wide model list. */
+  readConfig?(target: ConfigTarget, signal?: AbortSignal): Promise<HarnessConfig>;
+  /** P3.5A: change model and/or thinking level; only while idle; validates exactly, applies nothing on refusal. */
+  configure?(target: ConfigTarget, changes: { model?: string; thinkingLevel?: string }, signal?: AbortSignal): Promise<ConfigureResult>;
+  /** P3.5B: sibling sessions whose header names `locator`'s session as their parent (excluding `locator` itself). */
+  findForks?(locator: TranscriptLocator, signal?: AbortSignal): Promise<NativeFork[]>;
 }
 

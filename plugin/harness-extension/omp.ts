@@ -19,10 +19,24 @@ interface InputContext {
     notify(message: string, type: "error"): void;
   };
   sessionManager: { getSessionFile(): unknown; getSessionId(): unknown };
+  models: { list(): unknown; current(): unknown };
 }
 interface CompanionApi {
   on(event: "session_start" | "session_switch" | "session_shutdown", handler: (event: unknown, ctx: InputContext) => void): void;
   sendUserMessage(content: string): void;
+  setModel(model: unknown): Promise<unknown> | unknown;
+  getThinkingLevel(): unknown;
+  setThinkingLevel(level: string): unknown;
+}
+interface ModelEntry {
+  native: unknown;
+  id: string;
+  provider: string;
+  name: string;
+  reasoning: boolean;
+  efforts: string[];
+  defaultLevel?: string;
+  contextWindow: number | null;
 }
 interface InputState {
   ref: NativeRef | null;
@@ -46,6 +60,49 @@ function nativeRef(ctx: InputContext): NativeRef | null {
   return null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Null when the list has an unknown shape; individually malformed entries are unselectable and skipped. */
+function readModelList(ctx: InputContext): ModelEntry[] | null {
+  try {
+    const list = ctx.models.list();
+    if (!Array.isArray(list)) return null;
+    const models: ModelEntry[] = [];
+    for (const item of list as unknown[]) {
+      if (!isRecord(item) || typeof item.provider !== "string" || item.provider.length === 0 ||
+          typeof item.id !== "string" || item.id.length === 0 || typeof item.reasoning !== "boolean") continue;
+      const thinking = isRecord(item.thinking) ? item.thinking : undefined;
+      const efforts = Array.isArray(thinking?.efforts)
+        ? (thinking.efforts as unknown[]).filter((level): level is string => typeof level === "string" && level.length > 0)
+        : [];
+      models.push({
+        native: item,
+        id: `${item.provider}/${item.id}`,
+        provider: item.provider,
+        name: typeof item.name === "string" && item.name.length > 0 ? item.name : item.id,
+        reasoning: item.reasoning,
+        efforts,
+        ...(typeof thinking?.defaultLevel === "string" && thinking.defaultLevel.length > 0 ? { defaultLevel: thinking.defaultLevel } : {}),
+        contextWindow: typeof item.contextWindow === "number" && Number.isFinite(item.contextWindow) ? item.contextWindow : null,
+      });
+    }
+    return models;
+  } catch { return null; }
+}
+
+/** `undefined` = the API misbehaved; `null` = no current model. */
+function readCurrentModel(ctx: InputContext): string | null | undefined {
+  try {
+    const current = ctx.models.current();
+    if (current === undefined || current === null) return null;
+    if (isRecord(current) && typeof current.provider === "string" && typeof current.id === "string" &&
+        current.provider.length > 0 && current.id.length > 0) return `${current.provider}/${current.id}`;
+  } catch { /* fall through */ }
+  return undefined;
+}
+
 export default function ompInputCompanion(pi: CompanionApi): void {
   // A new extension instance (including an explicit operator reload) invalidates
   // every prior input identity, even when the OS process PID stays the same.
@@ -59,6 +116,7 @@ export default function ompInputCompanion(pi: CompanionApi): void {
   let socketIdentity: fs.Stats | null = null;
   let started = false;
   let ready = false;
+  let configuring = false;
 
   function snapshot(): InputState | null {
     if (!ctx) return null;
@@ -83,6 +141,116 @@ export default function ompInputCompanion(pi: CompanionApi): void {
     } catch { return null; }
   }
 
+  function readThinkingLevel(): string | null | undefined {
+    try {
+      const level = pi.getThinkingLevel();
+      return typeof level === "string" ? level : level === undefined || level === null ? null : undefined;
+    } catch { return undefined; }
+  }
+
+  function wireModel(model: ModelEntry): Record<string, unknown> {
+    return {
+      id: model.id, provider: model.provider, name: model.name, reasoning: model.reasoning,
+      efforts: model.efforts, ...(model.defaultLevel ? { defaultLevel: model.defaultLevel } : {}),
+      contextWindow: model.contextWindow,
+    };
+  }
+
+  function configure(
+    request: Record<string, unknown>,
+    state: InputState,
+    respond: (result: Record<string, unknown>) => void,
+    refuse: (code: string, message: string) => void,
+  ): void {
+    const context = ctx;
+    if (!context) { refuse("no_session", "The OMP session state is unavailable."); return; }
+    if (state.mode !== "tui" || state.hasUI !== true || state.isMain !== true) {
+      refuse("not_interactive", "OMP configuration requires an interactive main TUI session.");
+      return;
+    }
+    if (state.isIdle !== true || configuring) {
+      refuse("not_idle", "OMP is working; wait until it is idle before changing the model or thinking level.");
+      return;
+    }
+    if (state.hasPending !== false) {
+      refuse("pending_messages", "OMP has pending messages; wait for them to finish before changing the model or thinking level.");
+      return;
+    }
+    const wantsModel = request.model !== undefined;
+    const wantsThinking = request.thinkingLevel !== undefined;
+    if (!wantsModel && !wantsThinking) { refuse("bad_request", "Nothing to configure."); return; }
+    if ((wantsModel && (typeof request.model !== "string" || request.model.length === 0)) ||
+        (wantsThinking && (typeof request.thinkingLevel !== "string" || request.thinkingLevel.length === 0))) {
+      refuse("bad_request", "Model and thinking level must be non-empty strings.");
+      return;
+    }
+    const models = readModelList(context);
+    if (!models) { refuse("config_unavailable", "OMP model state is unavailable."); return; }
+    // Exact provider/id match only; never the fuzzy resolver.
+    let target: ModelEntry | undefined;
+    if (wantsModel) {
+      target = models.find((candidate) => candidate.id === request.model);
+      if (!target) { refuse("unknown_model", `OMP has no available model ${String(request.model)}.`); return; }
+    } else {
+      const current = readCurrentModel(context);
+      if (current === undefined) { refuse("config_unavailable", "OMP model state is unavailable."); return; }
+      target = models.find((candidate) => candidate.id === current);
+      if (!target) { refuse("unknown_model", "The current OMP model is not in the available model list."); return; }
+    }
+    if (wantsThinking) {
+      const level = request.thinkingLevel as string;
+      if (!target.reasoning) {
+        refuse("thinking_unsupported", `${target.id} does not support thinking levels.`);
+        return;
+      }
+      if (level !== "off" && !target.efforts.includes(level)) {
+        refuse("invalid_thinking", `${target.id} does not support thinking level ${level}.`);
+        return;
+      }
+    }
+    // Everything is validated. No await may separate the idle check above from
+    // the first setModel call below.
+    const chosen: ModelEntry = target;
+    configuring = true;
+    void (async () => {
+      try {
+        if (wantsModel) {
+          let applied: unknown;
+          try { applied = await pi.setModel(chosen.native); }
+          catch {
+            respond({ type: "uncertain", message: "OMP failed while switching models; the model may have partly changed. Do not retry automatically." });
+            return;
+          }
+          if (applied !== true) {
+            refuse("model_unavailable", `OMP could not switch to ${chosen.id} (no API key or unavailable).`);
+            return;
+          }
+        }
+        if (wantsThinking) {
+          try { pi.setThinkingLevel(request.thinkingLevel as string); }
+          catch {
+            respond({ type: "uncertain", message: "OMP failed while setting the thinking level; the configuration may have partly changed." });
+            return;
+          }
+        }
+        const model = readCurrentModel(context);
+        const thinkingLevel = readThinkingLevel();
+        const fresh = readModelList(context);
+        if (model === undefined || thinkingLevel === undefined || !fresh) {
+          respond({ type: "uncertain", message: "OMP applied the change but its state could not be read back." });
+          return;
+        }
+        if (wantsModel && model !== chosen.id) {
+          respond({ type: "uncertain", message: "OMP did not report the requested model after switching." });
+          return;
+        }
+        respond({ type: "configured", model, thinkingLevel, models: fresh.map(wireModel) });
+      } finally {
+        configuring = false;
+      }
+    })();
+  }
+
   function handle(value: unknown, socket: net.Socket): void {
     const request = typeof value === "object" && value !== null && !Array.isArray(value)
       ? value as Record<string, unknown> : {};
@@ -94,12 +262,12 @@ export default function ompInputCompanion(pi: CompanionApi): void {
     const refuse = (code: string, message: string) => respond({ type: "rejected", code, message });
     const ref = request.ref;
     if (typeof request.nonce !== "string" || request.nonce.length === 0 ||
-        (request.op !== "inspect" && request.op !== "submit") ||
+        (request.op !== "inspect" && request.op !== "submit" && request.op !== "config" && request.op !== "configure") ||
         typeof ref !== "object" || ref === null || Array.isArray(ref)) {
       refuse("bad_request", "Invalid OMP input companion request.");
       return;
     }
-    if (request.pid !== process.pid || (request.op === "submit" && request.instanceId !== instanceId)) {
+    if (request.pid !== process.pid || (request.op !== "inspect" && request.instanceId !== instanceId)) {
       refuse("identity_mismatch", "The OMP input process instance changed; reconnect before sending another prompt.");
       return;
     }
@@ -114,6 +282,27 @@ export default function ompInputCompanion(pi: CompanionApi): void {
     }
     if (request.op === "inspect") {
       respond({ type: "inspected", ...state });
+      return;
+    }
+    if (request.op === "config") {
+      const liveCtx = ctx;
+      if (!liveCtx) { refuse("no_session", "The OMP session state is unavailable."); return; }
+      const models = readModelList(liveCtx);
+      const model = readCurrentModel(liveCtx);
+      const thinkingLevel = readThinkingLevel();
+      if (!models || model === undefined || thinkingLevel === undefined) {
+        refuse("config_unavailable", "OMP model state is unavailable.");
+        return;
+      }
+      respond({ type: "config", model, thinkingLevel, models: models.map(wireModel) });
+      return;
+    }
+    if (request.op === "configure") {
+      configure(request, state, respond, refuse);
+      return;
+    }
+    if (configuring) {
+      refuse("not_idle", "OMP is applying a model change; wait before sending a prompt.");
       return;
     }
     if (state.mode !== "tui" || state.hasUI !== true || state.isMain !== true) {

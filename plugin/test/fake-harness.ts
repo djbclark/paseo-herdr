@@ -1,5 +1,8 @@
 import type {
+  ConfigureResult,
   HarnessAdapter,
+  HarnessConfig,
+  HarnessModel,
   TranscriptLocator,
   TranscriptReader,
   TranscriptSnapshot,
@@ -32,6 +35,9 @@ export class FakeTranscript {
   get lastEntry(): FakeTranscriptEntry | undefined { return this.entries.at(-1); }
   notify(): void { for (const listener of this.listeners) listener(); }
   readonly nativeSessionKey = "fake-session-1";
+  /** P3.5: what the transcript chain records as the last model / thinking level (undefined = nothing recorded). */
+  model: string | undefined;
+  thinkingLevel: string | null | undefined;
 
   set(entries: FakeTranscriptEntry[]): void {
     this.entries = [...entries];
@@ -54,9 +60,57 @@ export class FakeTranscript {
   }
 }
 
-export function makeFakeAdapter(transcript?: FakeTranscript): HarnessAdapter {
+export const FAKE_MODELS: readonly HarnessModel[] = [
+  { id: "fake/reasoner", label: "Reasoner", provider: "fake", thinkingLevels: ["low", "medium", "high"], defaultThinkingLevel: "medium", contextWindow: 200000 },
+  { id: "fake/plain", label: "Plain", provider: "fake", thinkingLevels: [] },
+];
+
+/** Mutable live config of the fake agent; tests read the call logs and override responses. */
+export class FakeConfig {
+  model: string | null = "fake/reasoner";
+  thinkingLevel: string | null = "medium";
+  models: readonly HarnessModel[] = FAKE_MODELS;
+  readError: Error | null = null;
+  /** When set, `configure` returns this instead of applying the change. */
+  configureOverride: ConfigureResult | null = null;
+  /** When set, `configure` waits for it before answering. */
+  configureGate: Promise<void> | null = null;
+  reads = 0;
+  readonly configureCalls: Array<{ model?: string; thinkingLevel?: string }> = [];
+  snapshot(): HarnessConfig { return { model: this.model, thinkingLevel: this.thinkingLevel, models: this.models }; }
+}
+
+/** `config` makes the adapter implement the optional P3.5A readConfig/configure pair. */
+export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?: FakeConfig } = {}): HarnessAdapter {
   const store = transcript ?? new FakeTranscript();
+  const live = options.config;
+  const configSupport: Pick<HarnessAdapter, "readConfig" | "configure"> = live ? {
+    readConfig: async () => {
+      live.reads++;
+      if (live.readError) throw live.readError;
+      return live.snapshot();
+    },
+    configure: async (_target, changes) => {
+      live.configureCalls.push(changes);
+      await live.configureGate;
+      if (live.configureOverride) return live.configureOverride;
+      const model = changes.model ?? live.model;
+      const entry = live.models.find((candidate) => candidate.id === model);
+      if (!entry) return { type: "rejected", code: "unknown_model", message: `Unknown model ${model}` };
+      let level = changes.model !== undefined && changes.thinkingLevel === undefined ? (entry.thinkingLevels.length ? entry.defaultThinkingLevel ?? null : null) : live.thinkingLevel;
+      if (changes.thinkingLevel !== undefined) {
+        if (!entry.thinkingLevels.length || (changes.thinkingLevel !== "off" && !entry.thinkingLevels.includes(changes.thinkingLevel))) {
+          return { type: "rejected", code: "invalid_thinking", message: `${entry.label} does not support ${changes.thinkingLevel}` };
+        }
+        level = changes.thinkingLevel === "off" ? null : changes.thinkingLevel;
+      }
+      live.model = entry.id;
+      live.thinkingLevel = entry.thinkingLevels.length ? level : null;
+      return { type: "configured", config: live.snapshot() };
+    },
+  } : {};
   return {
+    ...configSupport,
     id: FAKE_HARNESS_ID,
     label: "Fake",
     herdrIntegration: "fake",
@@ -73,6 +127,8 @@ export function makeFakeAdapter(transcript?: FakeTranscript): HarnessAdapter {
           return {
             items,
             timestamps,
+            ...(store.model !== undefined ? { model: store.model } : {}),
+            ...(store.thinkingLevel !== undefined ? { thinkingLevel: store.thinkingLevel } : {}),
             turnState: !store.lastEntry || store.lastEntry.kind === "assistant" ? "idle" : "working",
             ...(store.lastEntry?.kind === "assistant" ? { lastTurnEnd: store.lastEntry.end ?? "completed", lastTurnEndId: store.lastEntry.id } : {}),
             chainHead: items.at(-1)?.id ?? null,
