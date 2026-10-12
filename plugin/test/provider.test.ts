@@ -6,6 +6,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createHerdrProvider } from "../server/provider.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { classifyHerdrPrompt } from "../server/prompt.js";
+import { LaunchError, type LaunchResult } from "../server/launch.js";
+import { FakeTranscript, makeFakeAdapter } from "./fake-harness.js";
 import { ProviderEventSchema, type ProviderConnection, type ProviderEvent, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 
 const config: ProviderSessionConfig = {
@@ -138,4 +140,118 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
     event.clientMessageId === "message-2" && event.result.type === "failed")).toBe(true));
   expect(sent.filter((request) => request.method === "agent.prompt")).toHaveLength(1);
   await connection.close();
+});
+
+// --- Create path (no persistence): provider dispatch ---------------------------------------
+async function createRig(options: { companion?: { ok: boolean; diagnostic?: string }; launch: (signal: AbortSignal) => Promise<LaunchResult> }) {
+  directory = await mkdtemp(join(tmpdir(), "herdr-create-"));
+  const socket = join(directory, "herdr.sock");
+  const agent = { terminal_id: "term-new", pane_id: "pane-new", agent: "fake", name: "paseo-abc123", cwd: "/work",
+    agent_status: "idle", screen_detection_skipped: false, state_labels: {}, tokens: {},
+    agent_session: { source: "herdr:fake", agent: "fake", kind: "id", value: "fake-session-1" },
+    workspace_id: "w1", tab_id: "t1", focused: true, launch_pending: false, interactive_ready: true,
+    state_change_seq: 0, completion_seq: null, revision: 0 };
+  const sent: Array<{ method: string; params: Record<string, unknown> }> = [];
+  server = createServer((stream) => {
+    let bytes = "";
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk: string) => {
+      bytes += chunk;
+      if (!bytes.includes("\n")) return;
+      const request = JSON.parse(bytes.slice(0, bytes.indexOf("\n"))) as { id: string; method: string; params: Record<string, unknown> };
+      sent.push({ method: request.method, params: request.params });
+      if (request.method === "events.subscribe") {
+        stream.write(JSON.stringify({ id: request.id, result: { type: "subscription_started" } }) + "\n");
+        return;
+      }
+      const result = request.method === "pane.process_info" ? { type: "pane_process_info", process_info: {
+        pane_id: "pane-new", foreground_process_group_id: 77, tty: "/dev/pts/fake", foreground_processes: [{ pid: 77, name: "fake" }] } } :
+        request.method === "agent.list" ? { type: "agent_list", agents: [agent] } :
+        request.method === "agent.prompt" ? { type: "agent_prompted", agent } : { type: "unknown" };
+      stream.end(JSON.stringify({ id: request.id, result }) + "\n");
+    });
+  });
+  await new Promise<void>((resolve) => server?.listen(socket, resolve));
+  const adapter = makeFakeAdapter(new FakeTranscript());
+  const launches: AbortSignal[] = [];
+  const provider = createHerdrProvider(
+    { ...adapter, ...(options.companion ? { inputCompanionStatus: async () => options.companion! } : {}) },
+    async () => socket,
+    { getHerdrSession: () => "work", launch: async (_config, signal) => { launches.push(signal); return options.launch(signal); } },
+  );
+  const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message"] });
+  connections.push(connection);
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => events.push(ProviderEventSchema.parse(event)));
+  return { connection, events, sent, launches };
+}
+const launchedAgent = (): LaunchResult => ({ agentName: "paseo-abc123", terminalId: "term-new", paneId: "pane-new",
+  tabId: "t1", workspaceId: "w1", createdWorkspace: true, cwd: "/work", sessionRef: { kind: "id", value: "fake-session-1" } });
+const openNew = { type: "session.open", requestId: "open", sessionId: "new", config, history: "replay" } as const;
+
+it("creates an agent without persistence, announces how to attach, and admits a prompt", async () => {
+  const { connection, events, sent } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent() });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  expect(events.find((event) => event.type === "session.opened")).toMatchObject({ requestId: "open", persistence: { data: {
+    terminalId: "term-new", agentName: "paseo-abc123", herdrSession: "work", sessionRef: { kind: "id", value: "fake-session-1" } } } });
+  const notices = events.filter((event) => event.type === "session.notice");
+  expect(notices).toHaveLength(1);
+  expect(notices[0]).toMatchObject({ notice: { id: "attach", severity: "info",
+    description: expect.stringContaining("herdr --session work agent attach paseo-abc123") } });
+  await connection.send({ type: "session.prompt", sessionId: "new", prompt: {
+    clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "Go" }] } } });
+  await vi.waitFor(() => expect(sent.some((request) => request.method === "agent.prompt")).toBe(true));
+  expect(sent.find((request) => request.method === "agent.prompt")?.params).toMatchObject({ target: "pane-new", text: "Go" });
+});
+
+it("refuses to create when the input companion is missing and never launches", async () => {
+  const { connection, events, launches } = await createRig({ companion: { ok: false, diagnostic: "companion missing" },
+    launch: async () => launchedAgent() });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.failed")).toBe(true));
+  expect(events.find((event) => event.type === "request.failed")).toMatchObject({ requestId: "open", error: { message: "companion missing" } });
+  expect(launches).toEqual([]);
+  expect(events.some((event) => event.type === "session.opened")).toBe(false);
+});
+
+it("fails the request on LaunchError and does not leave the session registered", async () => {
+  let attempt = 0;
+  const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => {
+    if (attempt++ === 0) throw new LaunchError("Launch timed out; pane p-9 in workspace w-9 is still running", "timeout");
+    return launchedAgent();
+  } });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.failed")).toBe(true));
+  expect(events.find((event) => event.type === "request.failed")).toMatchObject({
+    requestId: "open", error: { message: expect.stringContaining("pane p-9") } });
+  expect(events.some((event) => event.type === "session.opened")).toBe(false);
+  // The id is free again (no "Session already open") and a prompt to it is unknown.
+  await connection.send({ type: "session.prompt", sessionId: "new", prompt: {
+    clientMessageId: "m0", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "x" }] } } });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.prompt_result")).toBe(true));
+  expect(events.find((event) => event.type === "session.prompt_result")).toMatchObject({
+    result: { type: "failed", error: { message: "Unknown session" } } });
+  await connection.send({ ...openNew, requestId: "retry" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready" && event.requestId === "retry")).toBe(true));
+});
+
+it("close during launch aborts the launch and emits no session events afterwards", async () => {
+  let release!: (result: LaunchResult) => void;
+  const { connection, events, launches } = await createRig({ companion: { ok: true },
+    launch: () => new Promise<LaunchResult>((resolve) => { release = resolve; }) });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(launches).toHaveLength(1));
+  await connection.send({ type: "session.close", sessionId: "new", requestId: "close" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.completed" && event.requestId === "close")).toBe(true));
+  expect(launches[0].aborted).toBe(true);
+  release(launchedAgent());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(events.map((event) => event.type)).toEqual(["session.closed", "request.completed"]);
+});
+
+it("OMP launch args pass model and thinking and never disable extensions (the companion must load)", () => {
+  expect(ompAdapter.launchArgs({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
+  expect(ompAdapter.launchArgs(config)).toEqual([]);
+  expect(ompAdapter.launchArgs({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
 });

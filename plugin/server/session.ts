@@ -7,6 +7,8 @@ import { emptyTimelineState, seedTimeline } from "./timeline.js";
 import { TurnTracker, type TurnEffect } from "./turns.js";
 import { PromptController } from "./prompt.js";
 import { LiveSession } from "./live-session.js";
+import type { LaunchResult } from "./launch.js";
+import { attachCommand } from "./herdr-commands.js";
 
 export interface HerdrRequest {
   (method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown>;
@@ -18,7 +20,15 @@ export interface SessionDeps {
   subscribe(subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }): Promise<HerdrSubscription>;
   emit(event: ProviderEvent): void;
   getHerdrSession?: () => string | null;
+  /** Create path: launch a new agent. Absent when the provider cannot create agents. */
+  launch?(config: ProviderSessionConfig, signal: AbortSignal): Promise<LaunchResult>;
 }
+
+/** Placeholder binding for a session whose agent is still being launched. */
+export function pendingBinding(adapter: HarnessAdapter, herdrSession: string | null, cwd: string): Binding {
+  return { harness: adapter.id, herdrSession, terminalId: "", agentName: null, sessionRef: null, cwd, submittedMessages: {} };
+}
+
 
 /** One owner for control and observation. Helpers hold only scheduling resources. */
 export interface SessionState {
@@ -61,6 +71,42 @@ export class HerdrHarnessSession {
   current(generation: number): boolean { return !this.isAborted && this.state.generation === generation; }
   emit(event: ProviderEvent): void { if (!this.isAborted) this.deps.emit(event); }
   persist(): void { this.emit({ type: "session.persistence", sessionId: this.sessionId, persistence: persistenceOf(this.state.binding) }); }
+
+  /**
+   * Create path: launch a new agent, bind to it, then run the normal open flow.
+   * Closing the session aborts the launch; whatever was launched stays running.
+   */
+  async create(config: ProviderSessionConfig, history: "replay" | "skip", requestId?: string): Promise<void> {
+    if (!this.deps.launch) throw new Error("Creating agents is not supported");
+    const launched = await this.deps.launch(config, this.signal);
+    if (this.isAborted) return;
+    this.state.binding = {
+      harness: this.adapter.id,
+      herdrSession: this.deps.getHerdrSession?.() ?? null,
+      terminalId: launched.terminalId,
+      agentName: launched.agentName,
+      sessionRef: launched.sessionRef ? { kind: launched.sessionRef.kind, value: launched.sessionRef.value } : null,
+      cwd: launched.cwd,
+      submittedMessages: {},
+    };
+    try {
+      await this.open(config, history, requestId);
+    } catch (error) {
+      // The launch succeeded, so the agent is running; the request fails but must say where it is.
+      if (this.isAborted) throw error;
+      const { herdrSession, agentName } = this.state.binding;
+      if (!agentName) throw error;
+      const text = messageOf(error);
+      throw new Error(`${/[.!?]$/.test(text) ? text : `${text}.`} The agent keeps running in Herdr; attach with: ${attachCommand(herdrSession, agentName)}`);
+    }
+    if (this.isAborted) return;
+    const readonly = this.state.outcome === "readonly";
+    this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
+      id: "attach", severity: "info", title: `${this.adapter.label} agent running in Herdr`,
+      description: `The agent ${launched.agentName} is running in Herdr and keeps running if you close this conversation. Attach from a terminal with: ${attachCommand(this.state.binding.herdrSession, launched.agentName)}`
+        + (readonly ? ". This conversation is read-only." : ""),
+    } });
+  }
 
   async open(config: ProviderSessionConfig, history: "replay" | "skip", requestId?: string): Promise<void> {
     const generation = this.state.generation;

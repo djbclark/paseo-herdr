@@ -11,13 +11,16 @@ import { HerdrClient, checkHerdrStatus, type SubscriptionDescriptor } from "./he
 import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
 import { parseBinding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
-import { HerdrHarnessSession } from "./session.js";
+import { launchAgent } from "./launch.js";
+import { HerdrHarnessSession, pendingBinding, type SessionDeps } from "./session.js";
 
 const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
 
 export interface ProviderHooks {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
   getHerdrSession?: () => string | null;
+  /** Override the agent launcher (tests); defaults to `launchAgent` over the Herdr socket. */
+  launch?: SessionDeps["launch"];
 }
 
 export function createHerdrProvider(
@@ -57,15 +60,17 @@ export function createHerdrProvider(
         const result = await (await client()).request("agent.list", {}, { signal });
         return AgentListResultSchema.parse(result).agents;
       };
-      const sessionDeps = () => ({
+      const herdrRequest: SessionDeps["request"] = (method, params = {}, options) =>
+        client().then((herdr) => herdr.request(method, params, options));
+      const sessionDeps = (): SessionDeps => ({
         adapter,
         listAgents: (signal?: AbortSignal) => list(signal),
-        request: (method: string, params: Record<string, unknown> = {}, options?: { signal?: AbortSignal }) =>
-          client().then((herdr) => herdr.request(method, params, options)),
+        request: herdrRequest,
         subscribe: (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) =>
           client().then((herdr) => herdr.subscribe(subscriptions, options)),
         emit,
         getHerdrSession: hooks.getHerdrSession,
+        launch: hooks.launch ?? ((config, signal) => launchAgent({ request: herdrRequest, herdrSession: hooks.getHerdrSession?.() ?? null }, adapter, config, signal)),
       });
 
       const dispatch = async (input: ProviderInput): Promise<void> => {
@@ -80,11 +85,32 @@ export function createHerdrProvider(
             return;
           }
           case "session.open": {
-            if (!input.persistence) throw new Error("Import an existing Herdr agent first; creation is not supported yet");
             if (sessions.has(input.sessionId)) throw new Error("Session already open");
+            if (!input.persistence) {
+              // A created agent without the input companion would be read-only at once; refuse before launching.
+              let companion: { ok: boolean; diagnostic?: string } | undefined;
+              try { companion = await adapter.inputCompanionStatus?.(); }
+              catch (error) { companion = { ok: false, diagnostic: `Input companion check failed: ${String(error)}` }; }
+              if (companion && !companion.ok) {
+                throw new Error(companion.diagnostic ?? `The ${adapter.label} input companion is not installed`);
+              }
+              if (sessions.has(input.sessionId)) throw new Error("Session already open");
+              const session = new HerdrHarnessSession(input.sessionId,
+                pendingBinding(adapter, hooks.getHerdrSession?.() ?? null, input.config.cwd), sessionDeps());
+              sessions.set(input.sessionId, session);
+              try {
+                await session.create(input.config, input.history, input.requestId);
+              } catch (error) {
+                const closedMeanwhile = session.isAborted;
+                session.close();
+                if (sessions.get(input.sessionId) === session) sessions.delete(input.sessionId);
+                // session.close already answered this request's session; nothing more to report.
+                if (!closedMeanwhile) throw error;
+              }
+              return;
+            }
             const binding = parseBinding(input.persistence, adapter);
-            const deps = sessionDeps();
-            const session = new HerdrHarnessSession(input.sessionId, binding, deps);
+            const session = new HerdrHarnessSession(input.sessionId, binding, sessionDeps());
             sessions.set(input.sessionId, session);
             try {
               await session.open(input.config, input.history, input.requestId);
