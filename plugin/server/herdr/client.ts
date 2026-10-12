@@ -33,11 +33,16 @@ export interface SubscriptionDescriptor {
 }
 
 export interface SubscriptionEventEnvelope {
-  /** Raw event name as pushed (dotted per-pane or snake_case lifecycle). */
+  /** Native event name, or synthetic observer.connected / observer.disconnected. */
   event: string;
   data: unknown;
   /** Set when events were dropped server-side (see `ReconnectOptions.onEventsLost`). */
   eventsLost?: boolean;
+}
+
+export interface HerdrSubscription {
+  [Symbol.asyncIterator](): AsyncIterator<SubscriptionEventEnvelope>;
+  close(): void;
 }
 
 export interface ReconnectOptions {
@@ -201,18 +206,26 @@ export class HerdrClient {
     return this.request("pane.process_info", { pane_id: paneId }, options);
   }
 
+  /** Send keys to a pane (`pane.send_keys`; used for the interrupt key). */
+  paneSendKeys(paneId: string, keys: readonly string[], options?: RequestOptions): Promise<unknown> {
+    return this.request("pane.send_keys", { pane_id: paneId, keys: [...keys] }, options);
+  }
+
   /**
    * Open a long-lived `events.subscribe` stream and yield each pushed event.
    * The subscription connection stays open until the returned close function is
    * called or the abort signal fires. Reconnects with exponential backoff when
    * the socket drops; a server `events_lost` error invokes `onEventsLost` once
    * and re-subscribes (the caller is responsible for reconciling via
-   * `session.snapshot`). Input requests are never replayed.
+   * `session.snapshot`). Synthetic `observer.disconnected` marks transport/event
+   * loss; `observer.connected` follows each `subscription_started` ack, including
+   * the initial one. An ack does not imply reconciled state or input readiness.
+   * Input requests are never replayed.
    */
   subscribe(
     subscriptions: SubscriptionDescriptor[],
     options: { signal?: AbortSignal; reconnect?: ReconnectOptions } = {},
-  ): { [Symbol.asyncIterator](): AsyncIterator<SubscriptionEventEnvelope>; close(): void } {
+  ): HerdrSubscription {
     const signal = options.signal;
     const reconnect = {
       baseDelayMs: options.reconnect?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS,
@@ -223,7 +236,7 @@ export class HerdrClient {
 
     let closed = false;
     let currentSocket: Socket | undefined;
-    let closeRequested = false;
+    let retryTimer: NodeJS.Timeout | undefined;
     let wake: (() => void) | undefined;
 
     const self = this;
@@ -234,18 +247,32 @@ export class HerdrClient {
         currentSocket = undefined;
       }
     };
-    const drop = () => {
-      closed = true;
-      destroyCurrent();
-      if (wake) wake();
-    };
     const close = () => {
-      closeRequested = true;
-      drop();
+      closed = true;
+      signal?.removeEventListener("abort", close);
+      destroyCurrent();
+      wake?.();
     };
     if (signal) {
-      if (signal.aborted) closeRequested = true;
+      if (signal.aborted) close();
       else signal.addEventListener("abort", close, { once: true });
+    }
+
+    function waitToReconnect(delay: number): Promise<void> {
+      return new Promise<void>((resolve) => {
+        if (closed) {
+          resolve();
+          return;
+        }
+        const finish = () => {
+          clearTimeout(retryTimer);
+          retryTimer = undefined;
+          wake = undefined;
+          resolve();
+        };
+        wake = finish;
+        retryTimer = setTimeout(finish, delay);
+      });
     }
 
     /** Feed complete newline-delimited lines from a socket into the queue. */
@@ -269,29 +296,27 @@ export class HerdrClient {
     async function* run(): AsyncGenerator<SubscriptionEventEnvelope> {
       const params = { subscriptions };
       let attempt = 0;
+      let disconnected = false;
       let lostSignaled = false;
       try {
-        while (!closeRequested) {
-          let eventsLost = false;
+        while (!closed) {
           const lines = new AsyncQueue<string>();
-          let sock: Socket;
           try {
-            sock = await connectSubscription();
-            if (closeRequested || closed) {
-              sock.destroy();
-              return;
-            }
-            currentSocket = sock;
-            attachReader(sock, lines);
+            const sock = await connectSubscription(lines);
+            if (closed) return;
             sock.write(JSON.stringify({ id: randomUUID(), method: "events.subscribe", params }) + "\n");
             const ack = await lines.next();
+            if (closed) return;
             if (ack.error) throw ack.error;
             self.assertAck(ack.value);
             attempt = 0;
+            disconnected = false;
             lostSignaled = false;
+            yield { event: "observer.connected", data: undefined };
 
-            for (;;) {
+            while (!closed) {
               const item = await lines.next();
+              if (closed) return;
               if (item.error) throw item.error;
               const line = item.value;
               if (line === undefined) break;
@@ -299,47 +324,45 @@ export class HerdrClient {
               if (envelope) {
                 yield envelope;
               } else {
-                // A server error envelope (e.g. events_lost) ends the stream.
-                const err = self.parseError(line);
-                if (err && err.code === "events_lost") {
-                  eventsLost = true;
-                  if (!lostSignaled) {
-                    lostSignaled = true;
-                    reconnect.onEventsLost?.({ message: err.message });
-                  }
-                }
-                throw err ?? new Error(`herdr subscription returned unexpected line: ${line.slice(0, 200)}`);
+                // Server errors end this subscription, including events_lost.
+                throw self.parseError(line) ?? new Error(`herdr subscription returned unexpected line: ${line.slice(0, 200)}`);
               }
             }
             return;
           } catch (error) {
             destroyCurrent();
-            if (closeRequested || closed) return;
+            if (closed) return;
             if (isAbortError(error)) return;
-            const reconnectable = !(error instanceof HerdrError && error.code === "invalid_params");
-            const exhausted = attempt >= reconnect.maxAttempts;
-            if (!reconnectable || exhausted) {
-              if (eventsLost) yield { event: "events_lost", data: undefined, eventsLost: true };
-              throw error;
+            if (!disconnected) {
+              disconnected = true;
+              yield { event: "observer.disconnected", data: undefined };
             }
-            if (eventsLost) yield { event: "events_lost", data: undefined, eventsLost: true };
+            if (closed) return;
+            if (error instanceof HerdrError && error.code === "events_lost") {
+              if (!lostSignaled) {
+                lostSignaled = true;
+                reconnect.onEventsLost?.({ message: error.message });
+              }
+              yield { event: "events_lost", data: undefined, eventsLost: true };
+            }
+            if (closed) return;
+            const reconnectable = !(error instanceof HerdrError && error.code === "invalid_params");
+            if (!reconnectable || attempt >= reconnect.maxAttempts) throw error;
             attempt++;
             const delay = Math.min(reconnect.baseDelayMs * 2 ** (attempt - 1), reconnect.maxDelayMs);
-            const timer = setTimeout(() => wake?.(), delay);
-            await new Promise<void>((resolve) => { wake = resolve; });
-            clearTimeout(timer);
+            await waitToReconnect(delay);
           }
         }
       } finally {
-        signal?.removeEventListener("abort", close);
-        destroyCurrent();
+        close();
       }
     }
 
-    async function connectSubscription(): Promise<Socket> {
+    async function connectSubscription(lines: AsyncQueue<string>): Promise<Socket> {
       return new Promise<Socket>((resolve, reject) => {
         const sock = connect({ path: self.socketPath });
         currentSocket = sock;
+        attachReader(sock, lines);
         let settled = false;
         sock.once("close", () => {
           if (settled) return;
