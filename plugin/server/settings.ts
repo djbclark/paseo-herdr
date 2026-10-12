@@ -5,5 +5,8 @@ export const herdrSettings = defineSettings({
   id: "herdr-connection",
   scope: "host",
   version: 1,
-  schema: z.object({ herdrSocketPath: z.string().default("") }),
+  schema: z.object({
+    herdrSocketPath: z.string().default(""),
+    herdrSession: z.string().default(""),
+  }),
 });
