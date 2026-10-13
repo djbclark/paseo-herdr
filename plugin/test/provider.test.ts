@@ -144,7 +144,8 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
 });
 
 // --- Create path (no persistence): provider dispatch ---------------------------------------
-async function createRig(options: { companion?: { ok: boolean; diagnostic?: string }; launch: (signal: AbortSignal) => Promise<LaunchResult>; config?: FakeConfig }) {
+async function createRig(options: { companion?: { ok: boolean; diagnostic?: string }; launch: (signal: AbortSignal) => Promise<LaunchResult>; config?: FakeConfig; isEnabled?: () => Promise<boolean>;
+  target?: { socket?: (rigSocket: string) => string; session?: () => string | null } }) {
   directory = await mkdtemp(join(tmpdir(), "herdr-create-"));
   const socket = join(directory, "herdr.sock");
   const agent = { terminal_id: "term-new", pane_id: "pane-new", agent: "fake", name: "paseo-abc123", cwd: "/work",
@@ -175,20 +176,28 @@ async function createRig(options: { companion?: { ok: boolean; diagnostic?: stri
   await new Promise<void>((resolve) => server?.listen(socket, resolve));
   const adapter = makeFakeAdapter(new FakeTranscript(), { config: options.config });
   const launches: AbortSignal[] = [];
+  const launchConfigs: unknown[] = [];
   const provider = createHerdrProvider(
     { ...adapter, ...(options.companion ? { inputCompanionStatus: async () => options.companion! } : {}) },
-    async () => socket,
-    { getHerdrSession: () => "work", launch: async (_config, signal) => { launches.push(signal); return options.launch(signal); } },
+    async () => options.target?.socket?.(socket) ?? socket,
+    { getHerdrSession: options.target?.session ?? (() => "work"), isEnabled: options.isEnabled, launch: async (config, signal) => { launches.push(signal); launchConfigs.push(config); return options.launch(signal); } },
   );
   const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message", "session.configure"] });
   connections.push(connection);
   const events: ProviderEvent[] = [];
   connection.onEvent((event) => events.push(ProviderEventSchema.parse(event)));
-  return { connection, events, sent, launches };
+  return { connection, events, sent, launches, launchConfigs };
 }
 const launchedAgent = (): LaunchResult => ({ agentName: "paseo-abc123", terminalId: "term-new", paneId: "pane-new",
   tabId: "t1", workspaceId: "w1", createdWorkspace: true, cwd: "/work", sessionRef: { kind: "id", value: "fake-session-1" } });
 const openNew = { type: "session.open", requestId: "open", sessionId: "new", config, history: "replay" } as const;
+
+it.each(["native-default", "fake/reasoner"])("resolves launch model %s before invoking the harness", async (model) => {
+  const { connection, events, launchConfigs } = await createRig({ launch: async () => launchedAgent() });
+  await connection.send({ ...openNew, config: { ...config, model } });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  expect(launchConfigs).toEqual([model === "native-default" ? config : { ...config, model }]);
+});
 
 it("creates an agent without persistence, announces how to attach, and admits a prompt", async () => {
   const { connection, events, sent } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent() });
@@ -214,6 +223,57 @@ it("refuses to create when the input companion is missing and never launches", a
   expect(events.find((event) => event.type === "request.failed")).toMatchObject({ requestId: "open", error: { message: "companion missing" } });
   expect(launches).toEqual([]);
   expect(events.some((event) => event.type === "session.opened")).toBe(false);
+});
+
+it("refuses to launch while the harness toggle is off, lists nothing, and still serves open sessions", async () => {
+  let enabled = true;
+  const { connection, events, launches, sent } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), isEnabled: async () => enabled });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  enabled = false;
+  await connection.send({ ...openNew, requestId: "off", sessionId: "other" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.failed")).toBe(true));
+  expect(events.find((event) => event.type === "request.failed")).toMatchObject({
+    requestId: "off", error: { message: expect.stringMatching(/is turned off in the Herdr plugin settings/) } });
+  expect(launches).toHaveLength(1);
+  const listCalls = sent.filter((request) => request.method === "agent.list").length;
+  await connection.send({ type: "sessions", requestId: "list", cwd: "/work" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "sessions" && event.requestId === "list")).toBe(true));
+  expect(events.find((event) => event.type === "sessions" && event.requestId === "list")).toMatchObject({ sessions: [] });
+  expect(sent.filter((request) => request.method === "agent.list").length).toBe(listCalls);
+  await connection.send({ type: "session.prompt", sessionId: "new", prompt: {
+    clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "Go" }] } } });
+  await vi.waitFor(() => expect(sent.some((request) => request.method === "agent.prompt")).toBe(true));
+  await connection.send({ type: "session.close", requestId: "close", sessionId: "new" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.closed")).toBe(true));
+});
+
+it("keeps an open session on the Herdr socket it opened on after the target changes", async () => {
+  let path: string | undefined;
+  const { connection, events, sent } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(),
+    target: { socket: (rigSocket) => path ?? rigSocket } });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  path = join(directory!, "elsewhere.sock");
+  await connection.send({ type: "session.prompt", sessionId: "new", prompt: {
+    clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "Go" }] } } });
+  await vi.waitFor(() => expect(sent.some((request) => request.method === "agent.prompt")).toBe(true));
+});
+
+it("refuses to reopen a conversation from another Herdr session instead of redirecting it", async () => {
+  let session: string | null = "work";
+  const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(),
+    target: { session: () => session } });
+  await connection.send(openNew);
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
+  const opened = events.find((event) => event.type === "session.opened");
+  if (!opened || opened.type !== "session.opened" || !opened.persistence) throw new Error("Missing persistence");
+  await connection.send({ type: "session.close", requestId: "close", sessionId: "new" });
+  session = null;
+  await connection.send({ type: "session.open", requestId: "reopen", sessionId: "again", config, persistence: opened.persistence, history: "replay" });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "request.failed" && event.requestId === "reopen")).toBe(true));
+  expect(events.find((event) => event.type === "request.failed" && event.requestId === "reopen")).toMatchObject({
+    error: { message: expect.stringContaining('belongs to Herdr session "work", but the Herdr plugin now targets the default Herdr session') } });
 });
 
 it("fails the request on LaunchError and does not leave the session registered", async () => {
@@ -280,12 +340,12 @@ it("advertises session.configure only when the adapter can read and change confi
   expect(configurable.events.find((event) => event.type === "session.opened")).toMatchObject({ capabilities: expect.arrayContaining(["session.configure"]) });
 });
 
-it("serves an empty catalog before any config was read, then models from the cache with per-model thinking options", async () => {
+it("offers the native default before any config was read, then models from the cache with per-model thinking options", async () => {
   const config = new FakeConfig();
   const { connection, events } = await createRig({ companion: { ok: true }, launch: async () => launchedAgent(), config });
   await connection.send({ type: "catalog", requestId: "c0", options: { cwd: "/work" } } as never);
   await vi.waitFor(() => expect(events.some((event) => event.type === "catalog")).toBe(true));
-  expect(catalogOf(events, "c0")).toEqual({ models: [], modes: [] });
+  expect(catalogOf(events, "c0")).toEqual({ models: [{ id: "native-default", label: "Configured default", isDefault: true }], modes: [] });
   await connection.send(openNew);
   await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready")).toBe(true));
   await connection.send({ type: "catalog", requestId: "c1", options: { cwd: "/work" } } as never);

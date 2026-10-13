@@ -59,6 +59,8 @@ export interface InputTarget { pid: number; ref: AgentSessionRef; }
 export interface HarnessAdapter {
   readonly id: string;
   readonly label: string;
+  /** Plugin-directory-relative path to a self-contained SVG; Paseo shows it beside this harness's chats and import rows. */
+  readonly icon?: string;
   readonly herdrIntegration: string;
   resolveTranscript(ref: AgentSessionRef | null, ctx: { cwd: string }): Promise<TranscriptLocator | null>;
   nativeSessionKey(ref: AgentSessionRef): string;

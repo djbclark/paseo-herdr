@@ -22,6 +22,7 @@ import { findOmpForks } from "./forks.js";
 export const ompAdapter: HarnessAdapter = {
   id: "omp",
   label: "OMP",
+  icon: "assets/omp-herdr.svg",
   herdrIntegration: "omp",
   resolveTranscript: async (ref) =>
     ref?.kind === "path" ? { path: ref.value, nativeSessionKey: ref.value } : null,

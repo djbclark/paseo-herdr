@@ -298,3 +298,34 @@ export interface HerdrResult {
   type: string;
   [key: string]: unknown;
 }
+
+/* ---- P3.7B overview listings ---- */
+
+export const WorkspaceListResultSchema = z.object({
+  type: z.literal("workspace_list"),
+  workspaces: z.array(z.object({
+    workspace_id: z.string(),
+    number: z.number().int(),
+    label: z.string(),
+    focused: z.boolean(),
+    pane_count: z.number().int().nonnegative().nullish(),
+    tab_count: z.number().int().nonnegative().nullish(),
+    active_tab_id: z.string().nullish(),
+    agent_status: agentStatusSchema,
+  })),
+});
+export type WorkspaceListResult = z.infer<typeof WorkspaceListResultSchema>;
+
+export const TabListResultSchema = z.object({
+  type: z.literal("tab_list"),
+  tabs: z.array(z.object({
+    tab_id: z.string(),
+    workspace_id: z.string(),
+    number: z.number().int(),
+    label: z.string(),
+    focused: z.boolean(),
+    pane_count: z.number().int().nonnegative().nullish(),
+    agent_status: agentStatusSchema,
+  })),
+});
+export type TabListResult = z.infer<typeof TabListResultSchema>;

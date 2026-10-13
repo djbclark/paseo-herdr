@@ -3,6 +3,7 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import type { ConfigTarget, HarnessAdapter, HarnessConfig, HarnessModel, TranscriptSnapshot } from "./harness/types.js";
 import type { HerdrHarnessSession } from "./session.js";
+import { NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 
 /** Session config (model and thinking selection) needs both halves of the adapter contract. */
 export function supportsConfigure(adapter: HarnessAdapter): boolean {
@@ -24,7 +25,7 @@ export class ModelCache {
 
   catalog(): ProviderCatalog {
     const config = this.config;
-    if (!config) return { models: [], modes: [] };
+    if (!config) return { models: [{ id: NATIVE_DEFAULT_MODEL, label: "Configured default", isDefault: true }], modes: [] };
     const labelCount = new Map<string, number>();
     for (const model of config.models) labelCount.set(model.label, (labelCount.get(model.label) ?? 0) + 1);
     const models = config.models.map((model): ProviderModel => ({

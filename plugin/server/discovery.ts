@@ -2,6 +2,7 @@ import type { ProviderInput, ProviderSessionSummary } from "@getpaseo/plugin/ser
 import type { HarnessAdapter } from "./harness/types.js";
 import type { AgentInfo } from "./herdr/schema.js";
 import { bindingOf, persistenceOf } from "./binding.js";
+import { agentPlace, cleanTitle } from "../shared/labels.js";
 
 export interface DiscoveryOptions {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
@@ -35,25 +36,32 @@ export async function discoverSessions(
       const binding = bindingOf(agent, adapter, herdrSession);
       const locator = await adapter.resolveTranscript(binding.sessionRef, { cwd: binding.cwd });
       let updatedAt = observedAt;
-      let description: string | undefined;
+      let history = "history unavailable";
+      let lastPrompt: string | undefined;
+      let transcriptTitle: string | undefined;
       if (locator) {
         const reader = adapter.openTranscript(locator);
         try {
           const snapshot = await reader.snapshot();
           updatedAt = snapshot.updatedAt ?? observedAt;
+          transcriptTitle = snapshot.title;
+          lastPrompt = [...snapshot.items].reverse().find((item) => item.type === "user_message")?.text;
+          history = "";
         } catch {
-          description = "History unavailable";
+          // History stays unavailable; the summary still identifies the agent.
         } finally {
           reader.close();
         }
-      } else {
-        description = "History unavailable";
       }
+      // Same naming as the plugin's Herdr screen, so the user can match rows across the two.
+      const title = cleanTitle(agent.terminal_title_stripped ?? agent.terminal_title) ?? cleanTitle(transcriptTitle) ?? agent.name ?? `${adapter.label} agent`;
+      const place = [`${agentPlace(`${adapter.label} in Herdr`, agent.pane_id)}`, agent.agent_status, history].filter(Boolean).join(" · ");
+      const prompt = lastPrompt?.replace(/\s+/g, " ").trim();
       return {
         persistence: persistenceOf(binding),
         cwd: binding.cwd || input.cwd || "",
-        title: agent.title ?? agent.name ?? `${adapter.label} agent`,
-        description,
+        title,
+        description: prompt ? `${place} — “${prompt.length > 100 ? `${prompt.slice(0, 99)}…` : prompt}”` : place,
         updatedAt,
       };
     }),

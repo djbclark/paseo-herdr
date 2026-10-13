@@ -14,12 +14,15 @@ import { discoverSessions } from "./discovery.js";
 import { launchAgent } from "./launch.js";
 import { HerdrHarnessSession, capabilitiesFor, pendingBinding, type SessionDeps } from "./session.js";
 import { ModelCache } from "./config.js";
+import { NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 
 export interface ProviderHooks {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
   getHerdrSession?: () => string | null;
   /** Override the agent launcher (tests); defaults to `launchAgent` over the Herdr socket. */
   launch?: SessionDeps["launch"];
+  /** Plugin `enable<Harness>` toggle: false means no new discovery or launch; already-open sessions keep working. */
+  isEnabled?: () => Promise<boolean>;
 }
 
 export function createHerdrProvider(
@@ -34,6 +37,7 @@ export function createHerdrProvider(
     id: `herdr-${adapter.id}`,
     label: `${adapter.label} (Herdr)`,
     description: `Chat with an existing Herdr-managed ${adapter.label} agent`,
+    ...(adapter.icon ? { icon: adapter.icon } : {}),
     async status() {
       try {
         const herdr = await client();
@@ -61,19 +65,23 @@ export function createHerdrProvider(
         const result = await (await client()).request("agent.list", {}, { signal });
         return AgentListResultSchema.parse(result).agents;
       };
-      const herdrRequest: SessionDeps["request"] = (method, params = {}, options) =>
-        client().then((herdr) => herdr.request(method, params, options));
-      const sessionDeps = (): SessionDeps => ({
-        adapter,
-        listAgents: (signal?: AbortSignal) => list(signal),
-        request: herdrRequest,
-        subscribe: (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) =>
-          client().then((herdr) => herdr.subscribe(subscriptions, options)),
-        emit,
-        modelCache,
-        getHerdrSession: hooks.getHerdrSession,
-        launch: hooks.launch ?? ((config, signal) => launchAgent({ request: herdrRequest, herdrSession: hooks.getHerdrSession?.() ?? null }, adapter, config, signal)),
-      });
+      // Each session pins the socket and Herdr session it opened on: a settings change applies to new
+      // operations only and never moves an open chat to another Herdr daemon (P3.7A).
+      const sessionDeps = async (): Promise<SessionDeps> => {
+        const herdr = new HerdrClient(await getSocketPath());
+        const herdrSession = hooks.getHerdrSession?.() ?? null;
+        const request: SessionDeps["request"] = (method, params = {}, options) => herdr.request(method, params, options);
+        return {
+          adapter,
+          listAgents: async (signal?: AbortSignal) => AgentListResultSchema.parse(await herdr.request("agent.list", {}, { signal })).agents,
+          request,
+          subscribe: async (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) => herdr.subscribe(subscriptions, options),
+          emit,
+          modelCache,
+          getHerdrSession: () => herdrSession,
+          launch: hooks.launch ?? ((config, signal) => launchAgent({ request, herdrSession }, adapter, config, signal)),
+        };
+      };
 
       const dispatch = async (input: ProviderInput): Promise<void> => {
         switch (input.type) {
@@ -88,6 +96,10 @@ export function createHerdrProvider(
             return;
           }
           case "sessions": {
+            if (hooks.isEnabled && !(await hooks.isEnabled())) {
+              emit({ type: "sessions", requestId: input.requestId, sessions: [] });
+              return;
+            }
             const agents = await list();
             const summaries = await discoverSessions(adapter, agents, input, hooks);
             emit({ type: "sessions", requestId: input.requestId, sessions: summaries });
@@ -96,6 +108,9 @@ export function createHerdrProvider(
           case "session.open": {
             if (sessions.has(input.sessionId)) throw new Error("Session already open");
             if (!input.persistence) {
+              if (hooks.isEnabled && !(await hooks.isEnabled())) {
+                throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
+              }
               // A created agent without the input companion would be read-only at once; refuse before launching.
               let companion: { ok: boolean; diagnostic?: string } | undefined;
               try { companion = await adapter.inputCompanionStatus?.(); }
@@ -103,12 +118,16 @@ export function createHerdrProvider(
               if (companion && !companion.ok) {
                 throw new Error(companion.diagnostic ?? `The ${adapter.label} input companion is not installed`);
               }
+              const deps = await sessionDeps();
               if (sessions.has(input.sessionId)) throw new Error("Session already open");
               const session = new HerdrHarnessSession(input.sessionId,
-                pendingBinding(adapter, hooks.getHerdrSession?.() ?? null, input.config.cwd), sessionDeps());
+                pendingBinding(adapter, deps.getHerdrSession?.() ?? null, input.config.cwd), deps);
               sessions.set(input.sessionId, session);
               try {
-                await session.create(input.config, input.history, input.requestId);
+                // This launch-only selection must never reach a harness as a literal model ID.
+                const config = { ...input.config };
+                if (config.model === NATIVE_DEFAULT_MODEL) delete config.model;
+                await session.create(config, input.history, input.requestId);
               } catch (error) {
                 const closedMeanwhile = session.isAborted;
                 session.close();
@@ -119,7 +138,14 @@ export function createHerdrProvider(
               return;
             }
             const binding = parseBinding(input.persistence, adapter);
-            const session = new HerdrHarnessSession(input.sessionId, binding, sessionDeps());
+            const deps = await sessionDeps();
+            const target = deps.getHerdrSession?.() ?? null;
+            if (binding.herdrSession !== target) {
+              const name = (session: string | null) => (session ? `Herdr session "${session}"` : "the default Herdr session");
+              throw new Error(`This conversation belongs to ${name(binding.herdrSession)}, but the Herdr plugin now targets ${name(target)}. Change the plugin's Herdr settings back to reopen it.`);
+            }
+            if (sessions.has(input.sessionId)) throw new Error("Session already open");
+            const session = new HerdrHarnessSession(input.sessionId, binding, deps);
             sessions.set(input.sessionId, session);
             try {
               await session.open(input.config, input.history, input.requestId);

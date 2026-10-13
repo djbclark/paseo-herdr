@@ -115,7 +115,7 @@ describe("neutral core", () => {
     const agent = fakeAgent({ agent_session: null });
     const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list", cwd: "/work" });
     expect(summaries).toHaveLength(1);
-    expect(summaries[0].description).toBe("History unavailable");
+    expect(summaries[0].description).toBe("Fake in Herdr · pane pane-1 · idle · history unavailable");
   });
 
   it("discovers id-backed fake sessions with a readable transcript", async () => {
@@ -128,7 +128,8 @@ describe("neutral core", () => {
     const agent = fakeAgent();
     const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list" });
     expect(summaries).toHaveLength(1);
-    expect(summaries[0].description).toBeUndefined();
+    // Harness and pane identify the agent; the last prompt helps tell conversations apart.
+    expect(summaries[0].description).toBe("Fake in Herdr · pane pane-1 · idle — “hello”");
   });
 
   it("session open replays items and closes without a turn event", async () => {
