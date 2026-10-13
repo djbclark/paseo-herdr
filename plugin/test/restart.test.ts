@@ -1,7 +1,8 @@
 import { expect, it } from "vitest";
 import { RestartError, restartAgent } from "../server/restart.js";
 import { HerdrError } from "../server/herdr/client.js";
-import { ompAdapter } from "../server/harness/omp/adapter.js";
+import { ompAdapter as realOmpAdapter } from "../server/harness/omp/adapter.js";
+const ompAdapter = { ...realOmpAdapter, inspectInput: async ({ pid }: { pid: number }) => ({ pid, instanceId: "restarted" }) };
 
 const SESSION = { source: "herdr:omp", agent: "omp", kind: "path", value: "/s/a.jsonl" };
 const agentInfo = (over: object = {}) => ({ terminal_id: "t1", name: null, agent: "omp", agent_status: "idle", agent_session: SESSION,
@@ -9,7 +10,7 @@ const agentInfo = (over: object = {}) => ({ terminal_id: "t1", name: null, agent
 const proc = (pid: number, name: string) => ({ type: "pane_process_info", process_info: { pane_id: "w1:p1", foreground_process_group_id: pid, foreground_processes: [{ pid, name }] } });
 
 /** Scripted Herdr: OMP (pid 10) until SIGTERM, then the shell, then OMP again (pid 20) once started. */
-function rig(options: { status?: string; exits?: boolean; startErrors?: HerdrError[] } = {}) {
+function rig(options: { name?: string; status?: string; exits?: boolean; startErrors?: Error[]; restartedRef?: typeof SESSION; ready?: boolean } = {}) {
   const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
   const signals: number[] = [];
   let phase: "old" | "shell" | "new" = "old";
@@ -21,10 +22,16 @@ function rig(options: { status?: string; exits?: boolean; startErrors?: HerdrErr
     signal: (pid: number) => { signals.push(pid); if (options.exits !== false) phase = "shell"; },
     request: async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params });
-      if (method === "agent.list") return { type: "agent_list", agents: phase === "shell" ? [] : [agentInfo({ agent_status: phase === "old" ? options.status ?? "idle" : "idle" })] };
+      if (method === "agent.list") return { type: "agent_list", agents: phase === "shell" ? [] : [agentInfo({ name: options.name ?? null,
+        ...(phase === "new" ? { agent_session: options.restartedRef ?? SESSION, interactive_ready: options.ready ?? true } : {}),
+        agent_status: phase === "old" ? options.status ?? "idle" : "idle" })] };
       if (method === "pane.process_info") return phase === "old" ? proc(10, "omp") : phase === "shell" ? proc(5, "zsh") : proc(20, "omp");
       if (method === "agent.start") {
+        if (typeof params?.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
+          throw new HerdrError("invalid_params", "agent.start requires a valid name");
+        }
         const error = startErrors.shift();
+        if (error && !(error instanceof HerdrError)) phase = "new";
         if (error) throw error;
         phase = "new";
         return { type: "agent_started", agent: agentInfo({ launch_pending: true }) };
@@ -40,6 +47,27 @@ it("stops the idle agent and resumes the same session in the same pane", async (
   await expect(restartAgent(deps, ompAdapter, { terminalId: "t1", paneId: "w1:p1" })).resolves.toEqual({ pid: 20 });
   expect(signals).toEqual([10]);
   expect(calls.find((call) => call.method === "agent.start")?.params).toMatchObject({ kind: "omp", pane_id: "w1:p1", args: ["--resume", "/s/a.jsonl"] });
+  expect(calls.find((call) => call.method === "agent.start")?.params?.name).toMatch(/^paseo-[a-f0-9]+$/);
+});
+
+it("preserves the existing agent name on restart", async () => {
+  const { deps, calls } = rig({ name: "reviewer" });
+  await restartAgent(deps, ompAdapter, { terminalId: "t1", paneId: "w1:p1" });
+  expect(calls.find((call) => call.method === "agent.start")?.params?.name).toBe("reviewer");
+});
+
+it("reconciles an uncertain start with the companion even when Herdr readiness lags, without starting twice", async () => {
+  const { deps, calls } = rig({ startErrors: [new Error("socket timed out")], ready: false });
+  await expect(restartAgent(deps, ompAdapter, { terminalId: "t1", paneId: "w1:p1" })).resolves.toEqual({ pid: 20 });
+  expect(calls.filter(c => c.method === "agent.start")).toHaveLength(1);
+});
+
+it("does not report success for a different native session or an unavailable input companion", async () => {
+  const changed = rig({ restartedRef: { ...SESSION, value: "/s/replaced.jsonl" } });
+  await expect(restartAgent(changed.deps, ompAdapter, { terminalId: "t1", paneId: "w1:p1" })).rejects.toThrow(/input couldn't be verified/);
+  const missing = rig();
+  await expect(restartAgent(missing.deps, { ...ompAdapter, inspectInput: async () => { throw new Error("missing"); } },
+    { terminalId: "t1", paneId: "w1:p1" })).rejects.toThrow(/input couldn't be verified/);
 });
 
 it("refuses a working agent without touching it", async () => {

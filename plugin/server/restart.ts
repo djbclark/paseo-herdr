@@ -1,4 +1,5 @@
 import type { HarnessAdapter } from "./harness/types.js";
+import { randomBytes } from "node:crypto";
 import { HerdrError } from "./herdr/client.js";
 import { AgentListResultSchema, AgentStartedResultSchema, PaneProcessInfoResultSchema, type AgentInfo } from "./herdr/schema.js";
 
@@ -59,12 +60,21 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
   }
 
   // The pane is back at its shell; Herdr may still report the old agent for a moment (agent_pane_busy).
-  const params = { kind: adapter.id, pane_id: target.paneId, timeout_ms: READY_TIMEOUT_MS, args, ...(agent.name ? { name: agent.name } : {}) };
+  // Manually started agents can be unnamed, but Herdr's agent.start requires a name.
+  const params = { kind: adapter.id, pane_id: target.paneId, timeout_ms: READY_TIMEOUT_MS, args,
+    name: agent.name ?? `paseo-${randomBytes(6).toString("hex")}` };
+  let startError: unknown;
   for (const deadline = now() + BUSY_WINDOW_MS; ;) {
     try {
       AgentStartedResultSchema.parse(await deps.request("agent.start", params));
       break;
     } catch (error) {
+      // A timed-out reply does not prove the start failed. Observe the process
+      // below; never send agent.start again after an uncertain outcome.
+      if (!(error instanceof HerdrError) || error.code === "timeout" || error.code === "agent_not_ready") {
+        startError = error;
+        break;
+      }
       if (!(error instanceof HerdrError && error.code === "agent_pane_busy") || now() >= deadline) {
         throw new RestartError(`${adapter.label} stopped, but starting it again failed: ${error instanceof Error ? error.message : String(error)}. Run \`${[adapter.id, ...args].join(" ")}\` in the pane.`);
       }
@@ -75,10 +85,18 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
   for (const deadline = now() + READY_TIMEOUT_MS; ;) {
     await sleep(POLL_MS);
     const restarted: AgentInfo | undefined = (await agents()).find((candidate) => candidate.pane_id === target.paneId);
-    if (restarted?.interactive_ready && (restarted.agent_status === "idle" || restarted.agent_status === "done")) {
+    if (restarted?.terminal_id === target.terminalId && restarted.agent === adapter.id &&
+        restarted.agent_session?.kind === ref.kind && restarted.agent_session.value === ref.value &&
+        (restarted.agent_status === "idle" || restarted.agent_status === "done")) {
       const after = await foreground();
-      if (after.foreground_process_group_id && adapter.isOccupant(after)) return { pid: after.foreground_process_group_id };
+      const nextPid = after.foreground_process_group_id;
+      if (after.pane_id === target.paneId && nextPid && nextPid !== pid && adapter.isOccupant(after)) {
+        // Resumed agents can remain launch_pending in Herdr even with a working
+        // TUI. The process-local companion proves that input is actually enabled.
+        const identity = await adapter.inspectInput({ pid: nextPid, ref: { kind: ref.kind, value: ref.value } }).catch(() => null);
+        if (identity?.pid === nextPid) return { pid: nextPid };
+      }
     }
-    if (now() >= deadline) throw new RestartError(`${adapter.label} was started again but isn't ready after ${READY_TIMEOUT_MS / 1000} s; check the pane in a terminal.`);
+    if (now() >= deadline) throw new RestartError(`${adapter.label} was started again but input couldn't be verified after ${READY_TIMEOUT_MS / 1000} s; check the pane in a terminal.${startError ? ` Start response: ${String(startError)}` : ""}`);
   }
 }
