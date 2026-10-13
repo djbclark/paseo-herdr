@@ -84,6 +84,7 @@ class World {
   tty = "/dev/pts/fake";
   instance = "fake-instance";
   down: Error | null = null;
+  moveDuringProcessRead: (() => void) | null = null;
   store = new FakeTranscript();
   readonly subs: Sub[] = [];
   readonly delivered: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -98,9 +99,10 @@ class World {
   deps(emit: (event: ProviderEvent) => void): SessionDeps {
     return {
       adapter: this.adapter,
-      listAgents: async () => { if (this.down) throw this.down; return this.gone ? [...this.extraAgents] : [this.agent, ...this.extraAgents]; },
+      listAgents: async () => { if (this.down) throw this.down; return structuredClone(this.gone ? [...this.extraAgents] : [this.agent, ...this.extraAgents]); },
       request: async (method, params) => {
         if (this.down) throw this.down;
+        if (method === "pane.process_info") this.moveDuringProcessRead?.();
         if (method === "pane.process_info") return { type: "pane_process_info", process_info: {
           pane_id: this.agent.pane_id, foreground_process_group_id: this.pid, tty: this.tty, foreground_processes: [{ pid: this.pid, name: "fake" }] } };
         this.delivered.push({ method, params });
@@ -219,6 +221,38 @@ describe.each(ALL)("4A pane moves: %s", (entry) => {
 });
 
 describe.each(ALL)("4B Herdr restart / event loss: %s", (entry) => {
+  it("revalidates a move between agent.list and process_info without freezing or sending to the old pane", async () => {
+    const { world, session } = await start(entry);
+    world.moveDuringProcessRead = () => { world.agent.pane_id = "pane-moved"; world.moveDuringProcessRead = null; };
+    await session.prompt(prompt("move-race"));
+    expect(session.state.outcome).toBe("active");
+    expect(session.state.paneId).toBe("pane-moved");
+    expect(world.prompts()).toMatchObject([{ target: "pane-moved" }]);
+  });
+
+  it("suspends input through repeated move races and recovers only after a consistent identity read", async () => {
+    const { world, session } = await start(entry);
+    let moves = 0;
+    world.moveDuringProcessRead = () => { world.agent.pane_id = `moving-${++moves}`; };
+    await session.prompt(prompt("moving"));
+    expect(session.state.outcome).toBe("active");
+    expect(session.state.connected).toBe(false);
+    expect(world.prompts()).toEqual([]);
+    world.moveDuringProcessRead = null;
+    await session.live.reconcile();
+    expect(session.state.connected).toBe(true);
+    await session.prompt(prompt("settled"));
+    expect(world.prompts()).toMatchObject([{ target: world.agent.pane_id }]);
+  });
+
+  it("still refuses a replaced occupant after resolving a move race", async () => {
+    const { world, session } = await start(entry);
+    world.moveDuringProcessRead = () => { world.agent.pane_id = "pane-moved"; world.pid++; world.moveDuringProcessRead = null; };
+    await session.prompt(prompt("replacement-race"));
+    expect(session.state.outcome).toBe("readonly");
+    expect(world.prompts()).toEqual([]);
+  });
+
   it("events_lost suspends input until reconcile, then catches up once with the same PID and no duplicate rows", async () => {
     const { world, events, session } = await start(entry);
     const pid = session.state.binding.occupant?.pid;

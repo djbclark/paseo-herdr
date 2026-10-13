@@ -237,7 +237,7 @@ export class HerdrHarnessSession {
   }
 
   /** Refresh terminal, native session, foreground leader and process-local nonce. */
-  async validateAgent(): Promise<AgentInfo | null> {
+  async validateAgent(moveRetry = false): Promise<AgentInfo | null> {
     const generation = this.state.generation;
     const agents = await this.deps.listAgents(this.signal);
     if (!this.current(generation) || this.state.outcome !== "active") return null;
@@ -266,7 +266,16 @@ export class HerdrHarnessSession {
     if (!this.current(generation) || this.state.outcome !== "active") return null;
     const process = result.process_info;
     const pid = process.foreground_process_group_id;
-    if (process.pane_id !== agent.pane_id || !pid || !this.adapter.isOccupant(process)) {
+    if (process.pane_id !== agent.pane_id) {
+      // Herdr resolves an old pane id to its new location after a move. The move
+      // can happen between agent.list and process_info; re-read both identities
+      // instead of treating an alias response as a replaced process.
+      if (!moveRetry) return this.validateAgent(true);
+      this.state.connected = false;
+      this.state.tracker.observeConnectivityLost();
+      return null;
+    }
+    if (!pid || !this.adapter.isOccupant(process)) {
       this.freeze("The bound agent was replaced", "The foreground process is not the bound harness; input is disabled.");
       return null;
     }
