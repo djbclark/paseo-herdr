@@ -67,19 +67,3 @@ export function pathTail(path: string): string {
 export function agentLabel(agent: { title: string | null; name: string | null; kind: string | null; terminalId: string }): string {
   return cleanTitle(agent.title) ?? agent.name ?? agent.kind ?? agent.terminalId;
 }
-
-/** Compact relative time ("now", "5m ago", "3h ago", "2d ago"); an unparsable date returns "". */
-export function timeAgo(iso: string, now: number = Date.now()): string {
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return "";
-  const minutes = Math.max(0, Math.floor((now - then) / 60_000));
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
-}
-
-const ATTENTION_LABELS = { permission: "Needs approval", error: "Error", finished: "Finished" } as const;
-export function attentionLabel(reason: keyof typeof ATTENTION_LABELS | null): string | null {
-  return reason ? ATTENTION_LABELS[reason] : null;
-}

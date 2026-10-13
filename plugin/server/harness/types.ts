@@ -82,6 +82,10 @@ export interface HarnessAdapter {
   readConfig?(target: ConfigTarget, signal?: AbortSignal): Promise<HarnessConfig>;
   /** P3.5A: change model and/or thinking level; only while idle; validates exactly, applies nothing on refusal. */
   configure?(target: ConfigTarget, changes: { model?: string; thinkingLevel?: string }, signal?: AbortSignal): Promise<ConfigureResult>;
+  /** Optional: arguments that reopen `ref` in a fresh process (in-place restart, R35). Without it the harness can't be restarted from Paseo. */
+  resumeArgs?(ref: AgentSessionRef): string[];
+  /** Optional: cheap check (no round trip) that process `pid` has its input endpoint; false means it started without the companion. */
+  inputReachable?(pid: number): Promise<boolean>;
   /** P3.5B: sibling sessions whose header names `locator`'s session as their parent (excluding `locator` itself). */
   findForks?(locator: TranscriptLocator, signal?: AbortSignal): Promise<NativeFork[]>;
 }

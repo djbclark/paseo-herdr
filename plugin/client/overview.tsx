@@ -1,32 +1,28 @@
 import { useCallback, useMemo, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 import { usePaseo, useRpc, type PluginScreenProps } from "@getpaseo/plugin/client";
-import { ScrollView, copyText, useToast } from "@getpaseo/plugin/client/react-native";
+import { Modal, ScrollView, copyText, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  herdrAgentRestartRpc,
+  herdrChatReadyRpc,
   herdrOverviewRpc,
   herdrWorkspaceCreateRpc,
   type OverviewAgent,
-  type OverviewTab,
   type OverviewWorkspace,
-  type HerdrTarget,
-  type HerdrConnection,
-  type RecentChat,
 } from "../shared/rpc.js";
 import {
   agentLabel,
-  attentionLabel,
   describeTarget,
   errorMessage,
   OVERVIEW_QUERY_KEY,
   OVERVIEW_REFETCH_MS,
-  timeAgo,
   statusLabel,
   statusTone,
   validateFolder,
 } from "./helpers.js";
-import { agentPlace, cleanTitle } from "../shared/labels.js";
-import { createHerdrChat } from "./actions.js";
+import { agentPlace } from "../shared/labels.js";
+import { bindHerdrChat, createHerdrChat } from "./actions.js";
 
 type Theme = PluginScreenProps["theme"];
 type Navigation = PluginScreenProps["navigation"];
@@ -85,6 +81,10 @@ function useStyles(theme: Theme, compact: boolean) {
         alignSelf: "stretch" as const,
       },
       indent: { paddingLeft: compact ? 8 : 16, gap: 6 },
+      warning: { color: c.statusWarning },
+      agent: { gap: 6, paddingVertical: 6, borderTopColor: c.border, borderTopWidth: 1 },
+      agentLine: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
+      agentMain: { flex: 1, gap: 2 },
     };
   }, [theme, compact]);
 }
@@ -128,32 +128,49 @@ function StatusBadge({ status, theme, styles }: { status: OverviewAgent["status"
   );
 }
 
-function AgentRow({
-  agent,
-  theme,
-  styles,
-  navigation,
-}: {
-  agent: OverviewAgent;
-  theme: Theme;
-  styles: Styles;
-  navigation: Navigation;
+/** Restart confirmation: the only destructive step, so it says exactly what happens. */
+function RestartSheet({ agent, label, open, onOpenChange, onRestarted, styles }: {
+  agent: OverviewAgent; label: string; open: boolean; onOpenChange(open: boolean): void; onRestarted(): void | Promise<void>; styles: Styles;
+}) {
+  const restart = useRpc(herdrAgentRestartRpc);
+  const toast = useToast();
+  const mutation = useMutation({
+    mutationFn: () => restart({ terminalId: agent.terminalId, paneId: agent.paneId }),
+    onSuccess: () => {
+      toast.show("Restarted; input is enabled", { variant: "success" });
+      onOpenChange(false);
+      void onRestarted();
+    },
+  });
+  const { isPending, error, mutate } = mutation;
+  const confirm = useCallback(() => {
+    if (!isPending) mutate();
+  }, [isPending, mutate]);
+  const cancel = useCallback(() => onOpenChange(false), [onOpenChange]);
+  return (
+    <Modal title={`Restart ${label}?`} open={open} onOpenChange={onOpenChange}>
+      <Modal.Content>
+        <Text style={styles.text}>
+          {agent.harness ?? "The agent"} quits and resumes this same conversation in the same Herdr pane, which takes a few seconds. It then loads the input companion, so you can type here.
+        </Text>
+        <Text style={styles.muted}>Anything typed in its terminal but not sent is lost.</Text>
+        <View style={styles.row}>
+          <Button label={isPending ? "Restarting…" : "Restart"} disabled={isPending} onPress={confirm} styles={styles} />
+          <Button label="Cancel" secondary disabled={isPending} onPress={cancel} styles={styles} />
+        </View>
+        {error ? <Text accessibilityRole="alert" style={styles.danger}>{errorMessage(error)}</Text> : null}
+      </Modal.Content>
+    </Modal>
+  );
+}
+
+/** Less common actions for one agent. */
+function MoreSheet({ agent, label, open, onOpenChange, onRestart, navigation, styles }: {
+  agent: OverviewAgent; label: string; open: boolean; onOpenChange(open: boolean): void; onRestart(): void; navigation: Navigation; styles: Styles;
 }) {
   const toast = useToast();
   const paseo = usePaseo();
-  const [showCommand, setShowCommand] = useState(false);
-  const { paseoAgentId, attach, cwd } = agent;
-  const label = agentLabel(agent);
-  const open = useCallback(() => {
-    if (paseoAgentId && navigation) navigation.openAgent({ agentId: paseoAgentId });
-  }, [paseoAgentId, navigation]);
-  const folder = useMutation({
-    mutationFn: async () => {
-      if (!cwd) throw new Error("This agent has no folder path");
-      return (await paseo.workspaces.open(cwd)).id;
-    },
-    onSuccess: (workspaceId) => navigation?.openWorkspace({ workspaceId }),
-  });
+  const { attach, cwd } = agent;
   // A Paseo terminal running `herdr agent attach` (no shell) in the Paseo workspace for the agent's folder.
   const terminal = useMutation({
     mutationFn: async () => {
@@ -162,12 +179,11 @@ function AgentRow({
       await workspace.terminals.create({ name: `Herdr: ${label}`, command: attach.command, args: attach.args });
       return workspace.id;
     },
-    onSuccess: (workspaceId) => navigation?.openWorkspace({ workspaceId }),
+    onSuccess: (workspaceId) => {
+      onOpenChange(false);
+      navigation?.openWorkspace({ workspaceId });
+    },
   });
-  const openTerminal = useCallback(() => {
-    if (!terminal.isPending) terminal.mutate();
-  }, [terminal]);
-  const toggleCommand = useCallback(() => setShowCommand((value) => !value), []);
   const copy = useCallback(async () => {
     try {
       await copyText(agent.attachCommand);
@@ -176,74 +192,119 @@ function AgentRow({
       toast.error("Could not copy. Select the text and use Copy.");
     }
   }, [agent.attachCommand, toast]);
-  const place = agentPlace(agent.harness ?? agent.kind, agent.paneId);
-  const details = [place, cwd].filter(Boolean).join(" · ");
-  const canOpenTerminal = Boolean(attach && cwd && navigation);
+  const restart = useCallback(() => {
+    onOpenChange(false);
+    onRestart();
+  }, [onOpenChange, onRestart]);
   return (
-    <View style={styles.indent}>
-      <View style={styles.row}>
-        <Text style={styles.text} numberOfLines={1}>{label}</Text>
-        <StatusBadge status={agent.status} theme={theme} styles={styles} />
-      </View>
-      {details ? <Text style={styles.muted} numberOfLines={1}>{details}</Text> : null}
-      {!paseoAgentId ? (
-        <Text style={styles.muted}>
-          {agent.provider
-            ? `To chat here, open the folder, tap ⋯ → Import session, and pick “${label}” (${place}).`
-            : "No Paseo provider handles this agent kind."}
-        </Text>
-      ) : !navigation ? (
-        <Text style={styles.muted}>Chat linked (open it from the Paseo sidebar)</Text>
-      ) : null}
-      <View style={styles.row}>
-        {paseoAgentId && navigation ? <Button label="Open chat" onPress={open} styles={styles} /> : null}
-        {!paseoAgentId && agent.provider && cwd && navigation ? (
-          <Button label={folder.isPending ? "Opening…" : "Open folder to import"} secondary disabled={folder.isPending} onPress={() => folder.mutate()} styles={styles} />
+    <Modal title={label} open={open} onOpenChange={onOpenChange}>
+      <Modal.Content>
+        <Text style={styles.muted}>{[agentPlace(agent.harness ?? agent.kind, agent.paneId), cwd].filter(Boolean).join(" · ")}</Text>
+        {attach && cwd && navigation ? (
+          <Button label={terminal.isPending ? "Opening…" : "Open in terminal"} secondary disabled={terminal.isPending} onPress={() => terminal.mutate()} styles={styles} />
         ) : null}
-        {canOpenTerminal ? (
-          <Button label={terminal.isPending ? "Opening…" : "Open terminal"} secondary disabled={terminal.isPending} onPress={openTerminal} styles={styles} />
-        ) : null}
-        {!paseoAgentId ? (
-          <Button label={showCommand ? "Hide command" : "Command"} secondary onPress={toggleCommand} styles={styles} />
-        ) : null}
-      </View>
-      {terminal.error ? <Text style={styles.muted}>Could not open a terminal: {errorMessage(terminal.error)}</Text> : null}
-      {folder.error ? <Text accessibilityRole="alert" style={styles.danger}>{errorMessage(folder.error)}</Text> : null}
-      {showCommand ? (
+        {agent.canRestart ? <Button label="Restart agent" secondary onPress={restart} styles={styles} /> : null}
+        <Text style={styles.muted}>Attach from any terminal on this computer:</Text>
         <View style={styles.row}>
-          <Text selectable style={styles.muted}>
-            {agent.attachCommand}
-          </Text>
+          <Text selectable style={styles.text}>{agent.attachCommand}</Text>
           <Button label="Copy" secondary onPress={copy} styles={styles} />
         </View>
-      ) : null}
-    </View>
+        {terminal.error ? <Text accessibilityRole="alert" style={styles.danger}>{errorMessage(terminal.error)}</Text> : null}
+      </Modal.Content>
+    </Modal>
   );
 }
 
-function TabBlock({
-  tab,
-  theme,
-  styles,
-  navigation,
-}: {
-  tab: OverviewTab;
-  theme: Theme;
-  styles: Styles;
-  navigation: Navigation;
+/** One live Herdr agent. Tapping it opens its Paseo chat. */
+function AgentRow({ agent, theme, styles, navigation, onChanged }: {
+  agent: OverviewAgent; theme: Theme; styles: Styles; navigation: Navigation; onChanged(): void;
 }) {
+  const toast = useToast();
+  const paseo = usePaseo();
+  const [more, setMore] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const { paseoAgentId, cwd } = agent;
+  const label = agentLabel(agent);
+  const place = agentPlace(agent.harness ?? agent.kind, agent.paneId);
+  const readOnly = agent.inputReady === false;
+  const idle = agent.status === "idle" || agent.status === "done";
+  const ready = useRpc(herdrChatReadyRpc);
+  // Not linked yet: create a chat bound to this running agent (no new process) and open it.
+  const link = useMutation({
+    mutationFn: () => bindHerdrChat(paseo, ready, agent, label),
+    onSuccess: (agentId) => {
+      onChanged();
+      navigation?.openAgent({ agentId });
+    },
+  });
+  // Fallback if binding fails: Paseo's own Import session lists this agent under the same name.
+  const folder = useMutation({
+    mutationFn: async () => {
+      if (!cwd) throw new Error("This agent has no folder path");
+      return (await paseo.workspaces.open(cwd)).id;
+    },
+    onSuccess: (workspaceId) => {
+      toast.show(`In ⋯ → Import session, pick “${label}” (${place})`, { variant: "info" });
+      navigation?.openWorkspace({ workspaceId });
+    },
+  });
+  const busy = link.isPending || folder.isPending;
+  const open = useCallback(() => {
+    if (paseoAgentId) navigation?.openAgent({ agentId: paseoAgentId });
+    else if (!busy) link.mutate();
+  }, [paseoAgentId, navigation, busy, link]);
+  // After a restart the old chat stays read-only (it was frozen), so open a fresh chat on the same
+  // conversation and archive the old one; archived chats can be restored from Paseo's archive.
+  const restarted = useCallback(async () => {
+    onChanged();
+    if (!paseoAgentId || !navigation) return;
+    try {
+      const fresh = await bindHerdrChat(paseo, ready, agent, label);
+      await paseo.agents.ref(paseoAgentId).archive().catch(() => undefined);
+      navigation.openAgent({ agentId: fresh });
+    } catch (error) {
+      toast.error(`Restarted, but couldn't reopen the chat: ${errorMessage(error)}`);
+    }
+  }, [onChanged, paseoAgentId, navigation, paseo, ready, agent, label, toast]);
+  const canOpen = Boolean(navigation && (paseoAgentId || (agent.provider && cwd)));
   return (
-    <View style={styles.indent}>
-      <View style={styles.row}>
-        <Text style={styles.text}>
-          Tab {tab.number}: {tab.label}
-        </Text>
-        <StatusBadge status={tab.status} theme={theme} styles={styles} />
+    <View style={styles.agent}>
+      <View style={styles.agentLine}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Open chat ${label}`}
+          disabled={!canOpen || busy}
+          onPress={open}
+          style={styles.agentMain}
+        >
+          <View style={styles.row}>
+            <Text style={styles.text} numberOfLines={1}>{label}</Text>
+            <StatusBadge status={agent.status} theme={theme} styles={styles} />
+          </View>
+          <Text style={styles.muted} numberOfLines={1}>{[place, cwd].filter(Boolean).join(" · ")}</Text>
+          {!agent.provider ? <Text style={styles.muted}>No Paseo provider handles this agent kind.</Text> : null}
+          {agent.provider && !paseoAgentId ? (
+            <Text style={styles.muted}>{link.isPending ? "Opening a chat…" : "No chat yet: tap to open one."}</Text>
+          ) : null}
+        </Pressable>
+        <Button label="⋯" secondary onPress={() => setMore(true)} styles={styles} />
       </View>
-      {tab.agents.length === 0 ? <Text style={styles.muted}>No agents</Text> : null}
-      {tab.agents.map((agent) => (
-        <AgentRow key={agent.terminalId} agent={agent} theme={theme} styles={styles} navigation={navigation} />
-      ))}
+      {readOnly ? (
+        <View style={styles.row}>
+          <Text style={styles.warning}>Read-only: it started before the input companion was installed.</Text>
+          {agent.canRestart && idle ? <Button label="Restart to enable input" onPress={() => setRestarting(true)} styles={styles} /> : null}
+          {agent.canRestart && !idle ? <Text style={styles.muted}>Restart is available once it's idle.</Text> : null}
+        </View>
+      ) : null}
+      {link.error ? (
+        <View style={styles.row}>
+          <Text accessibilityRole="alert" style={styles.danger}>Couldn't open a chat: {errorMessage(link.error)}</Text>
+          {cwd && navigation ? <Button label="Import it instead" secondary disabled={busy} onPress={() => folder.mutate()} styles={styles} /> : null}
+        </View>
+      ) : null}
+      {folder.error ? <Text accessibilityRole="alert" style={styles.danger}>{errorMessage(folder.error)}</Text> : null}
+      <MoreSheet agent={agent} label={label} open={more} onOpenChange={setMore} onRestart={() => setRestarting(true)} navigation={navigation} styles={styles} />
+      <RestartSheet agent={agent} label={label} open={restarting} onOpenChange={setRestarting} onRestarted={restarted} styles={styles} />
     </View>
   );
 }
@@ -311,32 +372,26 @@ function WorkspaceCard({
   theme,
   styles,
   navigation,
-  onCreated,
+  onChanged,
 }: {
   workspace: OverviewWorkspace;
   ompEnabled: boolean;
   theme: Theme;
   styles: Styles;
   navigation: Navigation;
-  onCreated(): void;
+  onChanged(): void;
 }) {
+  const agents = workspace.tabs.flatMap((tab) => tab.agents);
   return (
     <View style={styles.card}>
-      <View style={styles.row}>
-        <Text style={styles.title}>{workspace.label}</Text>
-        <StatusBadge status={workspace.status} theme={theme} styles={styles} />
-      </View>
-      {workspace.cwd ? (
-        <Text selectable style={styles.muted}>
-          {workspace.cwd}
-        </Text>
-      ) : null}
-      {workspace.tabs.length === 0 ? <Text style={styles.muted}>No tabs</Text> : null}
-      {workspace.tabs.map((tab) => (
-        <TabBlock key={tab.tabId} tab={tab} theme={theme} styles={styles} navigation={navigation} />
+      <Text style={styles.title} numberOfLines={1}>{workspace.label}</Text>
+      {workspace.cwd ? <Text selectable style={styles.muted} numberOfLines={1}>{workspace.cwd}</Text> : null}
+      {agents.length === 0 ? <Text style={styles.muted}>No agents running.</Text> : null}
+      {agents.map((agent) => (
+        <AgentRow key={agent.terminalId} agent={agent} theme={theme} styles={styles} navigation={navigation} onChanged={onChanged} />
       ))}
       {ompEnabled && workspace.cwd ? (
-        <NewAgentButton cwd={workspace.cwd} styles={styles} navigation={navigation} onCreated={onCreated} />
+        <NewAgentButton cwd={workspace.cwd} styles={styles} navigation={navigation} onCreated={onChanged} />
       ) : null}
     </View>
   );
@@ -398,50 +453,6 @@ function NewWorkspaceForm({ styles, theme, onCreated }: { styles: Styles; theme:
   );
 }
 
-function ChatRow({ chat, target, connection, styles, navigation }: { chat: RecentChat; target: HerdrTarget; connection: HerdrConnection; styles: Styles; navigation: Navigation }) {
-  const open = useCallback(() => navigation?.openAgent({ agentId: chat.paseoAgentId }), [navigation, chat.paseoAgentId]);
-  const attention = attentionLabel(chat.attention);
-  const where = chat.pane
-    ? `pane ${chat.pane.paneId} · ${statusLabel(chat.pane.status)}`
-    : chat.herdrSession !== target.herdrSession
-      ? `Herdr session ${chat.herdrSession ?? "default"}`
-      : connection.status === "unavailable" ? "live status unavailable" : "not running in Herdr";
-  const meta = [chat.harness, timeAgo(chat.lastActivityAt), where].filter(Boolean).join(" · ");
-  const body = (
-    <View>
-      <View style={styles.row}>
-        <Text style={styles.text} numberOfLines={1}>{cleanTitle(chat.title) ?? "Untitled chat"}</Text>
-        {attention ? <Text style={chat.attention === "error" ? styles.danger : styles.muted}>{attention}</Text> : null}
-      </View>
-      <Text style={styles.muted} numberOfLines={1}>{chat.cwd}</Text>
-      <Text style={styles.muted} numberOfLines={1}>{meta}</Text>
-    </View>
-  );
-  return navigation ? (
-    <Pressable accessibilityRole="button" accessibilityLabel={`Open chat ${cleanTitle(chat.title) ?? "Untitled chat"} in ${chat.cwd}`} onPress={open} style={styles.indent}>
-      {body}
-    </Pressable>
-  ) : (
-    <View style={styles.indent}>{body}</View>
-  );
-}
-
-function RecentChats({ chats, target, connection, error, styles, navigation }: { chats: readonly RecentChat[]; target: HerdrTarget; connection: HerdrConnection; error: string | null; styles: Styles; navigation: Navigation }) {
-  return (
-    <View style={styles.card}>
-      <Text style={styles.title}>Recent chats</Text>
-      {error ? <Text accessibilityRole="alert" style={styles.danger}>Could not load recent chats: {error}</Text> : null}
-      {chats.length === 0 && !error ? (
-        <Text style={styles.muted}>No Herdr chats in Paseo yet. Start a chat in a folder, or open a folder below to import a running agent.</Text>
-      ) : null}
-      {chats.map((chat) => (
-        <ChatRow key={chat.paseoAgentId} chat={chat} target={target} connection={connection} styles={styles} navigation={navigation} />
-      ))}
-      {!navigation && chats.length > 0 ? <Text style={styles.muted}>Open these chats from the Paseo sidebar.</Text> : null}
-    </View>
-  );
-}
-
 export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenProps) {
   const styles = useStyles(theme, layout.compact);
   const fetchOverview = useRpc(herdrOverviewRpc);
@@ -475,13 +486,11 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
               Herdr unavailable: {data.connection.error}
             </Text>
           ) : null}
-          <RecentChats chats={data.chats} target={data.target} connection={data.connection} error={data.chatError} styles={styles} navigation={navigation} />
-          {data.connection.status === "connected" && data.ompEnabled && navigation ? (
-            <NewChatForm styles={styles} theme={theme} navigation={navigation} onCreated={refresh} />
+          {data.chatError ? (
+            <Text style={styles.warning}>Couldn't check which agents already have a Paseo chat: {data.chatError}</Text>
           ) : null}
-          <Text style={styles.title}>Herdr workspaces</Text>
           {data.connection.status === "connected" && data.workspaces.length === 0 ? (
-            <Text style={styles.muted}>No Herdr workspaces yet.</Text>
+            <Text style={styles.muted}>No Herdr workspaces yet. Start a chat in a folder below.</Text>
           ) : null}
           {data.workspaces.map((workspace) => (
             <WorkspaceCard
@@ -491,9 +500,12 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
               theme={theme}
               styles={styles}
               navigation={navigation}
-              onCreated={refresh}
+              onChanged={refresh}
             />
           ))}
+          {data.connection.status === "connected" && data.ompEnabled && navigation ? (
+            <NewChatForm styles={styles} theme={theme} navigation={navigation} onCreated={refresh} />
+          ) : null}
           {data.connection.status === "connected" ? (
             <NewWorkspaceForm styles={styles} theme={theme} onCreated={refresh} />
           ) : null}

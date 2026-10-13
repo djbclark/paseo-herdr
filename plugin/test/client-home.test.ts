@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createHerdrChat } from "../client/actions.js";
+import { bindHerdrChat, createHerdrChat } from "../client/actions.js";
 import { registerHerdrHome } from "../client/home.js";
 import { createPaseoApi } from "@getpaseo/client";
 
@@ -24,6 +24,37 @@ describe("createHerdrChat", () => {
     await expect(createHerdrChat(paseo, "  ")).rejects.toThrow("Enter a folder path");
     expect(open).not.toHaveBeenCalled();
     await expect(createHerdrChat(paseo, "/gone")).rejects.toThrow("Folder unavailable");
+  });
+});
+
+describe("bindHerdrChat", () => {
+  const agent = { terminalId: "term-1", paneId: "w1:p2", provider: "herdr-omp", cwd: "/repo" };
+  it("creates a chat bound to the running agent in its folder's workspace, then asks for its history", async () => {
+    const createAgent = vi.fn(async () => ({ id: "chat-2" }));
+    const openProject = vi.fn(async () => ({ workspace: { id: "folder-workspace", workspaceDirectory: "/repo" } }));
+    const ready = vi.fn(async () => ({ flushed: 1 }));
+    const paseo = createPaseoApi({ openProject, createAgent } as never);
+    try {
+      expect(await bindHerdrChat(paseo, ready, agent, "Fix tests")).toBe("chat-2");
+      expect(createAgent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        workspaceId: "folder-workspace",
+        config: expect.objectContaining({ provider: "herdr-omp", model: "native-default", cwd: "/repo", title: "Fix tests",
+          providerOptions: { herdrBind: { terminalId: "term-1", paneId: "w1:p2" } } }),
+      }));
+      expect(ready).toHaveBeenCalledExactlyOnceWith({ terminalId: "term-1" });
+      expect(ready.mock.invocationCallOrder[0]).toBeGreaterThan(createAgent.mock.invocationCallOrder[0]);
+    } finally { await paseo.dispose(); }
+  });
+
+  it("still opens the chat when the history request fails, and refuses an agent without a provider", async () => {
+    const paseo = createPaseoApi({
+      openProject: async () => ({ workspace: { id: "w", workspaceDirectory: "/repo" } }),
+      createAgent: async () => ({ id: "chat-3" }),
+    } as never);
+    try {
+      expect(await bindHerdrChat(paseo, async () => { throw new Error("offline"); }, agent, "x")).toBe("chat-3");
+      await expect(bindHerdrChat(paseo, async () => ({}), { ...agent, provider: null }, "x")).rejects.toThrow(/can't be opened/);
+    } finally { await paseo.dispose(); }
   });
 });
 

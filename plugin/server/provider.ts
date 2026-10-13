@@ -9,12 +9,13 @@ import {
 import type { HarnessAdapter } from "./harness/types.js";
 import { HerdrClient, checkHerdrStatus, type SubscriptionDescriptor } from "./herdr/client.js";
 import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
-import { parseBinding } from "./binding.js";
+import { bindingOf, parseBinding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
 import { launchAgent } from "./launch.js";
 import { HerdrHarnessSession, capabilitiesFor, pendingBinding, type SessionDeps } from "./session.js";
 import { ModelCache } from "./config.js";
-import { NATIVE_DEFAULT_MODEL } from "../shared/model.js";
+import type { BoundSessions } from "./bound-sessions.js";
+import { HERDR_BIND_OPTION, NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 
 export interface ProviderHooks {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
@@ -23,7 +24,13 @@ export interface ProviderHooks {
   launch?: SessionDeps["launch"];
   /** Plugin `enable<Harness>` toggle: false means no new discovery or launch; already-open sessions keep working. */
   isEnabled?: () => Promise<boolean>;
+  /** Tests: shorten the fallback wait before a bound session re-sends its history. */
+  bindHistoryDelayMs?: number;
+  /** Shared with the management RPCs so `herdr.chat.ready` can flush a bound chat's history. */
+  boundSessions?: BoundSessions;
 }
+
+const BindOptionSchema = z.object({ terminalId: z.string().min(1), paneId: z.string().optional() });
 
 export function createHerdrProvider(
   adapter: HarnessAdapter,
@@ -79,6 +86,7 @@ export function createHerdrProvider(
           emit,
           modelCache,
           getHerdrSession: () => herdrSession,
+          ...(hooks.bindHistoryDelayMs !== undefined ? { bindHistoryDelayMs: hooks.bindHistoryDelayMs } : {}),
           launch: hooks.launch ?? ((config, signal) => launchAgent({ request, herdrSession }, adapter, config, signal)),
         };
       };
@@ -110,6 +118,35 @@ export function createHerdrProvider(
             if (!input.persistence) {
               if (hooks.isEnabled && !(await hooks.isEnabled())) {
                 throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
+              }
+              const bindOption = input.config.providerOptions?.[HERDR_BIND_OPTION];
+              if (bindOption !== undefined) {
+                const parsed = BindOptionSchema.safeParse(bindOption);
+                if (!parsed.success) throw new Error("Invalid herdrBind option: expected { terminalId, paneId? }");
+                const deps = await sessionDeps();
+                const agent = (await deps.listAgents()).find((candidate) => candidate.terminal_id === parsed.data.terminalId);
+                if (!agent) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is no longer running`);
+                if (agent.agent !== adapter.id) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is not a ${adapter.label} agent`);
+                const binding = bindingOf(agent, adapter, deps.getHerdrSession?.() ?? null);
+                // A read-only chat on the same agent doesn't count: after a restart the client binds a fresh chat and archives the old one.
+                const taken = () => [...sessions.values()].some((open) => open.state.outcome === "active" &&
+                  open.state.binding.terminalId === binding.terminalId && open.state.binding.herdrSession === binding.herdrSession);
+                if (sessions.has(input.sessionId)) throw new Error("Session already open");
+                if (taken()) throw new Error(`This ${adapter.label} agent is already open in another conversation`);
+                const session = new HerdrHarnessSession(input.sessionId, binding, deps);
+                sessions.set(input.sessionId, session);
+                hooks.boundSessions?.add(session);
+                try {
+                  const config = { ...input.config };
+                  if (config.model === NATIVE_DEFAULT_MODEL) delete config.model;
+                  await session.bind(config, input.requestId);
+                } catch (error) {
+                  const closedMeanwhile = session.isAborted;
+                  session.close();
+                  if (sessions.get(input.sessionId) === session) sessions.delete(input.sessionId);
+                  if (!closedMeanwhile) throw error;
+                }
+                return;
               }
               // A created agent without the input companion would be read-only at once; refuse before launching.
               let companion: { ok: boolean; diagnostic?: string } | undefined;

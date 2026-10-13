@@ -19,7 +19,7 @@ export default function contribute(client: PluginClientContext) {
       id: "open-herdr",
       title: "Open Herdr home",
       icon: "House",
-      keywords: ["herdr", "home", "recent", "agents", "omp", "chats", "workspaces"],
+      keywords: ["herdr", "home", "agents", "omp", "chats", "workspaces", "panes"],
       context: "global",
       onSelect: ({ openScreen }) => openScreen({ screenId: OVERVIEW_SCREEN_ID }),
     }),

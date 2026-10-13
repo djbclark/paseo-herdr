@@ -3,7 +3,7 @@ import type { HarnessAdapter, TranscriptReader, TranscriptSnapshot } from "./har
 import { PaneProcessInfoResultSchema, type AgentInfo, type AgentStatus } from "./herdr/schema.js";
 import type { HerdrSubscription, SubscriptionDescriptor } from "./herdr/client.js";
 import { persistenceOf, sameRef, sessionRefOf, type Binding } from "./binding.js";
-import { emptyTimelineState, seedTimeline } from "./timeline.js";
+import { emptyTimelineState, seedTimeline, type TimelineRow } from "./timeline.js";
 import { TurnTracker, type TurnEffect } from "./turns.js";
 import { PromptController } from "./prompt.js";
 import { LiveSession } from "./live-session.js";
@@ -25,7 +25,15 @@ export interface SessionDeps {
   launch?(config: ProviderSessionConfig, signal: AbortSignal): Promise<LaunchResult>;
   /** Install-wide model list shared by every session of the provider (catalog source). */
   modelCache?: ModelCache;
+  /** Bind path: fallback wait before re-sending history if the client never calls `flushHistory` (default {@link BIND_HISTORY_FALLBACK_MS}). */
+  bindHistoryDelayMs?: number;
 }
+/**
+ * Paseo subscribes to a created session only after registering it, and drops rows emitted before that
+ * (plugin-provider.ts:1116, agent-manager.ts:1320). The client calls `herdr.chat.ready` once its create
+ * resolves (so Paseo is listening), which flushes; this fallback covers a client that never does.
+ */
+export const BIND_HISTORY_FALLBACK_MS = 5000;
 
 /** Placeholder binding for a session whose agent is still being launched. */
 export function pendingBinding(adapter: HarnessAdapter, herdrSession: string | null, cwd: string): Binding {
@@ -61,6 +69,10 @@ export class HerdrHarnessSession {
   private readonly prompts: PromptController;
   readonly live: LiveSession;
   readonly config: ConfigController;
+  /** Bind path: live timeline rows held back until the replayed history has been sent. */
+  private heldRows: Array<Extract<ProviderEvent, { type: "timeline.item" }>> | null = null;
+  private historyTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingHistory: TimelineRow[] | null = null;
 
   constructor(readonly sessionId: string, binding: Binding, readonly deps: SessionDeps) {
     this.state = {
@@ -78,7 +90,11 @@ export class HerdrHarnessSession {
   get isAborted(): boolean { return this.signal.aborted; }
   get capabilities(): readonly string[] { return capabilitiesFor(this.adapter); }
   current(generation: number): boolean { return !this.isAborted && this.state.generation === generation; }
-  emit(event: ProviderEvent): void { if (!this.isAborted) this.deps.emit(event); }
+  emit(event: ProviderEvent): void {
+    if (this.isAborted) return;
+    if (this.heldRows && event.type === "timeline.item") this.heldRows.push(event);
+    else this.deps.emit(event);
+  }
   /** Called after every accepted transcript snapshot: terminal-made model/thinking changes surface here. */
   onSnapshot(previous: TranscriptSnapshot | null, snapshot: TranscriptSnapshot): void { this.config.onSnapshot(previous, snapshot); }
   persist(): void { this.emit({ type: "session.persistence", sessionId: this.sessionId, persistence: persistenceOf(this.state.binding) }); }
@@ -119,7 +135,25 @@ export class HerdrHarnessSession {
     } });
   }
 
-  async open(config: ProviderSessionConfig, history: "replay" | "skip", requestId?: string): Promise<void> {
+  /**
+   * Bind path: attach to an agent that is already running (the binding was set at construction), then
+   * open it like an import. Paseo opens creates without history, so the earlier conversation is re-sent as live rows.
+   */
+  async bind(config: ProviderSessionConfig, requestId?: string): Promise<void> {
+    await this.open(config, "replay-live", requestId);
+    if (this.isAborted) return;
+    const { herdrSession, agentName } = this.state.binding;
+    const readonly = this.state.outcome === "readonly";
+    this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
+      id: "attach", severity: "info", title: `Opened a running ${this.adapter.label} agent`,
+      description: `This conversation is attached to an agent that keeps running in Herdr if you close it. Earlier messages are shown with the time this conversation was opened.`
+        + (agentName ? ` Attach from a terminal with: ${attachCommand(herdrSession, agentName)}` : "")
+        + (readonly ? ". This conversation is read-only." : ""),
+    } });
+  }
+
+  async open(config: ProviderSessionConfig, history: "replay" | "skip" | "replay-live", requestId?: string): Promise<void> {
+    let live: TimelineRow[] = [];
     const generation = this.state.generation;
     const locator = await this.adapter.resolveTranscript(this.state.binding.sessionRef, { cwd: this.state.binding.cwd });
     if (!this.current(generation)) return;
@@ -134,6 +168,7 @@ export class HerdrHarnessSession {
       this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
         capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
         cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
+      if (history === "replay-live") live = seeded.rows;
       if (history === "replay") for (const row of seeded.rows) {
         this.emit({ type: "timeline.item", sessionId: this.sessionId, item: row.item, timestamp: row.timestamp });
       }
@@ -160,6 +195,27 @@ export class HerdrHarnessSession {
       this.state.connected = true;
       this.live.start();
     }
+    if (live.length) this.replayLive(live);
+  }
+
+  /** Re-send history as live rows once the host is listening; rows that arrive meanwhile queue behind it. */
+  private replayLive(rows: TimelineRow[]): void {
+    this.heldRows = [];
+    this.pendingHistory = rows;
+    this.historyTimer = setTimeout(() => this.flushHistory(), this.deps.bindHistoryDelayMs ?? BIND_HISTORY_FALLBACK_MS);
+  }
+
+  /** Bind path: send the held history now (the host is subscribed). Idempotent; a no-op for other sessions. */
+  flushHistory(): void {
+    if (this.historyTimer) clearTimeout(this.historyTimer);
+    this.historyTimer = null;
+    const rows = this.pendingHistory;
+    const held = this.heldRows ?? [];
+    this.pendingHistory = null;
+    this.heldRows = null;
+    if (!rows || this.isAborted) return;
+    for (const row of rows) this.emit({ type: "timeline.item", sessionId: this.sessionId, item: row.item, timestamp: row.timestamp });
+    for (const event of held) this.emit(event);
   }
 
   prompt(prompt: ProviderPrompt): Promise<void> { return this.prompts.prompt(prompt); }
@@ -167,6 +223,10 @@ export class HerdrHarnessSession {
   configure(requestId: string, changes: ProviderConfigChanges): Promise<void> { return this.config.configure(requestId, changes); }
   close(): void {
     this.controller.abort();
+    if (this.historyTimer) clearTimeout(this.historyTimer);
+    this.historyTimer = null;
+    this.heldRows = null;
+    this.pendingHistory = null;
     this.config.close();
     this.state.generation++;
     this.live.stop();

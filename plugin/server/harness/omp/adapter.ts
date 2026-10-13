@@ -5,9 +5,10 @@ import type {
   TranscriptSnapshot,
 } from "../types.js";
 import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
-import type { PaneProcessInfo } from "../../herdr/schema.js";
+import type { AgentSessionRef, PaneProcessInfo } from "../../herdr/schema.js";
 import { FileTail } from "../../file-tail.js";
-import { configureOmp, inspectOmpInput, readOmpConfig, submitOmpInput } from "./input.js";
+import { access } from "node:fs/promises";
+import { configureOmp, inspectOmpInput, ompInputSocketPath, readOmpConfig, submitOmpInput } from "./input.js";
 import { activeChain, lastTurnEndOf, lastTurnEndIdOf, modelOf, thinkingLevelOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
 import { companionInstallStatus } from "./companion-install.js";
@@ -95,6 +96,8 @@ export const ompAdapter: HarnessAdapter = {
     proc.foreground_processes.some((p) => p.pid === proc.foreground_process_group_id &&
       (p.name === "omp" || /(?:^|\/)omp$/.test(p.argv0 ?? "")) &&
       !p.argv?.some((arg) => arg.startsWith("__omp_worker_"))),
+  resumeArgs: (ref: AgentSessionRef): string[] => ["--resume", ref.value],
+  inputReachable: (pid: number): Promise<boolean> => access(ompInputSocketPath(pid)).then(() => true, () => false),
   blockedHint: "OMP needs approval in the terminal — run: herdr agent attach <target>",
   inputCompanionStatus: async () => {
     const status = await companionInstallStatus();

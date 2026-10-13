@@ -44,7 +44,7 @@ function roundTrip(pid: number, request: Record<string, unknown>, signal?: Abort
   const { promise, resolve } = Promise.withResolvers<SocketRoundTrip>();
   let socket: net.Socket;
   try {
-    socket = net.createConnection({ path: path.join(os.tmpdir(), `omp-input-${pid}`, "sock") });
+    socket = net.createConnection({ path: ompInputSocketPath(pid) });
   } catch (error) {
     resolve({ wrote: false, message: `OMP input socket could not connect: ${error instanceof Error ? error.message : String(error)}` });
     return promise;
@@ -105,6 +105,9 @@ function replyMatches(reply: Record<string, unknown>, pid: number, ref: AgentSes
     (instanceId === undefined || reply.instanceId === instanceId) &&
     observed.kind === ref.kind && observed.value === ref.value;
 }
+
+/** Where the companion of OMP process `pid` listens. */
+export const ompInputSocketPath = (pid: number): string => path.join(os.tmpdir(), `omp-input-${pid}`, "sock");
 
 /** Why this process has no companion socket: an old process (companion installed later) or a missing/outdated install. */
 async function companionUnavailableMessage(ref: AgentSessionRef, detail: string): Promise<string> {

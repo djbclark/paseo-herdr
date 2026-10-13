@@ -65,6 +65,10 @@ export const overviewAgentSchema = z.object({
    * by session name.
    */
   attach: z.object({ command: z.string(), args: z.array(z.string()) }).nullable(),
+  /** Whether the process has its input endpoint (companion); false = read-only until restarted; null = not known. */
+  inputReady: z.boolean().nullable(),
+  /** An in-place restart (same pane and session) is possible for this harness and agent. */
+  canRestart: z.boolean(),
 });
 export type OverviewAgent = z.infer<typeof overviewAgentSchema>;
 
@@ -90,25 +94,6 @@ export const overviewWorkspaceSchema = z.object({
 });
 export type OverviewWorkspace = z.infer<typeof overviewWorkspaceSchema>;
 
-/** A Paseo chat owned by one of this plugin's providers, for the Herdr screen's "Recent chats". */
-export const recentChatSchema = z.object({
-  paseoAgentId: z.string(),
-  title: z.string().nullable(),
-  /** Harness label, e.g. `OMP`. */
-  harness: z.string(),
-  cwd: z.string(),
-  /** Paseo's chat status (idle, running, error, closed, …). */
-  status: z.string(),
-  /** Latest user message or chat update (ISO). */
-  lastActivityAt: z.string(),
-  attention: z.enum(["finished", "error", "permission"]).nullable(),
-  /** Where its Herdr agent runs now on the current target; null when it isn't running there. */
-  pane: z.object({ paneId: z.string(), status: agentStatusSchema }).nullable(),
-  /** Herdr session the chat is bound to (null = default session); may differ from the current target's. */
-  herdrSession: z.string().nullable(),
-});
-export type RecentChat = z.infer<typeof recentChatSchema>;
-
 export const herdrTargetRpc = defineRpc({
   name: "herdr.target",
   input: z.object({}),
@@ -124,11 +109,26 @@ export const herdrOverviewRpc = defineRpc({
     connection: connectionSchema,
     /** Empty when the connection is unavailable. */
     workspaces: z.array(overviewWorkspaceSchema),
-    /** Most recent first, at most 20; archived chats are left out. */
-    chats: z.array(recentChatSchema),
-    /** A chat-list failure must not look like an empty history. */
+    /** Linking Herdr agents to Paseo chats failed; agents still show, but "Open chat" may be missing. */
     chatError: z.string().nullable(),
   }),
+});
+
+/** Restart an idle agent in place (same pane and session) so it loads its input companion (R35). */
+export const herdrAgentRestartRpc = defineRpc({
+  name: "herdr.agent.restart",
+  input: z.object({ terminalId: z.string(), paneId: z.string() }),
+  output: z.object({ pid: z.number().int() }),
+});
+
+/**
+ * The client created a chat bound to an existing agent (`herdrBind`) and Paseo is now listening: send its
+ * earlier conversation. Paseo drops rows a provider sends before it subscribes to a created chat.
+ */
+export const herdrChatReadyRpc = defineRpc({
+  name: "herdr.chat.ready",
+  input: z.object({ terminalId: z.string() }),
+  output: z.object({ flushed: z.number().int() }),
 });
 
 export const herdrWorkspaceCreateRpc = defineRpc({

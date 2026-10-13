@@ -2,10 +2,10 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { boundAgents, decodePluginPersistence, herdrChats, recentChats, registerManagementRpcs, type HerdrChat, type ManagementDeps } from "../server/rpc.js";
+import { boundAgents, decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
 import { persistenceOf } from "../server/binding.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
-import { herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HerdrClient } from "../server/herdr/client.js";
 
@@ -161,56 +161,19 @@ it("attaches an unnamed agent by pane id, since herdr agent attach can't resolve
   expect(unnamed.attach.args).toEqual(["--session", "work", "agent", "attach", "p2"]);
 });
 
-const chat = (agentId: string, terminalId: string, lastActivityAt: string, herdrSession: string | null = "work"): HerdrChat => ({
-  agentId, terminalId, herdrSession, harness: "OMP", harnessId: "omp", sessionRef: null, title: `π > ${agentId}`, cwd: "/a", status: "idle", lastActivityAt, attention: null });
-
-it("lists recent chats newest first and links each to its live pane on the current target", () => {
-  const live = [agent("p1", "tab1", "omp", null)];
-  const result = recentChats([
-    chat("old", "t-p1", "2026-10-12T10:00:00Z"),
-    chat("new", "t-gone", "2026-10-13T10:00:00Z"),
-    chat("elsewhere", "t-p1", "2026-10-11T10:00:00Z", null),
-  ], live as never, target("/s"));
-  expect(result.map((c) => c.paseoAgentId)).toEqual(["new", "old", "elsewhere"]);
-  expect(result[0].pane).toBeNull();
-  expect(result[1].pane).toEqual({ paneId: "p1", status: "working" });
-  // Same terminal id in another Herdr session is a different agent.
-  expect(result[2]).toMatchObject({ pane: null, herdrSession: null });
-});
-
-it("keeps at most 20 recent chats", () => {
-  const many = Array.from({ length: 25 }, (_, i) => chat(`c${i}`, `t${i}`, `2026-10-13T10:${String(i).padStart(2, "0")}:00Z`));
-  expect(recentChats(many, [], target("/s"))).toHaveLength(20);
-});
-
-it("still lists chats when Herdr is unavailable", async () => {
+it("reports Herdr unavailable without failing the overview", async () => {
   const { call } = setup({ ensureReady: async () => { throw new Error("Herdr is not running"); } });
-  const result = await call(herdrOverviewRpc, {}, list([paseoAgent("pa1", "herdr-omp", "t-p1", "work", { cwd: "/a", status: "idle", updatedAt: "2026-10-13T10:00:00Z", lastUserMessageAt: null, title: "Fix tests" })]));
-  expect(result.connection.status).toBe("unavailable");
-  expect(result.chats).toEqual([expect.objectContaining({ paseoAgentId: "pa1", title: "Fix tests", pane: null, harness: "OMP" })]);
-  expect(herdrOverviewRpc.output.parse(result).chatError).toBeNull();
+  const result = herdrOverviewRpc.output.parse(await call(herdrOverviewRpc, {}, list([paseoAgent("pa1", "herdr-omp", "t-p1", "work")])));
+  expect(result).toMatchObject({ connection: { status: "unavailable", error: "Herdr is not running" }, workspaces: [], chatError: null });
 });
 
-it("keeps recent chats if Herdr disconnects after readiness", async () => {
+it("reports Herdr unavailable if it disconnects after readiness", async () => {
   seed();
   fake.replyError("agent.list", "unavailable", "Herdr disconnected");
   const { call } = setup();
-  const result = await call(herdrOverviewRpc, {}, list([paseoAgent("pa1", "herdr-omp", "t-p1", "work")]));
+  const result = await call(herdrOverviewRpc, {}, list([]));
   expect(result.connection).toEqual({ status: "unavailable", error: "Herdr disconnected" });
-  expect(result.workspaces).toEqual([]);
-  expect(result.chats[0]).toMatchObject({ paseoAgentId: "pa1", pane: null });
   expect(herdrOverviewRpc.output.safeParse(result).success).toBe(true);
-});
-
-it("does not associate an older conversation with a pane after /new or a harness change", () => {
-  const ref = { kind: "path" as const, value: "/sessions/new.jsonl" };
-  const current = { ...agent("p1", "tab1", "omp", null), agent_session: ref };
-  const chats = [
-    { ...chat("old", "t-p1", "2026-10-12T10:00:00Z"), sessionRef: { ...ref, value: "/sessions/old.jsonl" } },
-    { ...chat("new", "t-p1", "2026-10-13T10:00:00Z"), sessionRef: ref },
-  ];
-  expect(recentChats(chats, [current] as never, target("/s")).map((c) => c.pane?.paneId ?? null)).toEqual(["p1", null]);
-  expect(recentChats(chats, [{ ...current, agent: "claude" }] as never, target("/s")).every((c) => c.pane === null)).toBe(true);
 });
 
 it("offers Open chat for the current native conversation when older chats share its terminal", async () => {
@@ -230,5 +193,21 @@ it("counts an arriving reply as recent activity and compares dates across time z
     lastUserMessageAt: "2026-10-13T09:00:00Z", updatedAt: "2026-10-13T10:00:00Z",
   })]) as never, [ompAdapter]);
   expect(chats[0].lastActivityAt).toBe("2026-10-13T10:00:00Z");
-  expect(recentChats([chat("a", "t1", "2026-10-13T11:00:00+02:00"), chat("b", "t2", "2026-10-13T10:00:00Z")], [], target("/s"))[0].paseoAgentId).toBe("b");
+});
+
+it("flags agents without an input endpoint and offers an in-place restart", async () => {
+  seed();
+  fake.reply("pane.process_info", { type: "pane_process_info", process_info: { pane_id: "p1", foreground_process_group_id: 41, foreground_processes: [{ pid: 41, name: "omp" }] } });
+  fake.reply("agent.list", { type: "agent_list", agents: [{ ...agent("p1", "tab1", "omp", null), agent_session: { source: "herdr:omp", agent: "omp", kind: "path", value: "/s.jsonl" } }] });
+  const adapter = { ...ompAdapter, inputReachable: async (pid: number) => pid !== 41 };
+  const { call } = setup({ harnesses: [adapter] });
+  const [row] = (await call(herdrOverviewRpc, {}, list([]))).workspaces[0].tabs[0].agents;
+  expect(row).toMatchObject({ inputReady: false, canRestart: true });
+});
+
+it("restarts through the injected routine and refuses an agent that is gone", async () => {
+  seed();
+  const { call } = setup({ restart: async (_deps, adapter) => { expect(adapter.id).toBe("omp"); return { pid: 99 }; } });
+  expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).toEqual({ pid: 99 });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" })).rejects.toThrow(/no longer running/);
 });

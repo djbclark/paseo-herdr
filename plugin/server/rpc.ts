@@ -2,12 +2,14 @@ import { access, constants, stat, realpath } from "node:fs/promises";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
-import { herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type RecentChat, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
+import { restartAgent } from "./restart.js";
+import type { BoundSessions } from "./bound-sessions.js";
 import { attachArgs, attachCommand } from "./herdr-commands.js";
 import { resolveSocketPath } from "./herdr/socket-path.js";
 import { HerdrClient } from "./herdr/client.js";
-import { type AgentInfo, AgentListResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
+import { type AgentInfo, AgentListResultSchema, PaneProcessInfoResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
 import type { ReadyTarget } from "./herdr/target.js";
 import type { HarnessAdapter } from "./harness/types.js";
 
@@ -21,6 +23,10 @@ export interface ManagementDeps {
   checkDirectory?(path: string): Promise<string>;
   /** Absolute path of the `herdr` CLI, or null. Defaults to a PATH lookup. */
   findHerdr?(): Promise<string | null>;
+  /** Tests: replaces the in-place restart. */
+  restart?: typeof restartAgent;
+  /** Bound chats awaiting `herdr.chat.ready`. */
+  boundSessions?: BoundSessions;
   /** Environment the CLI would resolve its socket with; defaults to `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
 }
@@ -127,22 +133,6 @@ export async function boundAgents(paseo: PaseoApi, harnesses: readonly HarnessAd
   return new Map((await herdrChats(paseo, harnesses)).sort(newestFirst).reverse().map((chat) => [chatKey(chat.herdrSession, chat.terminalId), chat.agentId]));
 }
 
-/** The 20 most recent chats, each with where its agent runs now on the current target (if it does). */
-export function recentChats(chats: readonly HerdrChat[], agents: readonly AgentInfo[], target: HerdrTarget): RecentChat[] {
-  const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
-  return [...chats]
-    .sort(newestFirst)
-    .slice(0, 20)
-    .map((chat) => {
-      const agent = liveChat(chat, live, target);
-      return {
-        paseoAgentId: chat.agentId, title: chat.title, harness: chat.harness, cwd: chat.cwd, status: chat.status,
-        lastActivityAt: chat.lastActivityAt, attention: chat.attention, herdrSession: chat.herdrSession,
-        pane: agent ? { paneId: agent.pane_id, status: agent.agent_status } : null,
-      };
-    });
-}
-
 export function registerManagementRpcs(server: Pick<PluginServerContext, "handle">, deps: ManagementDeps): void {
   const request = deps.request ?? ((socketPath, method, params) => new HerdrClient(socketPath).request(method, params));
   const check = deps.checkDirectory ?? checkDirectory;
@@ -159,7 +149,7 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     const chatError = chatResult.status === "rejected" ? errorMessage(chatResult.reason) : null;
     const unavailable = (error: unknown) => ({
       target, ompEnabled, connection: { status: "unavailable" as const, error: errorMessage(error) },
-      workspaces: [], chats: recentChats(chats, [], target), chatError,
+      workspaces: [], chatError,
     });
     if (readyResult.status === "rejected") return unavailable(readyResult.reason);
     const ready = readyResult.value;
@@ -175,6 +165,18 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
         request(socket, "pane.list", {}).then((r) => PaneListResultSchema.parse(r).panes),
         request(socket, "agent.list", {}).then((r) => AgentListResultSchema.parse(r).agents),
       ]);
+      // Read-only detection: does each harness process have its input endpoint? (one process_info per agent)
+      const inputReady = new Map(await Promise.all(agents.map(async (agent): Promise<[string, boolean | null]> => {
+        const adapter = deps.harnesses.find((candidate) => candidate.id === agent.agent);
+        if (!adapter?.inputReachable) return [agent.terminal_id, null];
+        try {
+          const process = PaneProcessInfoResultSchema.parse(await request(socket, "pane.process_info", { pane_id: agent.pane_id })).process_info;
+          const pid = process.foreground_process_group_id;
+          return [agent.terminal_id, pid && adapter.isOccupant(process) ? await adapter.inputReachable(pid) : null];
+        } catch {
+          return [agent.terminal_id, null];
+        }
+      })));
       const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
       const bound = new Map([...chats].sort(newestFirst).reverse()
         .filter((chat) => liveChat(chat, live, target))
@@ -209,6 +211,8 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
                 // `herdr agent attach` resolves names and pane ids, not terminal ids.
                 attachCommand: attachCommand(target.herdrSession, agent.name ?? agent.pane_id),
                 attach: herdrPath ? { command: herdrPath, args: attachArgs(target.herdrSession, agent.name ?? agent.pane_id) } : null,
+                inputReady: inputReady.get(agent.terminal_id) ?? null,
+                canRestart: Boolean(adapter?.resumeArgs && agent.agent_session),
               };
             }),
           }));
@@ -222,10 +226,26 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
           tabs: overviewTabs,
         };
       });
-      return { target, ompEnabled, connection: { status: "connected" as const, version: ready.version, autoStarted: ready.autoStarted }, workspaces: out, chats: recentChats(chats, agents, target), chatError };
+      return { target, ompEnabled, connection: { status: "connected" as const, version: ready.version, autoStarted: ready.autoStarted }, workspaces: out, chatError };
     } catch (error) {
       return unavailable(error);
     }
+  });
+
+  server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }) => {
+    const { target } = await deps.readTarget();
+    await deps.ensureReady(target);
+    const socket = target.socketPath;
+    const agent = AgentListResultSchema.parse(await request(socket, "agent.list", {})).agents.find((candidate) => candidate.terminal_id === terminalId);
+    const adapter = deps.harnesses.find((candidate) => candidate.id === agent?.agent);
+    if (!agent || !adapter) throw new Error("The agent is no longer running in Herdr.");
+    // An open chat on this agent stays read-only; the client binds a fresh chat and archives the old one.
+    return (deps.restart ?? restartAgent)({ request: (method, params) => request(socket, method, params) }, adapter, { terminalId, paneId });
+  });
+
+  server.handle(herdrChatReadyRpc, async ({ terminalId }) => {
+    const { target } = await deps.readTarget();
+    return { flushed: deps.boundSessions?.flushHistory(target.herdrSession, terminalId) ?? 0 };
   });
 
   server.handle(herdrWorkspaceCreateRpc, async ({ cwd, label }) => {
