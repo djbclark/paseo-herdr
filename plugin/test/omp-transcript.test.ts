@@ -295,15 +295,34 @@ describe("model and thinking level from the active chain", () => {
     type: "thinking_level_change", id, parentId, timestamp: "2026-10-06T15:56:50.000Z", thinkingLevel, configured: thinkingLevel,
   });
 
-  test("the last role-less or default model_change wins; fallback and other roles are ignored", async () => {
+  // Mirrors OMP 18.4.12 getRestorableSessionModels: the role of the last model_change decides.
+  test("a session-only switch (Alt+P, /switch: role temporary) is the active model", async () => {
+    const path = await write("temporary.jsonl", [
+      sessionRow,
+      modelChange("m1", null, "p/chosen", "default"),
+      modelChange("m2", "m1", "p/quick", "temporary"),
+    ]);
+    expect((await snapshotAt(path)).model).toBe("p/quick");
+  });
+
+  test("a later default change replaces a session-only one; a retry fallback keeps the default", async () => {
     const path = await write("models.jsonl", [
       sessionRow,
       modelChange("m1", null, "p/start"),
-      modelChange("m2", "m1", "p/chosen", "default"),
-      modelChange("m3", "m2", "p/backup", "fallback"),
-      modelChange("m4", "m3", "p/small", "smol"),
+      modelChange("m2", "m1", "p/quick", "temporary"),
+      modelChange("m3", "m2", "p/chosen", "default"),
+      modelChange("m4", "m3", "p/backup", "fallback"),
     ]);
     expect((await snapshotAt(path)).model).toBe("p/chosen");
+  });
+
+  test("switching to another role's model (e.g. smol) makes it active", async () => {
+    const path = await write("role.jsonl", [
+      sessionRow,
+      modelChange("m1", null, "p/chosen", "default"),
+      modelChange("m2", "m1", "p/small", "smol"),
+    ]);
+    expect((await snapshotAt(path)).model).toBe("p/small");
   });
 
   test("a chain with only fallback model_change entries records no model", async () => {

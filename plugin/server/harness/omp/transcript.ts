@@ -103,12 +103,19 @@ export function lastTurnEndIdOf(chain: readonly OmpSessionEntry[]): string | und
 
 /** Last user-selected model (`provider/id`): model_change entries with role absent or "default" (fallback/temporary roles are ignored). */
 export function modelOf(chain: readonly OmpSessionEntry[]): string | undefined {
-  for (let index = chain.length - 1; index >= 0; index--) {
-    const entry = chain[index] as Record<string, unknown>;
-    if (entry.type !== "model_change" || (entry.role ?? "default") !== "default") continue;
-    if (typeof entry.model === "string" && entry.model.length > 0) return entry.model;
+  // OMP's own rule (getRestorableSessionModels, session/session-context.ts:121 in 18.4.12): the role of the
+  // LAST model_change decides. "default" and "fallback" (a retry fallback) mean the latest default model; any
+  // other role, e.g. "temporary" from the session-only picker (Alt+P, /switch), is the active model itself.
+  const models = new Map<string, string>();
+  let lastRole: string | undefined;
+  for (const raw of chain) {
+    const entry = raw as Record<string, unknown>;
+    if (entry.type !== "model_change" || typeof entry.model !== "string" || entry.model.length === 0) continue;
+    lastRole = typeof entry.role === "string" ? entry.role : "default";
+    models.set(lastRole, entry.model);
   }
-  return undefined;
+  if (lastRole === undefined) return undefined;
+  return lastRole === "default" || lastRole === "fallback" ? models.get("default") : models.get(lastRole) ?? models.get("default");
 }
 
 /** Last thinking_level_change on the chain (`null` = off/cleared); undefined when none was recorded. */
