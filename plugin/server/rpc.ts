@@ -76,9 +76,8 @@ export interface HerdrChat {
   sessionRef: Binding["sessionRef"];
   title: string | null;
   cwd: string;
-  status: string;
+  /** Latest user message or chat update; the newest chat wins when several are bound to one agent. */
   lastActivityAt: string;
-  attention: "finished" | "error" | "permission" | null;
 }
 
 /** Every unarchived Paseo chat owned by one of the registered harness providers. */
@@ -97,9 +96,8 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
         chats.push({
           agentId: agent.id, herdrSession: binding.herdrSession, terminalId: binding.terminalId, harness: adapter.label,
           harnessId: adapter.id, sessionRef: binding.sessionRef,
-          title: agent.title ?? null, cwd: agent.cwd, status: agent.status,
+          title: agent.title ?? null, cwd: agent.cwd,
           lastActivityAt: activityTime(agent.lastUserMessageAt, agent.updatedAt),
-          attention: agent.requiresAttention ? agent.attentionReason ?? null : null,
         });
       } catch {
         // Foreign or corrupt persistence: ignore.
