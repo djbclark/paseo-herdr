@@ -24,9 +24,19 @@ export function classifyHerdrPrompt(result: unknown, error: unknown, binding: Bi
 }
 
 export class PromptController {
+  /** The submission being admitted/delivered; a Stop that arrives meanwhile waits for it (see `interrupt`). */
+  private inFlight: Promise<void> | null = null;
+
   constructor(private readonly session: HerdrHarnessSession) {}
 
   async prompt(prompt: ProviderPrompt): Promise<void> {
+    const run = this.admit(prompt);
+    this.inFlight = run;
+    try { await run; }
+    finally { if (this.inFlight === run) this.inFlight = null; }
+  }
+
+  private async admit(prompt: ProviderPrompt): Promise<void> {
     const session = this.session;
     const state = session.state;
     if (session.isAborted) return;
@@ -93,6 +103,10 @@ export class PromptController {
     const session = this.session;
     const state = session.state;
     const done = () => session.emit({ type: "request.completed", requestId });
+    if (session.isAborted) return;
+    // A Stop pressed while the prompt is still being delivered applies to that turn once it starts;
+    // a rejected or uncertain delivery has no turn to stop.
+    if (this.inFlight) await this.inFlight.catch(() => undefined);
     if (session.isAborted) return;
     if (state.outcome !== "active" || !state.connected || !state.tracker.isActive) { done(); return; }
     const generation = state.generation;

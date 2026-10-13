@@ -108,7 +108,17 @@ export class LiveSession {
         if (!state.tracker.activeTurn && (agent.agent_status === "working" || agent.agent_status === "blocked")) {
           state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
         }
-        state.tracker.observeStatus(agent.agent_status);
+        const working = agent.agent_status === "working";
+        const echo = state.staleWorking;
+        if (!state.tracker.activeTurn && echo && working && state.snapshot?.lastTurnEndId === echo.endId) {
+          // Late `working` for a turn the transcript already ended: no news, so no phantom turn.
+          echo.echoed = true;
+          state.tracker.observeStatus("idle");
+        } else {
+          if (echo?.echoed && !working) state.staleWorking = null;
+          state.tracker.observeStatus(agent.agent_status);
+          if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
+        }
         await this.doReadTranscript();
         if (!session.current(generation) || state.outcome !== "active") return;
         state.connected = true;
@@ -171,11 +181,14 @@ export class LiveSession {
     }
     state.timeline = nextTimeline;
     state.snapshot = snapshot;
+    if (state.staleWorking && snapshot.lastTurnEndId !== state.staleWorking.endId) state.staleWorking = null;
     session.onSnapshot(previous, snapshot);
     if (state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
         snapshot.turnState === "idle" && snapshot.lastTurnEndId && snapshot.lastTurnEndId !== state.turnBaselineEndId &&
         snapshot.lastTurnEnd && snapshot.lastTurnEnd !== "unknown") {
       state.tracker.observeNativeTurnEnd(snapshot.lastTurnEnd);
+      state.staleWorking = state.workingSeen ? null : { endId: snapshot.lastTurnEndId, echoed: false };
+      state.workingSeen = false;
       state.pending = null;
       state.turnBaselineEndId = snapshot.lastTurnEndId;
     }

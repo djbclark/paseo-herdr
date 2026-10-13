@@ -55,6 +55,14 @@ export interface SessionState {
   admitting: boolean;
   pending: { clientMessageId: string; text: string; previousUserIds: Set<string> } | null;
   turnBaselineEndId: string | null;
+  /** Herdr reported `working`/`blocked` while the current Paseo turn was open. */
+  workingSeen: boolean;
+  /**
+   * Set when the transcript ended a Paseo turn before Herdr ever reported it working (a Stop that aborts the turn
+   * within milliseconds). Herdr's late `working` for that finished turn must not open a new turn: its end is already
+   * consumed, so a phantom turn could never end.
+   */
+  staleWorking: { endId: string; echoed: boolean } | null;
   tracker: TurnTracker;
 }
 const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
@@ -78,7 +86,7 @@ export class HerdrHarnessSession {
     this.state = {
       binding, paneId: null, reader: null, timeline: emptyTimelineState(), snapshot: null,
       outcome: "active", connected: false, status: "unknown", generation: 0, admitting: false,
-      pending: null, turnBaselineEndId: null,
+      pending: null, turnBaselineEndId: null, workingSeen: false, staleWorking: null,
       tracker: new TurnTracker({ onEffect: (effect) => this.applyEffect(effect) }),
     };
     this.prompts = new PromptController(this);
