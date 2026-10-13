@@ -1,5 +1,6 @@
 import type { PluginClientContext, PluginButtonRegistration } from "@getpaseo/plugin/client";
 import { OVERVIEW_SCREEN_ID } from "./helpers.js";
+import { createCatalogFollower } from "./catalog.js";
 
 /** Keep a way home in every Herdr chat, including chats restored after reconnect. */
 export function registerHerdrHome(client: PluginClientContext): () => void {
@@ -14,8 +15,10 @@ export function registerHerdrHome(client: PluginClientContext): () => void {
   const clear = () => {
     for (const agentId of pills.keys()) remove(agentId);
   };
-  const register = (agent: { id: string; provider: string; workspaceId?: string | null; archivedAt?: string | null }) => {
+  const followCatalog = createCatalogFollower(client.paseo);
+  const register = (agent: { id: string; provider: string; workspaceId?: string | null; archivedAt?: string | null; runtimeInfo?: { model?: string | null } | null }) => {
     if (lifetime.signal.aborted) return;
+    if (!agent.archivedAt) void followCatalog(agent);
     if (!agent.provider.startsWith("herdr-") || !agent.workspaceId || agent.archivedAt) {
       remove(agent.id);
       return;
