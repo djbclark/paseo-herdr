@@ -123,8 +123,28 @@ async function startCompanion() {
 
 describe("OMP input client delivery classification", () => {
   it("gives a required-extension install diagnostic for a missing companion", async () => {
-    await expect(inspectOmpInput(PID, REF)).rejects.toThrow(/required OMP input companion.*read-only.*npm run install:omp-companion.*restart the OMP agent.*never restarted automatically/);
-    await expect(submitOmpInput(PID, REF, INSTANCE, "prompt")).resolves.toMatchObject({ type: "rejected" });
+    const agentDir = await mkdtemp(path.join(os.tmpdir(), "omp-agent-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    try {
+      await expect(inspectOmpInput(PID, REF)).rejects.toThrow(/required OMP input companion.*read-only.*npm run install:omp-companion.*omp --resume.*never restarts agents/);
+      await expect(submitOmpInput(PID, REF, INSTANCE, "prompt")).resolves.toMatchObject({ type: "rejected" });
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("tells an older OMP process to resume its session when the companion is already installed", async () => {
+    const agentDir = await mkdtemp(path.join(os.tmpdir(), "omp-agent-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    try {
+      await mkdir(path.join(agentDir, "extensions"));
+      await writeFile(path.join(agentDir, "extensions", "paseo-herdr-input.ts"), await readFile(new URL("../harness-extension/omp.ts", import.meta.url)));
+      await expect(inspectOmpInput(PID, REF)).rejects.toThrow(new RegExp(`started before the input companion was installed.*omp --resume ${REF.value}`));
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(agentDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects a pre-aborted prompt without connecting or writing", async () => {

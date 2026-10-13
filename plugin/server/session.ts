@@ -146,7 +146,7 @@ export class HerdrHarnessSession {
     if (this.state.outcome === "active") {
       try { await this.validateAgent(); }
       catch (error) {
-        if (!this.isAborted) this.freeze("Input companion unavailable", `${messageOf(error)}. Install the ${this.adapter.label} input companion and restart the agent; this conversation is read-only.`);
+        if (!this.isAborted) this.freeze("Input companion unavailable", messageOf(error));
       }
     }
     if (this.isAborted) return;

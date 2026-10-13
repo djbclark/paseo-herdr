@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSessionRef } from "../../herdr/schema.js";
+import { companionInstallStatus } from "./companion-install.js";
 import type { ConfigTarget, ConfigureResult, HarnessConfig, HarnessModel } from "../types.js";
 
 const REPLY_TIMEOUT_MS = 3000;
@@ -105,13 +106,22 @@ function replyMatches(reply: Record<string, unknown>, pid: number, ref: AgentSes
     observed.kind === ref.kind && observed.value === ref.value;
 }
 
+/** Why this process has no companion socket: an old process (companion installed later) or a missing/outdated install. */
+async function companionUnavailableMessage(ref: AgentSessionRef, detail: string): Promise<string> {
+  const installed = await companionInstallStatus().then((status) => status.state === "current", () => false);
+  const resume = `omp --resume ${ref.value.includes(" ") ? JSON.stringify(ref.value) : ref.value}`;
+  return installed
+    ? `This OMP process started before the input companion was installed (OMP loads extensions only at startup), so this session is read-only. To type here, quit OMP in its Herdr pane and run \`${resume}\` in the same pane, then reopen this chat. Paseo never restarts agents itself. (${detail})`
+    : `The required OMP input companion is unavailable; this session is read-only. Install it with npm run install:omp-companion in paseo-herdr/plugin, then quit OMP in its Herdr pane and run \`${resume}\` in the same pane (OMP loads extensions only at startup). Paseo never restarts agents itself. (${detail})`;
+}
+
 /** Establish input identity without requiring the editor to be empty or idle. */
 export async function inspectOmpInput(pid: number, ref: AgentSessionRef, signal?: AbortSignal): Promise<OmpInputIdentity> {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("OMP input requires a valid foreground process PID.");
   const nonce = randomUUID();
   const result = await roundTrip(pid, { op: "inspect", nonce, pid, ref }, signal);
   if (result.line === undefined) {
-    throw new Error(`The required OMP input companion is unavailable; this session is read-only. Install it with npm run install:omp-companion in paseo-herdr/plugin, then restart the OMP agent (OMP loads extensions only at startup). Existing sessions are never restarted automatically. ${result.message ?? "No reply received."}`);
+    throw new Error(await companionUnavailableMessage(ref, result.message ?? "No reply received."));
   }
   const reply = parseReply(result.line);
   if (!replyMatches(reply, pid, ref, nonce)) throw new Error("OMP input companion identity does not match this process and native session; this session is read-only.");

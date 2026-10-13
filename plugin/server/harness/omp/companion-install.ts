@@ -1,12 +1,12 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { COMPANION_SHA256 } from "./companion-hash.js";
 
 // Mirrors scripts/install-omp-companion.mjs; keep the two in sync.
 export const COMPANION_INSTALL_NAME = "paseo-herdr-input.ts";
 const COMPANION_MARKER = "// paseo-herdr OMP input companion.";
-const COMPANION_SOURCE = fileURLToPath(new URL("../../../harness-extension/omp.ts", import.meta.url));
 
 function expandTilde(value: string, home: string): string {
   if (value === "~") return home;
@@ -31,7 +31,6 @@ export async function companionInstallStatus(
     throw error;
   });
   if (installed === null) return { state: "missing", path: target };
-  const source = await fs.readFile(COMPANION_SOURCE, "utf8");
-  if (installed === source) return { state: "current", path: target };
+  if (createHash("sha256").update(installed).digest("hex") === COMPANION_SHA256) return { state: "current", path: target };
   return { state: installed.startsWith(COMPANION_MARKER) ? "outdated" : "foreign", path: target };
 }

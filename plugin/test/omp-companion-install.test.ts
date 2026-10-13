@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import * as installerModule from "../scripts/install-omp-companion.mjs";
 import { COMPANION_INSTALL_NAME, companionInstallStatus, ompExtensionDir } from "../server/harness/omp/companion-install.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
+import { COMPANION_SHA256 } from "../server/harness/omp/companion-hash.js";
+import { createHash } from "node:crypto";
 
 type Env = Record<string, string | undefined>;
 interface Installer {
@@ -225,4 +227,8 @@ describe("OMP adapter inputCompanionStatus", () => {
 
 it("marker is the prefix the source file starts with", () => {
   expect(SOURCE.startsWith(MARKER)).toBe(true);
+});
+
+it("keeps the generated companion hash in step with harness-extension/omp.ts (run npm run sync:companion-hash)", () => {
+  expect(createHash("sha256").update(SOURCE).digest("hex")).toBe(COMPANION_SHA256);
 });
