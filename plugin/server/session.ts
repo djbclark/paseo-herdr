@@ -62,7 +62,7 @@ export interface SessionState {
    * within milliseconds). Herdr's late `working` for that finished turn must not open a new turn: its end is already
    * consumed, so a phantom turn could never end.
    */
-  staleWorking: { endId: string; echoed: boolean } | null;
+  staleWorking: { endId: string | undefined; echoed: boolean } | null;
   tracker: TurnTracker;
 }
 const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
@@ -224,6 +224,27 @@ export class HerdrHarnessSession {
     if (!rows || this.isAborted) return;
     for (const row of rows) this.emit({ type: "timeline.item", sessionId: this.sessionId, item: row.item, timestamp: row.timestamp });
     for (const event of held) this.emit(event);
+  }
+
+  /**
+   * After an early-abort cancel the harness may have restored the prompt into its input box. Ask it once to drop that
+   * text; keep anything else. Never retried; uncertainty is reported to the user rather than resolved by guessing.
+   */
+  async discardRestoredPrompt(text: string, generation: number): Promise<void> {
+    const occupant = this.state.binding.occupant;
+    const ref = this.state.binding.sessionRef;
+    const label = this.adapter.label;
+    let outcome: "cleared" | "kept" | "unsupported" = "unsupported";
+    try {
+      if (this.adapter.discardRestoredPrompt && occupant && ref) {
+        outcome = await this.adapter.discardRestoredPrompt({ pid: occupant.pid, ref, instanceId: occupant.instanceId }, text, this.signal);
+      }
+    } catch { outcome = "kept"; }
+    if (outcome === "cleared" || !this.current(generation)) return;
+    this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
+      id: "restored-prompt", severity: "info", title: `${label} put your message back in its input box`,
+      description: `The message was not sent. To remove it, clear the input box in the terminal (Herdr screen, then ⋯, then Open in terminal).`,
+    } });
   }
 
   prompt(prompt: ProviderPrompt): Promise<void> { return this.prompts.prompt(prompt); }

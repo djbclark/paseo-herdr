@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { once, getEventListeners } from "node:events";
 import ompInputCompanion from "../harness-extension/omp.js";
-import { configureOmp, inspectOmpInput, readOmpConfig, submitOmpInput } from "../server/harness/omp/input.js";
+import { clearOmpRestoredPrompt, configureOmp, inspectOmpInput, readOmpConfig, submitOmpInput } from "../server/harness/omp/input.js";
 
 const REF = { kind: "path" as const, value: "/tmp/omp-input-session.jsonl" };
 const INSTANCE = "test-instance";
@@ -97,7 +97,7 @@ async function startCompanion() {
     mode: "tui", hasUI: true, agent: { kind: "main" },
     isIdle: vi.fn(() => state.idle),
     hasPendingMessages: vi.fn(() => state.pending),
-    ui: { getEditorText: vi.fn((): unknown => state.draft), notify: vi.fn() },
+    ui: { getEditorText: vi.fn((): unknown => state.draft), setEditorText: vi.fn((text: string) => { state.draft = text; }), notify: vi.fn() },
     sessionManager: { getSessionFile: () => state.ref, getSessionId: () => "native-id" },
     models: { list: vi.fn(() => state.list), current: vi.fn(() => state.current) },
   };
@@ -558,5 +558,82 @@ describe("OMP companion config and configure ops", () => {
     gate.resolve(true);
     await expect(first).resolves.toMatchObject({ type: "configured" });
     expect(c.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("OMP companion clearDraft (restored prompt after an early Stop)", () => {
+  const TEXT = "Write a long essay\n\n  with  spacing ☃ (#1)";
+
+  it("clears the editor only on an exact match", async () => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    companion.state.draft = TEXT;
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("cleared");
+    expect(companion.state.draft).toBe("");
+    expect(companion.ctx.ui.setEditorText).toHaveBeenCalledExactlyOnceWith("");
+    expect(companion.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["a different draft", "edited " + TEXT, TEXT + " more", " " + TEXT, TEXT + "\n"])("leaves %j untouched", async (draft) => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    companion.state.draft = draft;
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("kept");
+    expect(companion.state.draft).toBe(draft);
+    expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("reports an already empty editor as cleared without writing", async () => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("cleared");
+    expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("refuses a stale instance, a changed ref and a wrong pid without touching the editor", async () => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    companion.state.draft = TEXT;
+    expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n1", pid: process.pid, ref: REF, instanceId: "stale", text: TEXT })).code).toBe("identity_mismatch");
+    expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n2", pid: process.pid + 1, ref: REF, instanceId: identity.instanceId, text: TEXT })).code).toBe("identity_mismatch");
+    expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n3", pid: process.pid, ref: { kind: "path", value: "/other" }, instanceId: identity.instanceId, text: TEXT })).code).toBe("ref_mismatch");
+    await expect(clearOmpRestoredPrompt(process.pid, REF, "stale", TEXT)).resolves.toBe("kept");
+    expect(companion.state.draft).toBe(TEXT);
+    expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it.each(["non-TUI", "no UI", "subagent", "unknown editor"])("never mutates for %s", async (condition) => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    companion.state.draft = TEXT;
+    if (condition === "non-TUI") companion.ctx.mode = "rpc";
+    else if (condition === "no UI") companion.ctx.hasUI = false;
+    else if (condition === "subagent") companion.ctx.agent.kind = "sub";
+    else companion.ctx.ui.getEditorText.mockImplementation(() => { throw new Error("boom"); });
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("kept");
+    expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("reports a throwing setEditorText as kept and does not retry", async () => {
+    const companion = await startCompanion();
+    const identity = await inspectOmpInput(process.pid, REF);
+    companion.state.draft = TEXT;
+    companion.ctx.ui.setEditorText.mockImplementation(() => { throw new Error("boom"); });
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("kept");
+    expect(companion.ctx.ui.setEditorText).toHaveBeenCalledOnce();
+  });
+
+  it("maps an older companion's bad_request to unsupported", async () => {
+    await inputServer((request, socket) => {
+      socket.end(`${JSON.stringify({ nonce: request.nonce, pid: PID, instanceId: INSTANCE, ref: REF, type: "rejected", code: "bad_request", message: "Invalid OMP input companion request." })}\n`);
+    });
+    await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("unsupported");
+  });
+
+  it("treats a mismatched reply identity as kept", async () => {
+    await inputServer((request, socket) => {
+      socket.end(`${JSON.stringify({ nonce: "other", pid: PID, instanceId: INSTANCE, ref: REF, type: "cleared" })}\n`);
+    });
+    await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("kept");
   });
 });

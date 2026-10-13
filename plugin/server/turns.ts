@@ -36,6 +36,14 @@ export interface TurnTrackerThresholds {
   interruptPendingMs: number;
   /** Uncertain delivery with no transcript entry settles only after native idle has held this long. */
   uncertainSettleMs: number;
+  /**
+   * Early-abort detection (a Stop that lands before the harness recorded the prompt): only observations at least this
+   * long after the interrupt count. Normal startup lag (R17) keeps Herdr on `idle` for seconds, but there the user
+   * entry is already in the transcript; this margin covers the remaining window where the key and the entry race.
+   */
+  earlyAbortMinAfterInterruptMs: number;
+  /** Two consecutive non-working observations with no user entry must span at least this long before the turn is canceled. */
+  earlyAbortSettleMs: number;
 }
 
 export const DEFAULT_TURN_THRESHOLDS: TurnTrackerThresholds = {
@@ -43,6 +51,8 @@ export const DEFAULT_TURN_THRESHOLDS: TurnTrackerThresholds = {
   reconnectGiveUpMs: 60_000,
   interruptPendingMs: 10_000,
   uncertainSettleMs: 15_000,
+  earlyAbortMinAfterInterruptMs: 1_000,
+  earlyAbortSettleMs: 1_000,
 };
 
 export type TurnEffect =
@@ -70,6 +80,8 @@ export class TurnTracker {
   private disconnectedSince: number | null = null;
   private interruptedAt: number | null = null;
   private interruptNoticed = false;
+  /** Consecutive qualifying early-abort observations: when the first was made and how many so far. */
+  private earlyAbort: { since: number; count: number } | null = null;
   private readonly now: () => number;
   private readonly thresholds: TurnTrackerThresholds;
   private readonly onEffect: (effect: TurnEffect) => void;
@@ -279,7 +291,35 @@ export class TurnTracker {
     if (this.phase.kind !== "active" && this.phase.kind !== "ending") return;
     this.interruptedAt = this.now();
     this.interruptNoticed = false;
+    this.earlyAbort = null;
     this.tickInterrupt(this.now());
+  }
+
+  /**
+   * A Stop was sent for an accepted Paseo turn whose user entry never reached the transcript, and Herdr reports the
+   * agent not working: the harness aborted the turn before recording it, so no native end will ever arrive. After the
+   * interrupt has had `earlyAbortMinAfterInterruptMs` to take effect and two consecutive such observations span
+   * `earlyAbortSettleMs`, cancel the turn exactly once. Returns "canceled" when it ended the turn, "watching" while the
+   * evidence is accumulating (the caller should observe again after the settle window), otherwise "none".
+   */
+  observeEarlyAbort(input: { status: AgentStatus; entryMissing: boolean }, message: string): "none" | "watching" | "canceled" {
+    if (this.phase.kind !== "active" || this.phase.origin !== "paseo" || this.interruptedAt === null ||
+        !input.entryMissing || (input.status !== "idle" && input.status !== "done")) {
+      this.earlyAbort = null;
+      return "none";
+    }
+    const now = this.now();
+    if (now - this.interruptedAt < this.thresholds.earlyAbortMinAfterInterruptMs) { this.earlyAbort = null; return "watching"; }
+    if (!this.earlyAbort) { this.earlyAbort = { since: now, count: 1 }; return "watching"; }
+    this.earlyAbort.count++;
+    if (this.earlyAbort.count < 2 || now - this.earlyAbort.since < this.thresholds.earlyAbortSettleMs) return "watching";
+    const { turnId } = this.phase;
+    this.phase = { kind: "idle" };
+    this.interruptedAt = null;
+    this.interruptNoticed = false;
+    this.earlyAbort = null;
+    this.emit({ type: "turn", turnId, state: "canceled", error: message });
+    return "canceled";
   }
 
   private tickInterrupt(now: number): void {

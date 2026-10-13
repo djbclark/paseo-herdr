@@ -55,6 +55,7 @@ export type PromptDelivery =
   | { type: "accepted" }
   | { type: "rejected"; message: string }
   | { type: "uncertain"; message: string };
+export type RestoredPromptOutcome = "cleared" | "kept" | "unsupported";
 export interface InputTarget { pid: number; ref: AgentSessionRef; }
 export interface HarnessAdapter {
   readonly id: string;
@@ -86,6 +87,12 @@ export interface HarnessAdapter {
   resumeArgs?(ref: AgentSessionRef): string[];
   /** Optional: cheap check (no round trip) that process `pid` has its input endpoint; false means it started without the companion. */
   inputReachable?(pid: number): Promise<boolean>;
+  /**
+   * Optional: a turn Paseo submitted was aborted before the harness recorded it, and the harness may have put the prompt
+   * text back into its input box. Clear it only if the box holds exactly `text`; never touch anything else. Called at most
+   * once per canceled turn, never retried. "unsupported" = this harness/companion cannot tell (older companion).
+   */
+  discardRestoredPrompt?(target: InputTarget & { instanceId: string }, text: string, signal?: AbortSignal): Promise<RestoredPromptOutcome>;
   /** P3.5B: sibling sessions whose header names `locator`'s session as their parent (excluding `locator` itself). */
   findForks?(locator: TranscriptLocator, signal?: AbortSignal): Promise<NativeFork[]>;
 }

@@ -8,7 +8,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSessionRef } from "../../herdr/schema.js";
 import { companionInstallStatus } from "./companion-install.js";
-import type { ConfigTarget, ConfigureResult, HarnessConfig, HarnessModel } from "../types.js";
+import type { ConfigTarget, ConfigureResult, HarnessConfig, HarnessModel, RestoredPromptOutcome } from "../types.js";
 
 const REPLY_TIMEOUT_MS = 3000;
 const MAX_REPLY_CHARS = 65536;
@@ -266,4 +266,22 @@ export async function configureOmp(
     return { type: "uncertain", message: reply.message };
   }
   return { type: "uncertain", message: "OMP input companion returned an unrecognized reply; the change is uncertain. Do not retry automatically." };
+}
+
+/**
+ * Drop the prompt text OMP restored to its editor after an early Stop. One attempt, never retried. Anything that is
+ * not an authenticated "cleared" is reported as kept; an older companion that doesn't know the op is "unsupported".
+ */
+export async function clearOmpRestoredPrompt(pid: number, ref: AgentSessionRef, instanceId: string, text: string, signal?: AbortSignal): Promise<RestoredPromptOutcome> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof instanceId !== "string" || instanceId.length === 0 || typeof text !== "string" || text.length === 0) return "kept";
+  const nonce = randomUUID();
+  const result = await roundTrip(pid, { op: "clearDraft", nonce, pid, ref, instanceId, text }, signal);
+  if (result.line === undefined) return "kept";
+  let reply: Record<string, unknown>;
+  try { reply = parseReply(result.line); } catch { return "kept"; }
+  if (!replyMatches(reply, pid, ref, nonce, instanceId)) return "kept";
+  if (reply.type === "cleared") return "cleared";
+  // An older companion rejects the unknown op as a bad request.
+  if (reply.type === "rejected" && reply.code === "bad_request") return "unsupported";
+  return "kept";
 }

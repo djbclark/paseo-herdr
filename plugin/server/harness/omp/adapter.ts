@@ -8,7 +8,7 @@ import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import type { AgentSessionRef, PaneProcessInfo } from "../../herdr/schema.js";
 import { FileTail } from "../../file-tail.js";
 import { access } from "node:fs/promises";
-import { configureOmp, inspectOmpInput, ompInputSocketPath, readOmpConfig, submitOmpInput } from "./input.js";
+import { clearOmpRestoredPrompt, configureOmp, inspectOmpInput, ompInputSocketPath, readOmpConfig, submitOmpInput } from "./input.js";
 import { activeChain, lastTurnEndOf, lastTurnEndIdOf, modelOf, thinkingLevelOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
 import { companionInstallStatus } from "./companion-install.js";
@@ -79,6 +79,7 @@ export const ompAdapter: HarnessAdapter = {
   },
   inspectInput: ({ pid, ref }, signal) => inspectOmpInput(pid, ref, signal),
   submitPrompt: ({ pid, ref, instanceId }, text, { signal }) => submitOmpInput(pid, ref, instanceId, text, signal),
+  discardRestoredPrompt: ({ pid, ref, instanceId }, text, signal) => clearOmpRestoredPrompt(pid, ref, instanceId, text, signal),
   findForks: findOmpForks,
   readConfig: ({ pid, ref, instanceId }, signal) => readOmpConfig(pid, ref, instanceId, signal),
   configure: ({ pid, ref, instanceId }, changes, signal) => configureOmp(pid, ref, instanceId, changes, signal),

@@ -32,6 +32,7 @@ export class LiveSession {
     this.readerUnsubscribe = null;
     clearInterval(this.timer);
     this.timer = undefined;
+    clearTimeout(this.earlyAbortTimer);
     this.forks.stop();
   }
   paneChanged(): void { if (this.running) this.subscribePane(); }
@@ -123,10 +124,39 @@ export class LiveSession {
         if (!session.current(generation) || state.outcome !== "active") return;
         state.connected = true;
         state.tracker.observeConnectivityRestored();
+        this.checkEarlyAbort(generation);
       } catch {
         if (session.current(generation)) this.disconnected();
       }
     });
+  }
+
+  private earlyAbortTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * A Stop that lands before the harness records the prompt leaves no transcript trace, so only Herdr's idle status plus
+   * the missing user entry can end the turn (see TurnTracker.observeEarlyAbort).
+   */
+  private checkEarlyAbort(generation: number): void {
+    const session = this.session;
+    const state = session.state;
+    clearTimeout(this.earlyAbortTimer);
+    const pending = state.pending;
+    if (!pending || !state.tracker.isActive) return;
+    const entryMissing = !state.snapshot?.items.some((item) => item.type === "user_message" && !pending.previousUserIds.has(item.id));
+    const label = session.adapter.label;
+    const verdict = state.tracker.observeEarlyAbort({ status: state.status, entryMissing },
+      `Stopped before ${label} started this turn; nothing was sent to the model.`);
+    if (verdict === "watching" && this.running) {
+      this.earlyAbortTimer = setTimeout(() => { void this.reconcile(); }, 1100);
+    } else if (verdict === "canceled") {
+      state.pending = null;
+      state.workingSeen = false;
+      state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
+      // A late Herdr `working` for the aborted turn must not open a phantom turn that can never end.
+      state.staleWorking = { endId: state.snapshot?.lastTurnEndId, echoed: false };
+      void session.discardRestoredPrompt(pending.text, generation);
+    }
   }
 
   private async doReadTranscript(): Promise<void> {

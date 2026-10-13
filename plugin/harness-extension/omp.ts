@@ -16,6 +16,7 @@ interface InputContext {
   hasPendingMessages(): boolean;
   ui: {
     getEditorText(): unknown;
+    setEditorText(text: string): void;
     notify(message: string, type: "error"): void;
   };
   sessionManager: { getSessionFile(): unknown; getSessionId(): unknown };
@@ -262,7 +263,7 @@ export default function ompInputCompanion(pi: CompanionApi): void {
     const refuse = (code: string, message: string) => respond({ type: "rejected", code, message });
     const ref = request.ref;
     if (typeof request.nonce !== "string" || request.nonce.length === 0 ||
-        (request.op !== "inspect" && request.op !== "submit" && request.op !== "config" && request.op !== "configure") ||
+        (request.op !== "inspect" && request.op !== "submit" && request.op !== "config" && request.op !== "configure" && request.op !== "clearDraft") ||
         typeof ref !== "object" || ref === null || Array.isArray(ref)) {
       refuse("bad_request", "Invalid OMP input companion request.");
       return;
@@ -299,6 +300,32 @@ export default function ompInputCompanion(pi: CompanionApi): void {
     }
     if (request.op === "configure") {
       configure(request, state, respond, refuse);
+      return;
+    }
+    if (request.op === "clearDraft") {
+      // Esc on a still-queued prompt makes OMP restore the text to the editor. Drop it only if the editor holds exactly the
+      // text this plugin submitted (OMP restores a lone queued message verbatim); any other content is the user's.
+      if (state.mode !== "tui" || state.hasUI !== true || state.isMain !== true) {
+        refuse("not_interactive", "OMP input requires an interactive main TUI session.");
+        return;
+      }
+      if (typeof request.text !== "string" || request.text.length === 0) {
+        refuse("empty_text", "Prompt text must not be empty.");
+        return;
+      }
+      const liveCtx = ctx;
+      if (!liveCtx) { refuse("no_session", "The OMP session state is unavailable."); return; }
+      let current: unknown;
+      try { current = liveCtx.ui.getEditorText(); } catch { current = undefined; }
+      if (typeof current !== "string") {
+        refuse("editor_unknown", "OMP editor state is unavailable; the terminal draft has not been changed.");
+        return;
+      }
+      if (current === "") { respond({ type: "cleared", empty: true }); return; }
+      if (current !== request.text) { respond({ type: "kept" }); return; }
+      try { liveCtx.ui.setEditorText(""); }
+      catch { respond({ type: "kept" }); return; }
+      respond({ type: "cleared" });
       return;
     }
     if (configuring) {
