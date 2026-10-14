@@ -8,7 +8,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSessionRef } from "../../herdr/schema.js";
 import { companionInstallStatus } from "./companion-install.js";
-import type { ConfigTarget, ConfigureResult, HarnessConfig, HarnessModel, RestoredPromptOutcome } from "../types.js";
+import type {
+  ApprovalSnapshot, ConfigTarget, ConfigureResult, Decision, DecisionRecord, HarnessConfig, HarnessModel, PendingDecision,
+  ResolveResult, RestoredPromptOutcome,
+} from "../types.js";
 
 const REPLY_TIMEOUT_MS = 3000;
 const MAX_REPLY_CHARS = 65536;
@@ -29,6 +32,10 @@ const REFUSAL_CODES: Record<string, true | undefined> = {
   thinking_unsupported: true,
   invalid_thinking: true,
   model_unavailable: true,
+  unknown_request: true,
+  already_resolved: true,
+  invalid_decision: true,
+  not_pending: true,
 };
 
 export type OmpInputDelivery =
@@ -284,4 +291,147 @@ export async function clearOmpRestoredPrompt(pid: number, ref: AgentSessionRef, 
   // An older companion rejects the unknown op as a bad request.
   if (reply.type === "rejected" && reply.code === "bad_request") return "unsupported";
   return "kept";
+}
+
+const OUTCOMES = new Set(["approved", "denied", "answered", "cancelled", "timed_out", "chat"]);
+const SOURCES = new Set(["paseo", "terminal", "system"]);
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Throws on any malformed record so a damaged reply never becomes a decision. */
+function parseDecisionRecord(value: unknown): DecisionRecord {
+  if (!isRecord(value) || !Number.isSafeInteger(value.seq) || typeof value.id !== "string" || value.id.length === 0 ||
+      (value.kind !== "tool" && value.kind !== "question") || typeof value.outcome !== "string" || !OUTCOMES.has(value.outcome) ||
+      typeof value.source !== "string" || !SOURCES.has(value.source) || typeof value.at !== "string") {
+    throw new Error("OMP input companion returned a malformed decision record.");
+  }
+  let answer: DecisionRecord["answer"];
+  if (value.answer !== undefined) {
+    if (!Array.isArray(value.answer)) throw new Error("OMP input companion returned a malformed decision record.");
+    answer = value.answer.map((item) => {
+      if (!isRecord(item) || typeof item.id !== "string" || !Array.isArray(item.selectedOptions) ||
+          !item.selectedOptions.every((label) => typeof label === "string") ||
+          (item.customInput !== undefined && typeof item.customInput !== "string")) {
+        throw new Error("OMP input companion returned a malformed decision answer.");
+      }
+      return { id: item.id, selectedOptions: [...item.selectedOptions as string[]], ...(item.customInput !== undefined ? { customInput: item.customInput as string } : {}) };
+    });
+  }
+  return {
+    seq: value.seq as number, id: value.id, kind: value.kind, outcome: value.outcome as DecisionRecord["outcome"],
+    source: value.source as DecisionRecord["source"], at: value.at, ...(answer ? { answer } : {}),
+  };
+}
+
+function parsePending(value: unknown): PendingDecision {
+  if (!isRecord(value) || typeof value.id !== "string" || value.id.length === 0 || typeof value.createdAt !== "string") {
+    throw new Error("OMP input companion returned a malformed pending request.");
+  }
+  if (value.kind === "tool") {
+    if (typeof value.toolName !== "string" || typeof value.title !== "string" ||
+        (value.reason !== undefined && typeof value.reason !== "string") ||
+        (value.approvalMode !== undefined && typeof value.approvalMode !== "string")) {
+      throw new Error("OMP input companion returned a malformed pending approval.");
+    }
+    return {
+      id: value.id, kind: "tool", toolName: value.toolName, title: value.title, createdAt: value.createdAt,
+      ...(value.reason !== undefined ? { reason: value.reason as string } : {}),
+      ...(value.args !== undefined ? { args: value.args } : {}),
+      ...(value.approvalMode !== undefined ? { approvalMode: value.approvalMode as string } : {}),
+    };
+  }
+  if (value.kind === "question" && typeof value.toolName === "string" && Array.isArray(value.questions)) {
+    const questions = value.questions.map((q) => {
+      if (!isRecord(q) || typeof q.id !== "string" || typeof q.question !== "string" || typeof q.multi !== "boolean" || !Array.isArray(q.options) ||
+          (q.header !== undefined && typeof q.header !== "string") || (q.recommended !== undefined && typeof q.recommended !== "number")) {
+        throw new Error("OMP input companion returned a malformed pending question.");
+      }
+      const options = q.options.map((option) => {
+        if (!isRecord(option) || typeof option.label !== "string" || (option.description !== undefined && typeof option.description !== "string")) {
+          throw new Error("OMP input companion returned a malformed pending question option.");
+        }
+        return { label: option.label, ...(option.description !== undefined ? { description: option.description as string } : {}) };
+      });
+      return {
+        id: q.id, question: q.question, multi: q.multi, options,
+        ...(q.header !== undefined ? { header: q.header as string } : {}),
+        ...(q.recommended !== undefined ? { recommended: q.recommended as number } : {}),
+      };
+    });
+    return { id: value.id, kind: "question", toolName: value.toolName, questions, createdAt: value.createdAt };
+  }
+  throw new Error("OMP input companion returned an unknown pending request kind.");
+}
+
+/**
+ * Read pending approvals/questions plus outcomes after `cursor` (null = from the start). An older companion rejects the
+ * unknown op as a bad request: "unsupported". Everything else throws.
+ */
+export async function snapshotOmpApprovals(
+  pid: number, ref: AgentSessionRef, instanceId: string, cursor: number | null, signal?: AbortSignal,
+): Promise<ApprovalSnapshot | "unsupported"> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof instanceId !== "string" || instanceId.length === 0) {
+    throw new Error("OMP approvals require a valid process instance.");
+  }
+  const nonce = randomUUID();
+  const request: Record<string, unknown> = { op: "approval.snapshot", nonce, pid, ref, instanceId };
+  if (cursor !== null) request.cursor = cursor;
+  const result = await roundTrip(pid, request, signal, MAX_CONFIG_REPLY_CHARS);
+  if (result.line === undefined) throw new Error(result.message ?? "OMP input companion did not reply.");
+  const reply = parseReply(result.line);
+  if (!replyMatches(reply, pid, ref, nonce, instanceId)) {
+    throw new Error("OMP input companion identity does not match this process and native session.");
+  }
+  if (reply.type === "rejected") {
+    if (reply.code === "bad_request") return "unsupported";
+    throw Object.assign(
+      new Error(typeof reply.message === "string" && reply.message.length > 0 ? reply.message : "OMP input companion refused the approvals read."),
+      typeof reply.code === "string" ? { code: reply.code } : {},
+    );
+  }
+  if (reply.type !== "approvals" || !Array.isArray(reply.pending) || !Array.isArray(reply.outcomes) ||
+      !Number.isSafeInteger(reply.cursor) || typeof reply.lost !== "boolean") {
+    throw new Error("OMP input companion returned an unrecognized approvals reply.");
+  }
+  return {
+    pending: reply.pending.map(parsePending),
+    outcomes: reply.outcomes.map(parseDecisionRecord),
+    cursor: reply.cursor as number,
+    lost: reply.lost,
+  };
+}
+
+/** Never retried: a refusal is definite only before the write; after it only an authenticated reply settles the question. */
+export async function resolveOmpApproval(
+  pid: number, ref: AgentSessionRef, instanceId: string, id: string, decision: Decision, signal?: AbortSignal,
+): Promise<ResolveResult> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof instanceId !== "string" || instanceId.length === 0) {
+    return { type: "rejected", code: "identity_mismatch", message: "OMP approvals require a valid process instance; reconnect before deciding." };
+  }
+  if (typeof id !== "string" || id.length === 0) return { type: "rejected", code: "bad_request", message: "Specify the request to decide." };
+  const nonce = randomUUID();
+  const result = await roundTrip(pid, { op: "approval.resolve", nonce, pid, ref, instanceId, id, decision }, signal, MAX_CONFIG_REPLY_CHARS);
+  if (result.line === undefined) {
+    const message = result.message ?? "OMP input companion did not reply.";
+    return result.wrote ? { type: "uncertain", message } : { type: "rejected", code: "unavailable", message };
+  }
+  let reply: Record<string, unknown>;
+  try { reply = parseReply(result.line); }
+  catch (error) { return { type: "uncertain", message: error instanceof Error ? error.message : String(error) }; }
+  if (!replyMatches(reply, pid, ref, nonce, instanceId)) {
+    return { type: "uncertain", message: "OMP approval reply identity changed or did not match the request; the decision is uncertain. Do not retry automatically." };
+  }
+  if (reply.type === "resolved") {
+    try { return { type: "resolved", outcome: parseDecisionRecord(reply.outcome) }; }
+    catch { return { type: "uncertain", message: "OMP approval reply was malformed; the decision may have been applied." }; }
+  }
+  if (reply.type === "rejected" && typeof reply.code === "string" && Object.hasOwn(REFUSAL_CODES, reply.code) &&
+      typeof reply.message === "string" && reply.message.length > 0) {
+    if (reply.outcome === undefined) return { type: "rejected", code: reply.code, message: reply.message };
+    try { return { type: "rejected", code: reply.code, message: reply.message, outcome: parseDecisionRecord(reply.outcome) }; }
+    catch { return { type: "uncertain", message: "OMP approval reply was malformed; the decision is uncertain." }; }
+  }
+  if (reply.type === "uncertain" && typeof reply.message === "string" && reply.message.length > 0) {
+    return { type: "uncertain", message: reply.message };
+  }
+  return { type: "uncertain", message: "OMP input companion returned an unrecognized reply; the decision is uncertain. Do not retry automatically." };
 }

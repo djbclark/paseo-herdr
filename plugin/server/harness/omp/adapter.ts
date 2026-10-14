@@ -8,7 +8,7 @@ import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import type { AgentSessionRef, PaneProcessInfo } from "../../herdr/schema.js";
 import { FileTail } from "../../file-tail.js";
 import { access } from "node:fs/promises";
-import { clearOmpRestoredPrompt, configureOmp, inspectOmpInput, ompInputSocketPath, readOmpConfig, submitOmpInput } from "./input.js";
+import { clearOmpRestoredPrompt, configureOmp, inspectOmpInput, ompInputSocketPath, readOmpConfig, resolveOmpApproval, snapshotOmpApprovals, submitOmpInput } from "./input.js";
 import { activeChain, lastTurnEndOf, lastTurnEndIdOf, modelOf, thinkingLevelOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
 import { companionInstallStatus } from "./companion-install.js";
@@ -83,6 +83,8 @@ export const ompAdapter: HarnessAdapter = {
   findForks: findOmpForks,
   readConfig: ({ pid, ref, instanceId }, signal) => readOmpConfig(pid, ref, instanceId, signal),
   configure: ({ pid, ref, instanceId }, changes, signal) => configureOmp(pid, ref, instanceId, changes, signal),
+  snapshotApprovals: ({ pid, ref, instanceId }, cursor, signal) => snapshotOmpApprovals(pid, ref, instanceId, cursor, signal),
+  resolveApproval: ({ pid, ref, instanceId }, id, decision, signal) => resolveOmpApproval(pid, ref, instanceId, id, decision, signal),
   interruptKeys: ["esc"],
   promptWhileWorking: "reject",
   launchArgs: (config: ProviderSessionConfig): string[] => {

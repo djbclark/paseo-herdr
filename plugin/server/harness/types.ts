@@ -43,6 +43,65 @@ export type ConfigureResult =
   | { type: "rejected"; code: string; message: string }
   | { type: "uncertain"; message: string };
 export interface ConfigTarget { pid: number; ref: AgentSessionRef; instanceId: string; }
+
+/** P3.6 approvals and questions (contract frozen 2026-10-14). Ids are opaque, harness-issued and never reused. */
+export interface PendingApproval {
+  id: string;
+  kind: "tool";
+  toolName: string;
+  /** The harness's own dialog title, e.g. `Allow tool: bash`. */
+  title: string;
+  reason?: string;
+  /** Tool arguments; `{ truncated: true }` when too large to ship. */
+  args?: unknown;
+  approvalMode?: string;
+  createdAt: string;
+}
+export interface PendingQuestionItem {
+  id: string;
+  question: string;
+  header?: string;
+  options: { label: string; description?: string }[];
+  multi: boolean;
+  recommended?: number;
+}
+export interface PendingQuestion {
+  id: string;
+  kind: "question";
+  toolName: string;
+  questions: PendingQuestionItem[];
+  createdAt: string;
+}
+export type PendingDecision = PendingApproval | PendingQuestion;
+export type DecisionOutcome = "approved" | "denied" | "answered" | "cancelled" | "timed_out" | "chat";
+export type DecisionSource = "paseo" | "terminal" | "system";
+export interface QuestionAnswer { id: string; selectedOptions: string[]; customInput?: string; }
+export interface DecisionRecord {
+  /** Monotonic per harness instance; snapshots return records with `seq > cursor`. */
+  seq: number;
+  id: string;
+  kind: "tool" | "question";
+  outcome: DecisionOutcome;
+  source: DecisionSource;
+  answer?: QuestionAnswer[];
+  at: string;
+}
+export interface ApprovalSnapshot {
+  pending: PendingDecision[];
+  outcomes: DecisionRecord[];
+  cursor: number;
+  /** The requested cursor predates the oldest retained outcome: some outcomes were dropped. */
+  lost: boolean;
+}
+export type Decision =
+  | { type: "allow" }
+  | { type: "deny" }
+  | { type: "answer"; answers: QuestionAnswer[] }
+  | { type: "chat" };
+export type ResolveResult =
+  | { type: "resolved"; outcome: DecisionRecord }
+  | { type: "rejected"; code: string; message: string; outcome?: DecisionRecord }
+  | { type: "uncertain"; message: string };
 /** P3.5B: a sibling native session forked off ours by another process. */
 export interface NativeFork { path: string; sessionId: string; }
 export interface TranscriptReader {
@@ -95,5 +154,12 @@ export interface HarnessAdapter {
   discardRestoredPrompt?(target: InputTarget & { instanceId: string }, text: string, signal?: AbortSignal): Promise<RestoredPromptOutcome>;
   /** P3.5B: sibling sessions whose header names `locator`'s session as their parent (excluding `locator` itself). */
   findForks?(locator: TranscriptLocator, signal?: AbortSignal): Promise<NativeFork[]>;
+  /**
+   * P3.6: pending approvals/questions plus outcomes after `cursor` (null = from the start). "unsupported" = the
+   * companion predates approvals; the session falls back to the terminal-only notice.
+   */
+  snapshotApprovals?(target: ConfigTarget, cursor: number | null, signal?: AbortSignal): Promise<ApprovalSnapshot | "unsupported">;
+  /** P3.6: decide one pending entry. Never retried: refusals are definite only before the write; after it, "uncertain". */
+  resolveApproval?(target: ConfigTarget, id: string, decision: Decision, signal?: AbortSignal): Promise<ResolveResult>;
 }
 

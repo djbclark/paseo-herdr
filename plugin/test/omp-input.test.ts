@@ -101,7 +101,7 @@ async function startCompanion() {
     sessionManager: { getSessionFile: () => state.ref, getSessionId: () => "native-id" },
     models: { list: vi.fn(() => state.list), current: vi.fn(() => state.current) },
   };
-  type Event = "session_start" | "session_switch" | "session_shutdown";
+  type Event = string;
   const handlers: Partial<Record<Event, (event: unknown, context: typeof ctx) => void>> = {};
   const sendUserMessage = vi.fn((_text: string) => {});
   const setModel = vi.fn(async (model: unknown) => { state.current = model; return true; });
