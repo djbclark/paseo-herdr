@@ -1,8 +1,29 @@
 {
   "name": "paseo-herdr",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.1",
+  "description": "Paseo plugin: chat with OMP agents running in Herdr terminal sessions",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sdananjay/paseo-herdr.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/sdananjay/paseo-herdr#readme",
+  "bugs": "https://github.com/sdananjay/paseo-herdr/issues",
   "private": true,
   "type": "module",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "index.server.ts",
+    "index.client.tsx",
+    "client/",
+    "server/",
+    "shared/",
+    "harness-extension/",
+    "scripts/",
+    "assets/"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
     "test": "vitest run",

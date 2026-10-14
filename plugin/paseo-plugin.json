@@ -1,6 +1,9 @@
 {
   "id": "herdr-harness",
+  "name": "Herdr",
+  "description": "Chat with OMP agents running in Herdr terminal sessions from Paseo",
   "requirements": {
     "paseo": ">=0.11.1"
-  }
+  },
+  "build": [["node", "scripts/install-omp-companion.mjs"]]
 }

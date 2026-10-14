@@ -95,6 +95,7 @@ describe("installer main", () => {
     await mkdir(agentDir, { recursive: true });
     const first = run([]);
     expect(first.code).toBe(0);
+    expect(first.out).toContain(`Writing the paseo-herdr OMP input companion ${COMPANION_INSTALL_NAME} to ${extDir}`);
     expect(first.out).toContain(`installed: ${target}`);
     expect(first.out).toContain("Restart running OMP agents: OMP loads extensions only at startup. Do not also pass this file with -e.");
     expect(await readFile(target, "utf8")).toBe(SOURCE);

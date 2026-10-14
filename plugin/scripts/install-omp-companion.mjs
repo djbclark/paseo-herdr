@@ -87,10 +87,12 @@ export function main(argv, env, home) {
       return 1;
     }
   }
+  console.log(`Writing the paseo-herdr OMP input companion ${COMPANION_NAME} to ${extensionDir}`);
   fs.mkdirSync(extensionDir, { recursive: true });
   writeAtomic(target, source);
   console.log(`${label}: ${target}`);
   console.log("Restart running OMP agents: OMP loads extensions only at startup. Do not also pass this file with -e.");
+  console.log("On Paseo's Herdr screen, Restart to enable input restarts an idle agent in place.");
   return 0;
 }
 
