@@ -139,3 +139,22 @@ export const herdrWorkspaceCreateRpc = defineRpc({
   }),
   output: z.object({ workspaceId: z.string(), label: z.string(), cwd: z.string() }),
 });
+
+export const folderSourceSchema = z.enum(["herdr", "paseo", "filesystem"]);
+export type FolderSource = z.infer<typeof folderSourceSchema>;
+export const folderSuggestionSchema = z.object({ path: z.string(), source: folderSourceSchema });
+export type FolderSuggestion = z.infer<typeof folderSuggestionSchema>;
+
+/**
+ * Folder autocomplete for the Herdr screen's folder fields. The daemon host owns the filesystem and the
+ * home directory, so the client asks here (it also uses `resolved` to turn `~/x` into an absolute path).
+ */
+export const herdrFoldersSuggestRpc = defineRpc({
+  name: "herdr.folders.suggest",
+  input: z.object({ query: z.string().max(4096) }),
+  output: z.object({
+    /** Absolute, normalised form of the query (`~` expanded); null when it isn't an absolute path. */
+    resolved: z.string().nullable(),
+    folders: z.array(folderSuggestionSchema),
+  }),
+});

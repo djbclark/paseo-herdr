@@ -18,6 +18,15 @@ describe("createHerdrChat", () => {
       });
     } finally { await paseo.dispose(); }
   });
+  it("resolves a ~ folder through the daemon and passes the absolute path to workspaces.open", async () => {
+    const open = vi.fn(async () => ({ agents: { create: async () => ({ id: "chat-2" }) } }));
+    const resolve = vi.fn(async () => "/home/me/proj");
+    expect(await createHerdrChat({ workspaces: { open } } as never, " ~/proj ", resolve)).toBe("chat-2");
+    expect(resolve).toHaveBeenCalledWith("~/proj");
+    expect(open).toHaveBeenCalledExactlyOnceWith("/home/me/proj");
+    await expect(createHerdrChat({ workspaces: { open } } as never, "~/x", async () => null)).rejects.toThrow("absolute");
+    expect(open).toHaveBeenCalledTimes(1);
+  });
   it("refuses an empty folder before opening a workspace and propagates a folder failure", async () => {
     const open = vi.fn(async () => { throw new Error("Folder unavailable"); });
     const paseo = { workspaces: { open } } as never;

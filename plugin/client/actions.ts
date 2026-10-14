@@ -1,15 +1,26 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { HERDR_OMP_PROVIDER, validateFolder } from "./helpers.js";
+import { HERDR_OMP_PROVIDER, needsHomeExpansion, validateFolder } from "./helpers.js";
 import { HERDR_BIND_OPTION, NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 import type { OverviewAgent } from "../shared/rpc.js";
 
 type Paseo = PluginClientContext["paseo"];
 
 /** Reuse the folder's workspace so files, git, terminals and the new chat share one root. */
-export async function createHerdrChat(paseo: Paseo, folder: string): Promise<string> {
+export async function createHerdrChat(
+  paseo: Paseo,
+  folder: string,
+  /** Asks the daemon for the absolute form of a `~` path (the client can't know the daemon's home). */
+  resolve?: (folder: string) => Promise<string | null>,
+): Promise<string> {
   const invalid = validateFolder(folder);
   if (invalid) throw new Error(invalid);
-  const workspace = await paseo.workspaces.open(folder.trim());
+  let cwd = folder.trim();
+  if (needsHomeExpansion(cwd)) {
+    const resolved = resolve ? await resolve(cwd) : null;
+    if (!resolved) throw new Error("Enter an absolute folder path");
+    cwd = resolved;
+  }
+  const workspace = await paseo.workspaces.open(cwd);
   const agent = await workspace.agents.create({ config: { provider: `${HERDR_OMP_PROVIDER}/${NATIVE_DEFAULT_MODEL}` } });
   return agent.id;
 }

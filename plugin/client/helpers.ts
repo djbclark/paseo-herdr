@@ -52,7 +52,7 @@ export function errorMessage(error: unknown): string {
   return "Something went wrong";
 }
 
-/** Returns an error for an unusable folder path, else null. The server validates authoritatively. */
+/** Returns an error for an unusable folder path, else null. The server validates authoritatively (and expands a leading `~`). */
 export function validateFolder(path: string): string | null {
   return path.trim() ? null : "Enter a folder path";
 }
@@ -67,3 +67,18 @@ export function pathTail(path: string): string {
 export function agentLabel(agent: { title: string | null; name: string | null; kind: string | null; terminalId: string }): string {
   return cleanTitle(agent.title) ?? agent.name ?? agent.kind ?? agent.terminalId;
 }
+
+/** The value a picked suggestion puts in the field: the path plus "/" so the user can keep drilling down. */
+export function folderFieldValue(path: string): string {
+  return path.endsWith("/") ? path : `${path}/`;
+}
+
+/** True when the daemon must expand the text (`~`, `~/x`) before it can be used as an absolute path. */
+export function needsHomeExpansion(folder: string): boolean {
+  const trimmed = folder.trim();
+  return trimmed === "~" || trimmed.startsWith("~/");
+}
+
+export const FOLDER_SOURCE_LABELS = { herdr: "Herdr", paseo: "Paseo", filesystem: "" } as const;
+export const FOLDER_SUGGEST_DEBOUNCE_MS = 150;
+export const folderSuggestKey = (query: string) => ["herdr", "folders", query] as const;

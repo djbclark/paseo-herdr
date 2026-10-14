@@ -1,9 +1,11 @@
 import { access, constants, stat, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
-import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
+import { expandHome, suggestFolders } from "./folders.js";
 import { restartAgent } from "./restart.js";
 import type { BoundSessions } from "./bound-sessions.js";
 import { attachArgs, attachCommand } from "./herdr-commands.js";
@@ -21,6 +23,8 @@ export interface ManagementDeps {
   harnesses: readonly HarnessAdapter[];
   /** Tests: replaces the stat/realpath check; resolves the canonical directory or throws a user-facing Error. */
   checkDirectory?(path: string): Promise<string>;
+  /** Tests: the daemon user's home directory for `~` expansion; defaults to `os.homedir()`. */
+  homedir?(): string;
   /** Absolute path of the `herdr` CLI, or null. Defaults to a PATH lookup. */
   findHerdr?(): Promise<string | null>;
   /** Tests: replaces the in-place restart. */
@@ -134,8 +138,41 @@ export async function boundAgents(paseo: PaseoApi, harnesses: readonly HarnessAd
 export function registerManagementRpcs(server: Pick<PluginServerContext, "handle">, deps: ManagementDeps): void {
   const request = deps.request ?? ((socketPath, method, params) => new HerdrClient(socketPath).request(method, params));
   const check = deps.checkDirectory ?? checkDirectory;
+  const home = () => (deps.homedir ?? homedir)();
+
+  /** Folders Herdr's workspaces and agents are in on the configured target; empty when Herdr is unavailable. */
+  const herdrFolders = async (): Promise<string[]> => {
+    try {
+      const { target } = await deps.readTarget();
+      const [agents, panes] = await Promise.all([
+        request(target.socketPath, "agent.list", {}).then((r) => AgentListResultSchema.parse(r).agents.map((a) => a.cwd ?? a.foreground_cwd)),
+        request(target.socketPath, "pane.list", {}).then((r) => PaneListResultSchema.parse(r).panes.map((p) => p.cwd ?? p.foreground_cwd)),
+      ]);
+      return [...agents, ...panes].filter((cwd): cwd is string => typeof cwd === "string" && isAbsolute(cwd));
+    } catch {
+      return [];
+    }
+  };
+  /** Directories of Paseo's own workspaces, when the handler context exposes the Paseo API. */
+  const paseoFolders = async (paseo: PaseoApi | undefined): Promise<string[]> => {
+    try {
+      const result = await paseo?.workspaces?.list({ page: { limit: 100 } });
+      return (result?.entries ?? []).map((w) => w.workspaceDirectory ?? w.projectRootPath).filter((dir): dir is string => Boolean(dir) && isAbsolute(dir));
+    } catch {
+      return [];
+    }
+  };
 
   server.handle(herdrTargetRpc, () => deps.readTarget());
+
+  server.handle(herdrFoldersSuggestRpc, async ({ query }, { paseo }) => {
+    const [fromHerdr, fromPaseo] = await Promise.all([herdrFolders(), paseoFolders(paseo)]);
+    const known: FolderSuggestion[] = [
+      ...fromHerdr.map((path) => ({ path, source: "herdr" as const })),
+      ...fromPaseo.map((path) => ({ path, source: "paseo" as const })),
+    ];
+    return suggestFolders(query, home(), known);
+  });
 
   server.handle(herdrOverviewRpc, async (_input, { paseo }) => {
     const { target, ompEnabled } = await deps.readTarget();
@@ -247,7 +284,7 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
   });
 
   server.handle(herdrWorkspaceCreateRpc, async ({ cwd, label }) => {
-    const real = await check(cwd);
+    const real = await check(expandHome(cwd.trim(), home()));
     const { target } = await deps.readTarget();
     await deps.ensureReady(target);
     const name = label || basename(real) || real;

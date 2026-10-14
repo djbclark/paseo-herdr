@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   herdrAgentRestartRpc,
   herdrChatReadyRpc,
+  herdrFoldersSuggestRpc,
   herdrOverviewRpc,
   herdrWorkspaceCreateRpc,
   type OverviewAgent,
@@ -23,6 +24,7 @@ import {
 } from "./helpers.js";
 import { agentPlace } from "../shared/labels.js";
 import { bindHerdrChat, createHerdrChat } from "./actions.js";
+import { FolderField } from "./folder-field.js";
 
 type Theme = PluginScreenProps["theme"];
 type Navigation = PluginScreenProps["navigation"];
@@ -80,6 +82,17 @@ function useStyles(theme: Theme, compact: boolean) {
         minWidth: compact ? 0 : 240,
         alignSelf: "stretch" as const,
       },
+      list: {
+        backgroundColor: c.surface1,
+        borderColor: c.border,
+        borderWidth: 1,
+        borderRadius: 6,
+        marginTop: 4,
+        maxHeight: compact ? 220 : 280,
+        overflow: "hidden" as const,
+      },
+      option: { paddingHorizontal: 10, paddingVertical: compact ? 10 : 6, borderTopColor: c.border, borderTopWidth: 1 },
+      optionLine: { flexDirection: "row" as const, alignItems: "center" as const, justifyContent: "space-between" as const, gap: 8 },
       indent: { paddingLeft: compact ? 8 : 16, gap: 6 },
       warning: { color: c.statusWarning },
       agent: { gap: 6, paddingVertical: 6, borderTopColor: c.border, borderTopWidth: 1 },
@@ -321,9 +334,10 @@ function NewAgentButton({
   onCreated(): void;
 }) {
   const paseo = usePaseo();
+  const suggest = useRpc(herdrFoldersSuggestRpc);
   const mutation = useMutation({
     mutationFn: async () => {
-      return createHerdrChat(paseo, cwd);
+      return createHerdrChat(paseo, cwd, async (folder) => (await suggest({ query: folder })).resolved);
     },
     onSuccess: (agentId) => {
       onCreated();
@@ -351,15 +365,12 @@ function NewChatForm({ styles, theme, navigation, onCreated }: { styles: Styles;
   return (
     <View style={styles.card}>
       <Text style={styles.title}>Start a chat</Text>
-      <TextInput
+      <FolderField
         accessibilityLabel="New chat folder path"
-        placeholder="Folder path"
         placeholderTextColor={theme.colors.foregroundMuted}
         value={cwd}
         onChangeText={setCwd}
-        autoCapitalize="none"
-        autoCorrect={false}
-        style={styles.input}
+        styles={styles}
       />
       <NewAgentButton cwd={cwd} styles={styles} navigation={navigation} onCreated={onCreated} />
     </View>
@@ -421,16 +432,14 @@ function NewWorkspaceForm({ styles, theme, onCreated }: { styles: Styles; theme:
   return (
     <View style={styles.card}>
       <Text style={styles.title}>New workspace</Text>
-      <TextInput
+      <FolderField
         accessibilityLabel="Folder path"
-        placeholder="Folder path"
         placeholderTextColor={theme.colors.foregroundMuted}
         value={cwd}
         onChangeText={setCwd}
-        autoCapitalize="none"
-        autoCorrect={false}
         editable={!isPending}
-        style={styles.input}
+        onSubmitEditing={submit}
+        styles={styles}
       />
       <TextInput
         accessibilityLabel="Label"
