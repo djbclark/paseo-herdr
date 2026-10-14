@@ -1,8 +1,10 @@
 import { access, constants, stat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, isAbsolute, join } from "node:path";
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
+
+// Derived from the SDK: Paseo's compiler can't resolve @getpaseo/client in an install without node_modules.
+type PaseoApi = PluginHandlerContext["paseo"];
 import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
 import { expandHome, suggestFolders } from "./folders.js";
