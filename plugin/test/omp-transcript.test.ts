@@ -183,6 +183,26 @@ describe("OMP adapter replay", () => {
     expect(snapshot.lastTurnEnd).toBe("aborted");
   });
 
+  test("a cancelled ask ends the turn as aborted, while any other tool error leaves it working", async () => {
+    // Real shape (P3.6 live run, OMP 18.4.12): ask's ToolAbortError ends the run with no closing assistant entry.
+    const toolResult = (id: string, parentId: string, toolName: string, text: string) => ({
+      type: "message", id, parentId, timestamp: "2026-10-14T07:09:57.506Z",
+      message: { role: "toolResult", toolCallId: `ollama:1:${toolName}`, toolName, details: {}, isError: true,
+        content: [{ type: "text", text }] },
+    });
+    const head = [titleRow, sessionRow, message("u1", null, "user", userText("ask me")),
+      assistantMessage("a1", "u1", [toolCall("ollama:1:ask", "ask")], "toolUse")];
+    const cancelled = await snapshotAt(await write("ask-cancelled.jsonl",
+      [...head, toolResult("r1", "a1", "ask", "Ask tool was cancelled by the user")]));
+    expect(cancelled.turnState).toBe("idle");
+    expect(cancelled.lastTurnEnd).toBe("aborted");
+    expect(cancelled.lastTurnEndId).toBe("r1");
+    const failed = await snapshotAt(await write("tool-error.jsonl",
+      [...head, toolResult("r1", "a1", "bash", "Ask tool was cancelled by the user")]));
+    expect(failed.turnState).toBe("working");
+    expect(failed.lastTurnEnd).toBeUndefined();
+  });
+
   test("torn final JSON line is tolerated", async () => {
     const base = [titleRow, sessionRow, message("e1", null, "user", userText("stable"))];
     const torn = JSON.stringify(message("e2", "e1", "assistant", userText("cut off in the middle")));

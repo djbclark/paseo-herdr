@@ -57,6 +57,18 @@ export function titleOf(entries: readonly OmpSessionEntry[]): string | undefined
   return typeof title === "string" ? title : undefined;
 }
 
+/**
+ * OMP's `ask` tool ends the whole run when its dialog is cancelled (Esc, or Stop while the question is open): it aborts
+ * and throws `ToolAbortError`, so the chain ends with this error result and no closing assistant entry (OMP 18.4.12,
+ * tools/ask.ts). Treat it as an aborted turn end, or the turn would look unfinished forever.
+ */
+const ASK_CANCELLED_TEXT = "Ask tool was cancelled by the user";
+function isCancelledAsk(message: { role?: unknown; toolName?: unknown; isError?: unknown; content?: unknown }): boolean {
+  if (message.role !== "toolResult" || message.toolName !== "ask" || message.isError !== true || !Array.isArray(message.content)) return false;
+  return message.content.some((part: unknown) => typeof part === "object" && part !== null &&
+    (part as { type?: unknown }).type === "text" && (part as { text?: unknown }).text === ASK_CANCELLED_TEXT);
+}
+
 /** Native outcome of the chain's last assistant entry (stopReason → NativeTurnEnd). */
 export function lastTurnEndOf(chain: readonly OmpSessionEntry[]): NativeTurnEnd | undefined {
   for (let index = chain.length - 1; index >= 0; index -= 1) {
@@ -64,6 +76,7 @@ export function lastTurnEndOf(chain: readonly OmpSessionEntry[]): NativeTurnEnd 
     if (entry.type !== "message") continue;
     const message = entry.message;
     if (!message || typeof message !== "object") continue;
+    if (isCancelledAsk(message)) return "aborted";
     if (message.role === "user" || message.role === "toolResult") return undefined;
     if (message.role === "assistant") return mapStopReason(message.stopReason);
   }
@@ -82,6 +95,7 @@ export function turnStateOf(chain: readonly OmpSessionEntry[]): "idle" | "workin
     const entry = chain[index];
     if (entry.type !== "message" || !entry.message) continue;
     const message = entry.message;
+    if (isCancelledAsk(message)) return "idle";
     if (message.role === "user" || message.role === "toolResult") return "working";
     if (message.role === "assistant") {
       const end = mapStopReason(message.stopReason);
@@ -95,6 +109,7 @@ export function lastTurnEndIdOf(chain: readonly OmpSessionEntry[]): string | und
   for (let index = chain.length - 1; index >= 0; index--) {
     const entry = chain[index];
     if (entry.type !== "message" || !entry.message) continue;
+    if (isCancelledAsk(entry.message)) return entry.id;
     if (entry.message.role === "user" || entry.message.role === "toolResult") return undefined;
     if (entry.message.role === "assistant") return entry.id;
   }
