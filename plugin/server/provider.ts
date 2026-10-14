@@ -15,6 +15,7 @@ import { launchAgent } from "./launch.js";
 import { HerdrHarnessSession, capabilitiesFor, pendingBinding, type SessionDeps } from "./session.js";
 import { ModelCache } from "./config.js";
 import type { BoundSessions } from "./bound-sessions.js";
+import type { PermissionResponder } from "./host.js";
 import { HERDR_BIND_OPTION, NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 
 export interface ProviderHooks {
@@ -28,6 +29,10 @@ export interface ProviderHooks {
   bindHistoryDelayMs?: number;
   /** Shared with the management RPCs so `herdr.chat.ready` can flush a bound chat's history. */
   boundSessions?: BoundSessions;
+  /** The Paseo API handle captured from a lifecycle hook (null until one has fired). */
+  getPaseo?: () => PermissionResponder | null;
+  /** Tests: replaces the real timer between approval polls. */
+  approvalSleep?: SessionDeps["approvalSleep"];
 }
 
 const BindOptionSchema = z.object({ terminalId: z.string().min(1), paneId: z.string().optional() });
@@ -85,6 +90,8 @@ export function createHerdrProvider(
           subscribe: async (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) => herdr.subscribe(subscriptions, options),
           emit,
           modelCache,
+          ...(hooks.getPaseo ? { getPaseo: hooks.getPaseo } : {}),
+          ...(hooks.approvalSleep ? { approvalSleep: hooks.approvalSleep } : {}),
           getHerdrSession: () => herdrSession,
           ...(hooks.bindHistoryDelayMs !== undefined ? { bindHistoryDelayMs: hooks.bindHistoryDelayMs } : {}),
           launch: hooks.launch ?? ((config, signal) => launchAgent({ request, herdrSession }, adapter, config, signal)),
@@ -203,6 +210,12 @@ export function createHerdrProvider(
             const session = sessions.get(input.sessionId);
             if (!session) throw new Error("Unknown session");
             await session.interrupt(input.requestId);
+            return;
+          }
+          case "session.permission": {
+            const session = sessions.get(input.sessionId);
+            if (!session) throw new Error("Unknown session");
+            await session.approvals.respond(input.permissionId, input.response);
             return;
           }
           case "session.configure": {

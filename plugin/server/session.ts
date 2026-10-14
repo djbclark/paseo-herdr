@@ -10,6 +10,8 @@ import { LiveSession } from "./live-session.js";
 import type { LaunchResult } from "./launch.js";
 import { attachCommand } from "./herdr-commands.js";
 import { ConfigController, supportsConfigure, type ModelCache } from "./config.js";
+import { ApprovalController, supportsApprovals } from "./approvals.js";
+import type { PermissionResponder } from "./host.js";
 
 export interface HerdrRequest {
   (method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown>;
@@ -27,6 +29,10 @@ export interface SessionDeps {
   modelCache?: ModelCache;
   /** Bind path: fallback wait before re-sending history if the client never calls `flushHistory` (default {@link BIND_HISTORY_FALLBACK_MS}). */
   bindHistoryDelayMs?: number;
+  /** P3.6: the Paseo API handle captured from a lifecycle hook, once one has fired. */
+  getPaseo?: () => PermissionResponder | null;
+  /** Tests: replaces the real timer between approval polls. Must resolve on abort. */
+  approvalSleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 /**
  * Paseo subscribes to a created session only after registering it, and drops rows emitted before that
@@ -68,7 +74,11 @@ export interface SessionState {
 const CAPABILITIES = ["prompt.message", "session.list", "session.persistence"] as const;
 /** Capabilities a session of this adapter supports; provider-level negotiation uses the same list. */
 export function capabilitiesFor(adapter: HarnessAdapter): readonly string[] {
-  return supportsConfigure(adapter) ? [...CAPABILITIES, "session.configure"] : CAPABILITIES;
+  return [
+    ...CAPABILITIES,
+    ...(supportsConfigure(adapter) ? ["session.configure"] : []),
+    ...(supportsApprovals(adapter) ? ["permission", "timeline.plugin"] : []),
+  ];
 }
 
 export class HerdrHarnessSession {
@@ -77,6 +87,7 @@ export class HerdrHarnessSession {
   private readonly prompts: PromptController;
   readonly live: LiveSession;
   readonly config: ConfigController;
+  readonly approvals: ApprovalController;
   /** Bind path: live timeline rows held back until the replayed history has been sent. */
   private heldRows: Array<Extract<ProviderEvent, { type: "timeline.item" }>> | null = null;
   private historyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -92,6 +103,7 @@ export class HerdrHarnessSession {
     this.prompts = new PromptController(this);
     this.live = new LiveSession(this);
     this.config = new ConfigController(this);
+    this.approvals = new ApprovalController(this);
   }
   get adapter(): HarnessAdapter { return this.deps.adapter; }
   get signal(): AbortSignal { return this.controller.signal; }
@@ -162,6 +174,7 @@ export class HerdrHarnessSession {
 
   async open(config: ProviderSessionConfig, history: "replay" | "skip" | "replay-live", requestId?: string): Promise<void> {
     let live: TimelineRow[] = [];
+    this.approvals.begin(config);
     const generation = this.state.generation;
     const locator = await this.adapter.resolveTranscript(this.state.binding.sessionRef, { cwd: this.state.binding.cwd });
     if (!this.current(generation)) return;
@@ -186,6 +199,7 @@ export class HerdrHarnessSession {
         cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
       this.freeze("History unavailable", "This agent has no readable native history; the conversation is read-only.");
     }
+    if (history === "replay") this.approvals.replay();
     if (this.state.outcome === "active") {
       try { await this.validateAgent(); }
       catch (error) {
@@ -201,6 +215,9 @@ export class HerdrHarnessSession {
     this.emit({ type: "session.ready", requestId, sessionId: this.sessionId });
     if (this.state.outcome === "active") {
       this.state.connected = true;
+      // Before the live loop: it must know whether approvals are on when it first sees a blocked agent.
+      await this.approvals.initialPoll();
+      if (this.isAborted) return;
       this.live.start();
     }
     if (live.length) this.replayLive(live);
@@ -257,6 +274,7 @@ export class HerdrHarnessSession {
     this.heldRows = null;
     this.pendingHistory = null;
     this.config.close();
+    this.approvals.close();
     this.state.generation++;
     this.live.stop();
     this.state.reader?.close();
@@ -339,6 +357,7 @@ export class HerdrHarnessSession {
     this.live.stop();
     this.state.reader?.close();
     this.state.reader = null;
+    this.approvals.withdrawAll(title);
     this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
       id: "history-or-agent-unavailable", severity: "warning", title, description,
     } });
@@ -358,6 +377,8 @@ export class HerdrHarnessSession {
         notice: { id: "prompt-uncertain", severity: "warning", title: "Prompt delivery is uncertain",
           description: "The prompt may still reach the agent; it was not resubmitted. Check the attached terminal." } });
     } else if (effect.type === "notice") {
+      // With approvals on, the cards replace the "needs approval in the terminal" notice; dismissals always pass.
+      if (effect.id === "blocked" && !effect.dismissed && this.approvals.enabled === "on") return;
       this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
         ...effect, ...(effect.id === "blocked" ? { description: this.adapter.blockedHint } : {}),
       } });

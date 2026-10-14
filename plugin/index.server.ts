@@ -4,6 +4,7 @@ import { createHerdrProvider } from "./server/provider.js";
 import { registerManagementRpcs } from "./server/rpc.js";
 import { BoundSessions } from "./server/bound-sessions.js";
 import { TargetReadiness, defaultTargetReadinessDeps, resolveTarget } from "./server/herdr/target.js";
+import { PaseoHost } from "./server/host.js";
 import { herdrSettings } from "./shared/settings.js";
 
 export default function contribute(server: PluginServerContext) {
@@ -29,8 +30,14 @@ export default function contribute(server: PluginServerContext) {
   };
   const isEnabled = async () => (await readSettings()).enableOmp;
   const boundSessions = new BoundSessions();
+  // Paseo gives every hook the plugin's one PaseoApi, which stays valid until the plugin stops. Provider code has no
+  // other way to reach it, so capture it from the first hook that fires. Our own cards fire permission_requested.
+  const host = new PaseoHost();
+  for (const name of ["agent.permission_requested", "agent.turn_started", "agent.created"] as const) {
+    server.on(name, (_event, context) => { host.capture(context.paseo); });
+  }
   for (const adapter of harnesses) {
-    server.registerProvider(createHerdrProvider(adapter, socketPath, { getHerdrSession: () => herdrSession, isEnabled, boundSessions }));
+    server.registerProvider(createHerdrProvider(adapter, socketPath, { getHerdrSession: () => herdrSession, isEnabled, boundSessions, getPaseo: () => host.get() }));
   }
   registerManagementRpcs(server, { readTarget, ensureReady: (target) => readiness.ensureReady(target), harnesses, boundSessions });
   return () => {};

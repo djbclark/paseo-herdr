@@ -2,9 +2,14 @@ import { z } from "zod";
 import type { ProviderPersistence, ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 import type { HarnessAdapter } from "./harness/types.js";
 import type { AgentInfo, AgentSessionRef } from "./herdr/schema.js";
+import { DecisionRowSchema, type DecisionRowData } from "../shared/decision.js";
 
 export const PERSISTENCE_VERSION = 1;
 export const MAX_SUBMITTED_MESSAGES = 256;
+export const MAX_DECISIONS = 64;
+
+/** A decided approval or question, kept so its timeline row survives a plugin reload (P3.6). */
+export interface StoredDecision { id: string; data: DecisionRowData; }
 
 /**
  * Native session binding captured at open and carried in persistence. The
@@ -21,6 +26,8 @@ export interface Binding {
   cwd: string;
   submittedMessages: Record<string, string>;
   occupant?: { pid: number; tty: string | null; instanceId: string };
+  /** Optional, newest last, at most {@link MAX_DECISIONS}. */
+  decisions?: StoredDecision[];
 }
 
 /** The `{kind, value}` session identity from a wire agent (strips `source`/`agent`). */
@@ -61,6 +68,7 @@ export function persistenceOf(binding: Binding): ProviderPersistence {
       cwd: binding.cwd,
       submittedMessages: capSubmittedMessages(binding.submittedMessages),
       ...(binding.occupant ? { occupant: binding.occupant } : {}),
+      ...(binding.decisions?.length ? { decisions: binding.decisions.slice(-MAX_DECISIONS) as unknown as ProviderPersistence["data"] } : {}),
     },
   };
 }
@@ -76,6 +84,8 @@ export function parseBinding(persistence: ProviderPersistence, adapter: HarnessA
     sessionRef: z.object({ kind: z.enum(["path", "id"]), value: z.string().min(1) }).nullable(),
     submittedMessages: z.record(z.string(), z.string()).default({}),
     occupant: z.object({ pid: z.number().int().positive(), tty: z.string().nullable(), instanceId: z.string().min(1) }).optional(),
+    // Rows are cosmetic: a malformed entry is dropped rather than failing the whole binding.
+    decisions: z.array(z.unknown()).optional(),
   }).parse(persistence.data);
   if (parsed.harness !== adapter.id) throw new Error("Herdr session belongs to another harness");
   return {
@@ -87,7 +97,18 @@ export function parseBinding(persistence: ProviderPersistence, adapter: HarnessA
     cwd: parsed.cwd,
     submittedMessages: capSubmittedMessages(parsed.submittedMessages),
     ...(parsed.occupant ? { occupant: parsed.occupant } : {}),
+    ...(parsed.decisions ? { decisions: storedDecisionsOf(parsed.decisions) } : {}),
   };
+}
+
+const StoredDecisionSchema = z.object({ id: z.string().min(1), data: DecisionRowSchema });
+function storedDecisionsOf(raw: unknown[]): StoredDecision[] {
+  const out: StoredDecision[] = [];
+  for (const entry of raw) {
+    const parsed = StoredDecisionSchema.safeParse(entry);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out.slice(-MAX_DECISIONS);
 }
 
 export function sameRef(a: { kind: string; value: string } | null, b: { kind: string; value: string } | null): boolean {

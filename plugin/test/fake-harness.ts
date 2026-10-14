@@ -1,5 +1,13 @@
 import type {
+  ApprovalSnapshot,
   ConfigureResult,
+  Decision,
+  DecisionOutcome,
+  DecisionRecord,
+  DecisionSource,
+  PendingDecision,
+  QuestionAnswer,
+  ResolveResult,
   HarnessAdapter,
   HarnessConfig,
   HarnessModel,
@@ -80,8 +88,42 @@ export class FakeConfig {
   snapshot(): HarnessConfig { return { model: this.model, thinkingLevel: this.thinkingLevel, models: this.models }; }
 }
 
+/** Mutable approval state of the fake agent; tests add pending entries, decide them "in the terminal" and read the call logs. */
+export class FakeApprovals {
+  pending: PendingDecision[] = [];
+  outcomes: DecisionRecord[] = [];
+  seq = 0;
+  /** Report the next snapshot as having dropped outcomes. */
+  lost = false;
+  /** Answer snapshots with "unsupported" (an older companion). */
+  unsupported = false;
+  snapshotError: Error | null = null;
+  /** When set, `resolveApproval` returns this instead of applying the decision. */
+  resolveOverride: ResolveResult | null = null;
+  /** When set, `resolveApproval` waits for it first. */
+  resolveGate: Promise<void> | null = null;
+  readonly snapshotCalls: Array<number | null> = [];
+  readonly resolveCalls: Array<{ id: string; decision: Decision }> = [];
+
+  add(entry: PendingDecision): void { this.pending.push(entry); }
+  /** A decision made outside Paseo (or by the harness itself). */
+  decide(id: string, outcome: DecisionOutcome, source: DecisionSource = "terminal", answer?: QuestionAnswer[]): DecisionRecord {
+    const entry = this.pending.find((candidate) => candidate.id === id);
+    if (!entry) throw new Error(`no pending ${id}`);
+    this.pending = this.pending.filter((candidate) => candidate.id !== id);
+    const record: DecisionRecord = { seq: ++this.seq, id, kind: entry.kind, outcome, source, ...(answer ? { answer } : {}), at: "2026-10-14T00:00:00.000Z" };
+    this.outcomes.push(record);
+    return record;
+  }
+  snapshot(cursor: number | null): ApprovalSnapshot {
+    const lost = this.lost;
+    this.lost = false;
+    return { pending: structuredClone(this.pending), outcomes: this.outcomes.filter((record) => record.seq > (cursor ?? 0)), cursor: this.seq, lost };
+  }
+}
+
 /** `config` makes the adapter implement the optional P3.5A readConfig/configure pair. */
-export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?: FakeConfig } = {}): HarnessAdapter {
+export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?: FakeConfig; approvals?: FakeApprovals } = {}): HarnessAdapter {
   const store = transcript ?? new FakeTranscript();
   const live = options.config;
   const configSupport: Pick<HarnessAdapter, "readConfig" | "configure"> = live ? {
@@ -109,8 +151,27 @@ export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?:
       return { type: "configured", config: live.snapshot() };
     },
   } : {};
+  const approvals = options.approvals;
+  const approvalSupport: Pick<HarnessAdapter, "snapshotApprovals" | "resolveApproval"> = approvals ? {
+    snapshotApprovals: async (_target, cursor) => {
+      approvals.snapshotCalls.push(cursor);
+      if (approvals.snapshotError) throw approvals.snapshotError;
+      return approvals.unsupported ? "unsupported" : approvals.snapshot(cursor);
+    },
+    resolveApproval: async (_target, id, decision) => {
+      approvals.resolveCalls.push({ id, decision });
+      await approvals.resolveGate;
+      if (approvals.resolveOverride) return approvals.resolveOverride;
+      const known = approvals.outcomes.find((record) => record.id === id);
+      if (known) return { type: "rejected", code: "already_resolved", message: "Already decided", outcome: known };
+      if (!approvals.pending.some((entry) => entry.id === id)) return { type: "rejected", code: "unknown_request", message: "Unknown request" };
+      const outcome: DecisionOutcome = decision.type === "allow" ? "approved" : decision.type === "deny" ? "denied" : decision.type === "chat" ? "chat" : "answered";
+      return { type: "resolved", outcome: approvals.decide(id, outcome, "paseo", decision.type === "answer" ? decision.answers : undefined) };
+    },
+  } : {};
   return {
     ...configSupport,
+    ...approvalSupport,
     id: FAKE_HARNESS_ID,
     label: "Fake",
     herdrIntegration: "fake",

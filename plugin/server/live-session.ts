@@ -102,6 +102,7 @@ export class LiveSession {
       const session = this.session;
       if (session.isAborted || session.state.outcome !== "active") return;
       const generation = session.state.generation;
+      const wasConnected = session.state.connected;
       try {
         const agent = await session.validateAgent();
         if (!agent || !session.current(generation)) return;
@@ -120,10 +121,12 @@ export class LiveSession {
           state.tracker.observeStatus(agent.agent_status);
           if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
         }
+        session.approvals.observeStatus(agent.agent_status);
         await this.doReadTranscript();
         if (!session.current(generation) || state.outcome !== "active") return;
         state.connected = true;
         state.tracker.observeConnectivityRestored();
+        if (!wasConnected) session.approvals.connectivityRestored();
         this.checkEarlyAbort(generation);
       } catch {
         if (session.current(generation)) this.disconnected();

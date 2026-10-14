@@ -4,6 +4,8 @@ import { HerdrSettings } from "./client/settings";
 import { HerdrSidebarItem } from "./client/sidebar";
 import { OVERVIEW_SCREEN_ID } from "./client/helpers";
 import { registerHerdrHome } from "./client/home";
+import { DecisionRow } from "./client/decision-row";
+import { DECISION_ROW_KIND, DECISION_ROW_VERSION, DecisionRowSchema } from "./shared/decision";
 
 export default function contribute(client: PluginClientContext) {
   const cleanups = [
@@ -24,6 +26,7 @@ export default function contribute(client: PluginClientContext) {
       onSelect: ({ openScreen }) => openScreen({ screenId: OVERVIEW_SCREEN_ID }),
     }),
     registerHerdrHome(client),
+    client.addTimelineRenderer({ kind: DECISION_ROW_KIND, version: DECISION_ROW_VERSION, schema: DecisionRowSchema, Component: DecisionRow }),
     client.addCommandCenterItem({
       id: "herdr-settings",
       title: "Herdr settings",
