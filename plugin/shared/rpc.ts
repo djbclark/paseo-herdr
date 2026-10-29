@@ -58,6 +58,11 @@ export const overviewAgentSchema = z.object({
   cwd: z.string().nullable(),
   /** The Paseo agent already bound to this terminal on this target, if any. */
   paseoAgentId: z.string().nullable(),
+  /**
+   * Other live chats bound to the same terminal (F4): the newest chat owns the row, and the
+   * client may archive these duplicates. The server never archives from a read RPC.
+   */
+  duplicateChatIds: z.array(z.string()),
   attachCommand: z.string(),
   /**
    * Runs the attach without a shell (absolute `herdr` path + args), for a Paseo terminal. Null when the

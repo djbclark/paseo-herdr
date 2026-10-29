@@ -2,9 +2,11 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { boundAgents, decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
+import { decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
 import { persistenceOf } from "../server/binding.js";
+import { createResolver } from "../server/harness/resolve.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
+import { makeFakeAdapter } from "./fake-harness.js";
 import { herdrAgentRestartRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HerdrClient } from "../server/herdr/client.js";
@@ -93,13 +95,13 @@ it("overview reports unavailable instead of throwing", async () => {
   expect(fake.requests).toHaveLength(0);
 });
 
-it("boundAgents skips archived, foreign providers, bad persistence; follows pages; reads sessionId fallback", async () => {
+it("herdrChats skips archived, foreign providers, bad persistence; follows pages; reads sessionId fallback", async () => {
   const p = persistenceOf({ harness: "omp", herdrSession: null, terminalId: "tx", agentName: null, sessionRef: null, cwd: "", submittedMessages: {} });
-  const result = await boundAgents(list([], [
+  const chats = await herdrChats(list([], [
     [paseoAgent("a", "herdr-omp", "t1", "work", { archivedAt: "2026-01-01" }), paseoAgent("b", "claude", "t2", "work"), { id: "c", provider: "herdr-omp", persistence: { provider: "herdr-omp", sessionId: "junk" } }],
     [{ id: "d", provider: "herdr-omp", archivedAt: null, persistence: { provider: "herdr-omp", sessionId: `plugin:${JSON.stringify(p)}` } }],
   ]) as never, [ompAdapter]);
-  expect([...result]).toEqual([["\0tx", "d"]]);
+  expect(chats.map((chat) => [chat.agentId, chat.terminalId, chat.harnessId])).toEqual([["d", "tx", "omp"]]);
 });
 
 it("decodePluginPersistence handles metadata, sessionId and garbage", () => {
@@ -210,4 +212,54 @@ it("restarts through the injected routine and refuses an agent that is gone", as
   const { call } = setup({ restart: async (_deps, adapter) => { expect(adapter.id).toBe("omp"); return { pid: 99 }; } });
   expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).toEqual({ pid: 99 });
   await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" })).rejects.toThrow(/no longer running/);
+});
+
+// --- F3 routing + F4 duplicates -----------------------------------------------------------------------------
+const chatWith = (id: string, harnessId: string, terminalId: string, extra: object = {}) => ({
+  id, provider: `herdr-${harnessId}`, archivedAt: null,
+  title: id, cwd: "/a", status: "idle", updatedAt: "2026-10-13T10:00:00Z", lastUserMessageAt: null,
+  persistence: { provider: `herdr-${harnessId}`, sessionId: "x", metadata: { pluginProviderPersistence: persistenceOf({ harness: harnessId, herdrSession: "work", terminalId, agentName: null, sessionRef: null, cwd: "/a", submittedMessages: {} }) } },
+  ...extra,
+});
+
+it("two live chats on one terminal keep the newest as paseoAgentId and report the older as duplicate", async () => {
+  seed();
+  const { call } = setup();
+  const result = await call(herdrOverviewRpc, {}, list([
+    chatWith("older", "omp", "t-p1", { updatedAt: "2026-10-13T09:00:00Z" }),
+    chatWith("newer", "omp", "t-p1", { updatedAt: "2026-10-13T10:00:00Z" }),
+  ]));
+  const [row] = result.workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("newer");
+  expect(row.duplicateChatIds).toEqual(["older"]);
+  expect(herdrOverviewRpc.output.safeParse(result).success).toBe(true);
+});
+
+it("a saved fallback chat keeps its provider after the pane is detected as a specific kind", async () => {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [agent("p1", "tab1", "fake", null)] });
+  const generic = makeFakeAdapter(undefined, { id: "generic", nativeKinds: "any" });
+  const specific = makeFakeAdapter(undefined, { id: "fake", nativeKinds: ["fake"] });
+  const { call } = setup({ harnesses: [generic, specific], resolver: createResolver([generic, specific]) });
+  const [row] = (await call(herdrOverviewRpc, {}, list([chatWith("saved", "generic", "t-p1")]))).workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("saved");
+  expect(row.provider).toBe("herdr-generic");
+});
+
+it("a pane-mode chat with a null session ref still counts as live", async () => {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [{ ...agent("p1", "tab1", "panefake", null), agent_session: { source: "herdr:panefake", agent: "panefake", kind: "id", value: "s-1" } }] });
+  const paneAdapter = makeFakeAdapter(undefined, { id: "panefake", nativeKinds: ["panefake"], binding: "pane" });
+  const { call } = setup({ harnesses: [paneAdapter], resolver: createResolver([paneAdapter]) });
+  const [row] = (await call(herdrOverviewRpc, {}, list([chatWith("pane-chat", "panefake", "t-p1")]))).workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("pane-chat");
+});
+
+it("the restart RPC refuses an adapter that cannot launch, before touching the pane", async () => {
+  seed();
+  const generic = makeFakeAdapter(undefined, { id: "generic", nativeKinds: "any", launch: null });
+  const { call } = setup({ harnesses: [generic], resolver: createResolver([generic]) });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).rejects.toThrow(/can't be restarted from Paseo/);
+  expect(fake.requestsFor("agent.start")).toHaveLength(0);
+  expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
 });

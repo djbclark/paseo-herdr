@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentInfo } from "../server/herdr/schema.js";
+import { createResolver } from "../server/harness/resolve.js";
 import { bindingOf, parseBinding, persistenceOf, capSubmittedMessages } from "../server/binding.js";
 import { diffTimeline, seedTimeline, emptyTimelineState } from "../server/timeline.js";
 import { discoverSessions } from "../server/discovery.js";
@@ -113,7 +114,7 @@ describe("neutral core", () => {
   it("discovers path-less fake sessions without a readable transcript", async () => {
     const adapter = makeFakeAdapter();
     const agent = fakeAgent({ agent_session: null });
-    const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list", cwd: "/work" });
+    const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list", cwd: "/work" }, { resolver: createResolver([adapter]) });
     expect(summaries).toHaveLength(1);
     expect(summaries[0].description).toBe("Fake in Herdr · pane pane-1 · idle · history unavailable");
   });
@@ -126,7 +127,7 @@ describe("neutral core", () => {
     ]);
     const adapter = makeFakeAdapter(store);
     const agent = fakeAgent();
-    const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list" });
+    const summaries = await discoverSessions(adapter, [agent], { type: "sessions", requestId: "list" }, { resolver: createResolver([adapter]) });
     expect(summaries).toHaveLength(1);
     // Harness and pane identify the agent; the last prompt helps tell conversations apart.
     expect(summaries[0].description).toBe("Fake in Herdr · pane pane-1 · idle — “hello”");

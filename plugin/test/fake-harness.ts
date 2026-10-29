@@ -237,7 +237,7 @@ export function makeFakeAdapter(transcript?: FakeTranscript, options: FakeAdapte
     id,
     label: "Fake",
     nativeKinds: options.nativeKinds ?? [id],
-    herdrIntegration: options.herdrIntegration ?? "fake",
+    herdrIntegration: options.herdrIntegration === undefined ? "fake" : options.herdrIntegration,
     binding: options.binding ?? "native-ref",
     turnEvidence: options.turnEvidence ?? "transcript",
     ...(launch ? { launch } : {}),

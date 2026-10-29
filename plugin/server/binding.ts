@@ -121,16 +121,3 @@ export function correlateItem(item: ProviderTimelineItem, submittedMessages: Rec
   const clientMessageId = submittedMessages[item.id];
   return clientMessageId ? { ...item, clientMessageId } : item;
 }
-
-/**
- * Locate the currently-live occupant for a binding. `terminal_id` anchors the
- * pane; the harness and native session identity must both still match the
- * binding captured at open (path fallback is handled by the caller, never here
- * — a first-of-several path match would be an unsafe guess).
- */
-export function findBound(agents: readonly AgentInfo[], binding: Binding, adapter: HarnessAdapter): AgentInfo | null {
-  const agent = agents.find((candidate) => candidate.terminal_id === binding.terminalId);
-  if (!agent || agent.agent !== adapter.id) return null;
-  if (!sameRef(binding.sessionRef, sessionRefOf(agent))) return null;
-  return agent;
-}

@@ -6,9 +6,11 @@ import {
   type ProviderInput,
   type ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
-import type { HarnessAdapter } from "./harness/types.js";
+import type { HarnessAdapter, PaneObservation } from "./harness/types.js";
+import { createResolver, type AdapterResolver } from "./harness/resolve.js";
 import { HerdrClient, checkHerdrStatus, type SubscriptionDescriptor } from "./herdr/client.js";
-import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
+import { listPaneTargets } from "./herdr/targets.js";
+import type { AgentInfo } from "./herdr/schema.js";
 import { bindingOf, parseBinding, type Binding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
 import { launchAgent } from "./launch.js";
@@ -22,6 +24,11 @@ import { HERDR_BIND_OPTION, NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 export interface ProviderHooks {
   /** Optional hook to stamp the resolved Herdr session name into persistence. */
   getHerdrSession?: () => string | null;
+  /**
+   * Adapter routing for new work (discovery, herdrBind): a specific kind match in the shared
+   * resolver wins over this provider's adapter. Defaults to a resolver over this one adapter.
+   */
+  resolver?: AdapterResolver;
   /** Override the agent launcher (tests); defaults to `launchAgent` over the Herdr socket. */
   launch?: SessionDeps["launch"];
   /** Plugin `enable<Harness>` toggle: false means no new discovery or launch; already-open sessions keep working. */
@@ -44,6 +51,7 @@ export function createHerdrProvider(
   hooks: ProviderHooks = {},
 ): ProviderRegistration {
   const client = async () => new HerdrClient(await getSocketPath());
+  const resolver = hooks.resolver ?? createResolver([adapter]);
   // The model list is install-wide, so it outlives connections.
   const modelCache = new ModelCache();
   return {
@@ -76,10 +84,6 @@ export function createHerdrProvider(
       const controller = new AbortController();
       let closed = false;
       const emit = (event: ProviderEvent) => { if (!closed) for (const listener of listeners) listener(event); };
-      const list = async (signal?: AbortSignal): Promise<AgentInfo[]> => {
-        const result = await (await client()).request("agent.list", {}, { signal });
-        return AgentListResultSchema.parse(result).agents;
-      };
       // Each session pins the socket and Herdr session it opened on: a settings change applies to new
       // operations only and never moves an open chat to another Herdr daemon (P3.7A).
       const sessionDeps = async (): Promise<SessionDeps & { socketPath: string }> => {
@@ -90,7 +94,7 @@ export function createHerdrProvider(
         return {
           socketPath,
           adapter,
-          listAgents: async (signal?: AbortSignal) => AgentListResultSchema.parse(await herdr.request("agent.list", {}, { signal })).agents,
+          listAgents: async (signal?: AbortSignal) => listPaneTargets(request, { signal }),
           request,
           subscribe: async (subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }) => herdr.subscribe(subscriptions, options),
           emit,
@@ -99,7 +103,10 @@ export function createHerdrProvider(
           ...(hooks.approvalSleep ? { approvalSleep: hooks.approvalSleep } : {}),
           getHerdrSession: () => herdrSession,
           ...(hooks.bindHistoryDelayMs !== undefined ? { bindHistoryDelayMs: hooks.bindHistoryDelayMs } : {}),
-          launch: hooks.launch ?? ((config, signal) => launchAgent({ request, herdrSession }, adapter, config, signal)),
+          // An adapter without a launch spec is import/bind only; `session.open` refuses to create.
+          ...(adapter.launch
+            ? { launch: hooks.launch ?? ((config, signal) => launchAgent({ request, herdrSession }, adapter, config, signal)) }
+            : {}),
         };
       };
 
@@ -152,8 +159,28 @@ export function createHerdrProvider(
               emit({ type: "sessions", requestId: input.requestId, sessions: [] });
               return;
             }
-            const agents = await list();
-            const summaries = await discoverSessions(adapter, agents, input, hooks);
+            const herdr = await client();
+            const agents = await listPaneTargets(
+              (method, params = {}, options) => herdr.request(method, params, options),
+              { signal: controller.signal },
+            );
+            if (closed) return;
+            const summaries = await discoverSessions(adapter, agents, input, {
+              getHerdrSession: hooks.getHerdrSession,
+              resolver,
+              // A pane-mode adapter reads panes through a discovery-scoped observation on this connection.
+              ...(adapter.binding === "pane"
+                ? {
+                    observe: (agent: AgentInfo, signal: AbortSignal): PaneObservation => ({
+                      terminalId: agent.terminal_id,
+                      herdrSession: hooks.getHerdrSession?.() ?? null,
+                      paneId: () => agent.pane_id,
+                      request: (method, params = {}, options) => herdr.request(method, params, { ...options, signal: options?.signal ?? signal }),
+                      signal,
+                    }),
+                  }
+                : {}),
+            });
             emit({ type: "sessions", requestId: input.requestId, sessions: summaries });
             return;
           }
@@ -174,7 +201,8 @@ export function createHerdrProvider(
                 const agent = (await deps.listAgents(controller.signal)).find((candidate) => candidate.terminal_id === parsed.data.terminalId);
                 if (closed) return;
                 if (!agent) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is no longer running`);
-                if (agent.agent !== adapter.id) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is not a ${adapter.label} agent`);
+                // New binding: route by kind, so a specific adapter wins over this one even if it is the fallback.
+                if (resolver.select(agent.agent) !== adapter) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is not a ${adapter.label} agent`);
                 const binding = bindingOf(agent, adapter, deps.getHerdrSession?.() ?? null);
                 if (sessions.has(input.sessionId)) throw new Error("Session already open");
                 const session = register(input.sessionId, binding, deps);
@@ -192,6 +220,11 @@ export function createHerdrProvider(
                   if (!closedMeanwhile) throw error;
                 }
                 return;
+              }
+              // An adapter without a launch spec is import/bind only; refuse before the companion
+              // check or any Herdr I/O, so nothing is started on its behalf.
+              if (!adapter.launch) {
+                throw new Error(`${adapter.label} agents can't be started from Paseo; start one in a Herdr terminal and import it instead.`);
               }
               // A created agent without the input companion would be read-only at once; refuse before launching.
               let companion: { ok: boolean; diagnostic?: string } | undefined;

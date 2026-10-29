@@ -280,7 +280,7 @@ it("shares claims between connections of one provider and between different harn
   await first.ready("first");
   await world.open(second.connection, "second");
   expect(await second.failure("second")).toMatchObject({ error: { message: "This Fake agent is already open in another conversation" } });
-  const other = await world.connect(world.provider({ adapter: { ...world.adapter, id: "other", label: "Other" } }));
+  const other = await world.connect(world.provider({ adapter: { ...world.adapter, id: "other", label: "Other", nativeKinds: ["other"] } }));
   world.fake.reply("agent.list", { type: "agent_list", agents: [{ ...world.agent, agent: "other" }] });
   await other.connection.send({ type: "session.open", requestId: "other", sessionId: "other", history: "skip",
     config: { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: "term-live" } } } });
