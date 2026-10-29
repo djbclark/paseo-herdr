@@ -289,7 +289,7 @@ describe("no-transcript abort (Stop before the harness recorded the prompt)", ()
     expect(discards).toEqual(["hello"]);
     const notices = events.flatMap((e) => e.type === "session.notice" && e.notice.id === "restored-prompt" ? [e.notice] : []);
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.description).toMatch(/not sent.*clear the input box.*Open in terminal/);
+    expect(notices[0]!.description).toMatch(/clear the input box.*Open in terminal/);
     expect(turnStates(events)).toEqual(["started", "canceled"]);
   });
 

@@ -3,7 +3,7 @@ import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/prov
 import { HerdrHarnessSession, type SessionDeps } from "../server/session.js";
 import { bindingOf, persistenceOf } from "../server/binding.js";
 import { HerdrError, type SubscriptionEventEnvelope } from "../server/herdr/client.js";
-import { classifyHerdrPrompt } from "../server/prompt.js";
+import { classifyHerdrPrompt, type PromptExpectation } from "../server/prompt.js";
 import type { AgentInfo } from "../server/herdr/schema.js";
 import { FakeTranscript, makeFakeAdapter } from "./fake-harness.js";
 
@@ -260,9 +260,17 @@ it("settles an uncertain prompt on a foreign terminal entry and starts an autono
 });
 
 it("classifies definite Herdr rejection separately from potentially delivered errors and mismatched replies", () => {
-  const binding = bindingOf(makeAgent(), makeFakeAdapter(), null);
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_blocked", "blocked"), binding)).toEqual({ type: "rejected", message: "blocked" });
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_stalled", "stall"), binding)).toEqual({ type: "uncertain", message: "stall" });
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_failed", "write may be partial"), binding)).toEqual({ type: "uncertain", message: "write may be partial" });
-  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), terminal_id: "other" } }, undefined, binding).type).toBe("uncertain");
+  const expectation: PromptExpectation = { terminalId: "terminal", sessionRef: { kind: "id", value: "fake-session-1" }, accepts: (kind) => kind === "fake" };
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_blocked", "blocked"), expectation)).toEqual({ type: "rejected", message: "blocked" });
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_stalled", "stall"), expectation)).toEqual({ type: "uncertain", message: "stall" });
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_failed", "write may be partial"), expectation)).toEqual({ type: "uncertain", message: "write may be partial" });
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), terminal_id: "other" } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: makeAgent() }, undefined, expectation)).toEqual({ type: "accepted" });
+  // The adapter decides which Herdr kinds are its own; a reply naming another kind is not confirmation.
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent: "other" } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent: null } }, undefined, { ...expectation, accepts: () => true })).toEqual({ type: "accepted" });
+  // A native-ref binding requires the same ref; a pane binding (null ref) takes whatever ref the agent reports.
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent_session: null } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: makeAgent() }, undefined, { ...expectation, sessionRef: null })).toEqual({ type: "accepted" });
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent_session: null } }, undefined, { ...expectation, sessionRef: null })).toEqual({ type: "accepted" });
 });

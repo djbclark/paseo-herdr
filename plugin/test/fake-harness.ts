@@ -284,8 +284,9 @@ export function makeFakeAdapter(transcript?: FakeTranscript, options: FakeAdapte
     },
     inspectInput: async ({ pid }) => ({ pid, instanceId: "fake-instance" }),
     submitPrompt: async (target, text, ctx) => {
-      const binding = { harness: id, terminalId: target.terminalId, sessionRef: target.ref,
-        herdrSession: null, agentName: null, cwd: "/work", submittedMessages: {} };
+      const kinds = options.nativeKinds ?? [id];
+      const binding = { terminalId: target.terminalId, sessionRef: target.ref,
+        accepts: (kind: string | null | undefined) => kinds === "any" || (kind != null && kinds.includes(kind)) };
       try {
         const result = await ctx.request("agent.prompt", { target: target.paneId, text }, { signal: ctx.signal });
         return classifyHerdrPrompt(result, undefined, binding);

@@ -192,6 +192,29 @@ describe("rejection racing a status observation", () => {
     expect(results(events)).toEqual(["p1:turn"]);
     expect(turns(events).map((t) => t.state)).toEqual(["started"]);
   });
+
+  it("a working echo right after a rejected send starts no terminal turn (F2)", async () => {
+    const { session, agent, events, hold } = await setup();
+    // The previous Paseo turn was stopped fast: its native end is consumed, so Herdr's late `working` is an echo.
+    session.state.staleWorking = { endId: "old-end", echoed: false };
+    const release = hold("Agent is busy");
+    const pending = session.prompt(prompt("p1"));
+    await tick();
+    agent.agent_status = "working";
+    await session.live.reconcile();
+    release();
+    await pending;
+    expect(results(events)).toEqual(["p1:failed"]);
+    expect(turns(events)).toEqual([]);
+    expect(session.state.tracker.activeTurn).toBeNull();
+    // Once the echo ends the guard clears, and genuinely new work opens a turn again.
+    agent.agent_status = "idle";
+    await session.live.reconcile();
+    expect(session.state.staleWorking).toBeNull();
+    agent.agent_status = "working";
+    await session.live.reconcile();
+    expect(turns(events).map((t) => t.state)).toEqual(["started"]);
+  });
 });
 
 describe("restored-prompt notice (F10)", () => {
@@ -232,11 +255,20 @@ describe("restored-prompt notice (F10)", () => {
     expect(claimed(thrown[0]!)).toBe(false);
   });
 
-  it("an adapter that answered kept is positive evidence of a restored draft", async () => {
+  it("an adapter that answered kept reports retained text without claiming the message was not sent", async () => {
     const notices = await abortEarly(async () => "kept");
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.title).toMatch(/put your message back in its input box/);
-    expect(notices[0]!.description).toMatch(/^The message was not sent\..*clear the input box.*Open in terminal/);
+    expect(notices[0]!.title).toMatch(/kept text in its input box/);
+    expect(claimed(notices[0]!)).toBe(false);
+    expect(notices[0]!.description).toMatch(/^The input box was not cleared.*clear the input box.*Open in terminal/);
+  });
+
+  it("an adapter that could not tell (unknown) gets the conditional notice, not a kept claim", async () => {
+    const notices = await abortEarly(async () => "unknown");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.title).toMatch(/may have kept your message/);
+    expect(notices[0]!.description).toMatch(/^If the message was not sent.*clear the input box.*Open in terminal/);
+    expect(notices[0]!.title).not.toMatch(/kept text/);
   });
 
   it("a cleared draft produces no notice", async () => {

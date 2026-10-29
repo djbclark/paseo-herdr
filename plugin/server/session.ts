@@ -1,6 +1,7 @@
 import type { ProviderConfigChanges, ProviderEvent, ProviderPrompt, ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
-import type { HarnessAdapter, RestoredPromptOutcome, TranscriptReader, TranscriptSnapshot } from "./harness/types.js";
-import { PaneProcessInfoResultSchema, type AgentInfo, type AgentStatus } from "./herdr/schema.js";
+import type { HarnessAdapter, PaneObservation, RestoredPromptOutcome, TranscriptReader, TranscriptSnapshot } from "./harness/types.js";
+import { adapterAcceptsKind } from "./harness/resolve.js";
+import { PaneProcessInfoResultSchema, type AgentInfo, type AgentStatus, type PaneProcessInfo } from "./herdr/schema.js";
 import type { HerdrSubscription, SubscriptionDescriptor } from "./herdr/client.js";
 import { persistenceOf, sameRef, sessionRefOf, type Binding } from "./binding.js";
 import { emptyTimelineState, seedTimeline, type TimelineRow } from "./timeline.js";
@@ -53,6 +54,8 @@ export function pendingBinding(adapter: HarnessAdapter, herdrSession: string | n
 export interface SessionState {
   binding: Binding;
   paneId: string | null;
+  /** Foreground process of the pane as last validated; the pane half of an adapter's input target. */
+  process: PaneProcessInfo | null;
   reader: TranscriptReader | null;
   timeline: ReadonlyMap<string, string>;
   snapshot: TranscriptSnapshot | null;
@@ -94,13 +97,25 @@ export class HerdrHarnessSession {
   private heldRows: Array<Extract<ProviderEvent, { type: "timeline.item" }>> | null = null;
   private historyTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingHistory: TimelineRow[] | null = null;
+  /** Pane-bound open: events emitted by the validation that runs before `session.opened`, replayed right after it. */
+  private deferred: ProviderEvent[] | null = null;
+  /** Live view of this session's pane for pane-bound adapters; it follows terminal and pane moves. */
+  readonly observation: PaneObservation;
 
   constructor(readonly sessionId: string, binding: Binding, readonly deps: SessionDeps) {
     this.state = {
-      binding, paneId: null, reader: null, timeline: emptyTimelineState(), snapshot: null,
+      binding, paneId: null, process: null, reader: null, timeline: emptyTimelineState(), snapshot: null,
       outcome: "active", connected: false, status: "unknown", generation: 0, admitting: false,
       pending: null, turnBaselineEndId: null, workingSeen: false, staleWorking: null,
-      tracker: new TurnTracker({ onEffect: (effect) => this.applyEffect(effect) }),
+      tracker: new TurnTracker({ mode: deps.adapter.turnEvidence, onEffect: (effect) => this.applyEffect(effect) }),
+    };
+    const state = this.state;
+    this.observation = {
+      get terminalId() { return state.binding.terminalId; },
+      get herdrSession() { return state.binding.herdrSession; },
+      paneId: () => state.paneId,
+      request: deps.request,
+      signal: this.controller.signal,
     };
     this.prompts = new PromptController(this);
     this.live = new LiveSession(this);
@@ -114,6 +129,7 @@ export class HerdrHarnessSession {
   current(generation: number): boolean { return !this.isAborted && this.state.generation === generation; }
   emit(event: ProviderEvent): void {
     if (this.isAborted) return;
+    if (this.deferred) { this.deferred.push(event); return; }
     if (this.heldRows && event.type === "timeline.item") this.heldRows.push(event);
     else this.deps.emit(event);
   }
@@ -177,32 +193,49 @@ export class HerdrHarnessSession {
   async open(config: ProviderSessionConfig, history: "replay" | "skip" | "replay-live", requestId?: string): Promise<void> {
     let live: TimelineRow[] = [];
     this.approvals.begin(config);
+    const paneBound = this.adapter.binding === "pane";
+    if (paneBound) {
+      // A pane reader needs the validated pane, so validate first. Its events (a freeze notice, persistence) must
+      // not reach the host before `session.opened`: hold them and replay them right after it.
+      this.deferred = [];
+      try { await this.validateAgent(); }
+      catch (error) {
+        if (!this.isAborted) this.freeze("Input companion unavailable", messageOf(error));
+      }
+      if (this.isAborted) { this.deferred = null; return; }
+    }
     const generation = this.state.generation;
-    const locator = await this.adapter.resolveTranscript(this.state.binding.sessionRef, { cwd: this.state.binding.cwd });
-    if (!this.current(generation)) return;
+    const emitOpened = () => {
+      const held = this.deferred ?? [];
+      this.deferred = null;
+      this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
+        capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
+        cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
+      for (const event of held) this.emit(event);
+    };
+    // A pane-bound session that failed validation has no pane to read.
+    const locator = paneBound && this.state.outcome !== "active" ? null
+      : await this.adapter.resolveTranscript(this.state.binding.sessionRef, { cwd: this.state.binding.cwd, ...(paneBound ? { pane: this.observation } : {}) });
+    if (!this.current(generation)) { this.deferred = null; return; }
     if (locator) {
       this.state.reader = this.adapter.openTranscript(locator);
       const snapshot = await this.state.reader.snapshot();
-      if (!this.current(generation)) return;
+      if (!this.current(generation)) { this.deferred = null; return; }
       this.state.snapshot = snapshot;
       this.state.turnBaselineEndId = snapshot.lastTurnEndId ?? null;
       const seeded = seedTimeline(snapshot, this.state.binding.submittedMessages);
       this.state.timeline = seeded.state;
-      this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
-        capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
-        cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
+      emitOpened();
       if (history === "replay-live") live = seeded.rows;
       if (history === "replay") for (const row of seeded.rows) {
         this.emit({ type: "timeline.item", sessionId: this.sessionId, item: row.item, timestamp: row.timestamp });
       }
     } else {
-      this.emit({ type: "session.opened", requestId, sessionId: this.sessionId, restoration: "core",
-        capabilities: this.capabilities, persistence: persistenceOf(this.state.binding),
-        cwd: this.state.binding.cwd || config.cwd, title: this.state.binding.agentName ?? config.title });
+      emitOpened();
       this.freeze("History unavailable", "This agent has no readable native history; the conversation is read-only.");
     }
     if (history === "replay") this.approvals.replay();
-    if (this.state.outcome === "active") {
+    if (this.state.outcome === "active" && !paneBound) {
       try { await this.validateAgent(); }
       catch (error) {
         if (!this.isAborted) this.freeze("Input companion unavailable", messageOf(error));
@@ -255,17 +288,20 @@ export class HerdrHarnessSession {
     const label = this.adapter.label;
     let outcome: RestoredPromptOutcome = "unsupported";
     try {
-      if (this.adapter.discardRestoredPrompt && occupant && ref) {
-        outcome = await this.adapter.discardRestoredPrompt({ pid: occupant.pid, ref, instanceId: occupant.instanceId }, text, this.signal);
+      if (this.adapter.discardRestoredPrompt && occupant && (this.adapter.binding === "pane" || ref)) {
+        const { paneId, process } = this.state;
+        outcome = await this.adapter.discardRestoredPrompt({ pid: occupant.pid, ref, instanceId: occupant.instanceId,
+          ...(paneId && process ? { pane: { paneId, terminalId: this.state.binding.terminalId, process } } : {}) }, text, this.signal);
       }
     } catch { /* the adapter could not tell: same as unsupported */ }
     if (outcome === "cleared" || !this.current(generation)) return;
-    // Only an adapter that answered "kept" saw the draft; with no answer nothing is known about the input box.
-    const restored = outcome === "kept";
+    // "kept" is a companion's authenticated answer that the input box still holds text, which need not be ours;
+    // anything else (unknown, unsupported, a throw) says nothing about the input box.
+    const kept = outcome === "kept";
     this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
       id: "restored-prompt", severity: "info",
-      title: restored ? `${label} put your message back in its input box` : `${label} may have kept your message in its input box`,
-      description: `${restored ? "The message was not sent." : "If the message was not sent, it may still be in the input box."} To remove it, clear the input box in the terminal (Herdr screen, then ⋯, then Open in terminal).`,
+      title: kept ? `${label} kept text in its input box` : `${label} may have kept your message in its input box`,
+      description: `${kept ? "The input box was not cleared, and the text in it may not be your message." : "If the message was not sent, it may still be in the input box."} To remove it, clear the input box in the terminal (Herdr screen, then ⋯, then Open in terminal).`,
     } });
   }
 
@@ -295,14 +331,16 @@ export class HerdrHarnessSession {
     if (!this.current(generation) || this.state.outcome !== "active") return null;
     const binding = this.state.binding;
     let agent = agents.find((candidate) => candidate.terminal_id === binding.terminalId);
-    if (agent && (agent.agent !== this.adapter.id || !sameRef(sessionRefOf(agent), binding.sessionRef))) {
-      const changedSession = agent.agent === this.adapter.id && !sameRef(sessionRefOf(agent), binding.sessionRef);
+    const nativeRef = this.adapter.binding === "native-ref";
+    if (agent && (!adapterAcceptsKind(this.adapter, agent.agent) || (nativeRef && !sameRef(sessionRefOf(agent), binding.sessionRef)))) {
+      const changedSession = adapterAcceptsKind(this.adapter, agent.agent) && nativeRef && !sameRef(sessionRefOf(agent), binding.sessionRef);
       this.freeze(changedSession ? "The native session changed" : "The bound agent was replaced",
         changedSession ? "The old conversation is frozen. Open Import session, choose the Herdr provider and import the current native conversation separately. Do not import it through the native provider: that creates a second process." : "The bound foreground agent changed; no input will be sent to its replacement.");
       return null;
     }
     if (!agent) {
-      const matches = agents.filter((candidate) => candidate.agent === this.adapter.id && sameRef(sessionRefOf(candidate), binding.sessionRef));
+      // Recovery by native ref only exists for native-ref bindings; a pane binding with a missing terminal is gone.
+      const matches = nativeRef ? agents.filter((candidate) => adapterAcceptsKind(this.adapter, candidate.agent) && sameRef(sessionRefOf(candidate), binding.sessionRef)) : [];
       // Recovery never trusts a native path alone; require retained process evidence below.
       if (matches.length !== 1 || !binding.occupant) {
         this.freeze(`${this.adapter.label} agent unavailable`, "The bound agent is no longer present or recovery is ambiguous; this conversation is read-only.");
@@ -310,7 +348,7 @@ export class HerdrHarnessSession {
       }
       agent = matches[0];
     }
-    if (!binding.sessionRef) {
+    if (nativeRef && !binding.sessionRef) {
       this.freeze("History unavailable", "This agent has no readable native history; the conversation is read-only.");
       return null;
     }
@@ -336,7 +374,8 @@ export class HerdrHarnessSession {
       this.freeze("The bound agent was replaced", "The foreground process identity changed; no input will be sent to the replacement.");
       return null;
     }
-    const identity = await this.adapter.inspectInput({ pid, ref: binding.sessionRef }, this.signal);
+    const identity = await this.adapter.inspectInput({ pid, ref: binding.sessionRef,
+      pane: { paneId: agent.pane_id, terminalId: agent.terminal_id, process } }, this.signal);
     if (!this.current(generation) || this.state.outcome !== "active") return null;
     if (identity.pid !== pid || (previous && previous.instanceId !== identity.instanceId)) {
       this.freeze("The bound agent was replaced", "The process-local input identity changed; no input will be sent to the replacement.");
@@ -351,6 +390,7 @@ export class HerdrHarnessSession {
     binding.occupant = { pid, tty: process.tty ?? null, instanceId: identity.instanceId };
     binding.terminalId = agent.terminal_id;
     this.state.paneId = agent.pane_id;
+    this.state.process = process;
     this.state.status = agent.agent_status;
     if (!previous || moved) this.persist();
     if (moved) this.live.paneChanged();
@@ -385,7 +425,7 @@ export class HerdrHarnessSession {
         result: { type: "turn", turnId: effect.turnId } });
       if (effect.type === "prompt_uncertain") this.emit({ type: "session.notice", sessionId: this.sessionId,
         notice: { id: "prompt-uncertain", severity: "warning", title: "Prompt delivery is uncertain",
-          description: "The prompt may still reach the agent; it was not resubmitted. Check the attached terminal." } });
+          description: `${effect.message ? `${effect.message}${/[.!?]$/.test(effect.message) ? "" : "."} ` : ""}The prompt may still reach the agent; it was not resubmitted. Check the attached terminal.` } });
     } else if (effect.type === "notice") {
       // With approvals on, the cards replace the "needs approval in the terminal" notice; dismissals always pass.
       if (effect.id === "blocked" && !effect.dismissed && this.approvals.enabled === "on") return;

@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/provider";
 import { HerdrHarnessSession } from "../server/session.js";
 import { bindingOf } from "../server/binding.js";
@@ -88,4 +88,64 @@ it("a rejection that starts no terminal turn does not leak workingSeen into the 
   agent.agent_status = "working";
   await session.live.reconcile();
   expect(session.state.tracker.activeTurn).not.toBeNull();
+});
+
+/**
+ * F1: an uncertain delivery that saw `working`, then settled idle ("did not reach the agent"), leaves `workingSeen`
+ * set. The next Paseo turn is reserved with that stale flag, so a fast Stop (native end before Herdr's `working`)
+ * does not arm the late-`working` guard and Herdr's echo opens a phantom turn that never ends.
+ */
+it("a working flag left by an uncertain delivery that settled idle does not leak into the next fast Paseo turn (F1)", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const agent = agentOf("idle");
+    const store = new FakeTranscript();
+    store.set([{ id: "old-user", kind: "user", text: "old" }, { id: "old-end", kind: "assistant", text: "old answer" }]);
+    const adapter = makeFakeAdapter(store);
+    const events: ProviderEvent[] = [];
+    let stall = true;
+    const session = new HerdrHarnessSession("s", bindingOf(agent, adapter, null), {
+      adapter, listAgents: async () => [structuredClone(agent)],
+      request: async (method) => {
+        if (method === "pane.process_info") return { type: "pane_process_info", process_info: { pane_id: "pane",
+          foreground_process_group_id: 100, tty: "/dev/pts/fake", foreground_processes: [{ pid: 100, name: "fake" }] } };
+        if (method === "agent.prompt" && stall) { stall = false; throw new HerdrError("agent_prompt_stalled", "stall"); }
+        return { type: "agent_prompted", agent };
+      },
+      subscribe: async () => ({ [Symbol.asyncIterator]: async function* () {}, close() {} }),
+      emit: (event) => events.push(event),
+    });
+    sessions.push(session);
+    await session.open(config, "skip");
+    await session.live.reconcile();
+
+    await session.prompt(prompt("p1"));
+    expect(session.state.tracker.isUncertain).toBe(true);
+    agent.agent_status = "working";
+    await session.live.reconcile();
+    expect(session.state.workingSeen).toBe(true);
+    // Herdr goes idle with no transcript entry for our text: after the idle hold the reservation settles as failed.
+    agent.agent_status = "idle";
+    await session.live.reconcile();
+    vi.setSystemTime(Date.now() + 16_000);
+    await session.live.reconcile();
+    expect(turns(events)).toEqual(["started", "failed"]);
+    expect(session.state.tracker.activeTurn).toBeNull();
+
+    // Reserving the next prompt must drop the stale flag.
+    await session.prompt(prompt("p2", "again"));
+    expect(results(events)).toEqual(["p1:turn", "p2:turn"]);
+    expect(session.state.workingSeen).toBe(false);
+    // That turn ends fast in the transcript; Herdr's late `working` is an echo, not a new turn.
+    store.append({ id: "u2", kind: "user", text: "again" });
+    store.append({ id: "a2", kind: "assistant", text: "done fast" });
+    await session.live.reconcile();
+    expect(turns(events)).toEqual(["started", "failed", "started", "completed"]);
+    agent.agent_status = "working";
+    await session.live.reconcile();
+    expect(turns(events)).toEqual(["started", "failed", "started", "completed"]);
+    expect(session.state.tracker.activeTurn).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
 });
