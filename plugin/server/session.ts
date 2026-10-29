@@ -105,9 +105,13 @@ export class HerdrHarnessSession {
   private pendingHistory: TimelineRow[] | null = null;
   /** Pane-bound open: events emitted by the validation that runs before `session.opened`, replayed right after it. */
   private deferred: ProviderEvent[] | null = null;
-  /** `validateAgent` calls take a sequence number at the start; a commit older than the last committed one is dropped. */
+  /**
+   * `validateAgent` calls take a sequence number at the start. A call older than the last committed one never commits:
+   * it returns that newer commit's agent instead (`committed`), so a caller does not read the overlap as "unavailable".
+   */
   private validationSeq = 0;
   private committedSeq = 0;
+  private committed: AgentInfo | null = null;
   /** Live view of this session's pane for pane-bound adapters; it follows terminal and pane moves. */
   readonly observation: PaneObservation;
 
@@ -377,6 +381,8 @@ export class HerdrHarnessSession {
       // can happen between agent.list and process_info; re-read both identities
       // instead of treating an alias response as a replaced process.
       if (!moveRetry) return this.validateAgent(true, seq);
+      // A newer commit already proved the pane reachable: this older observation must not mark it disconnected.
+      if (seq < this.committedSeq) return this.committed;
       this.state.connected = false;
       this.state.tracker.observeConnectivityLost();
       return null;
@@ -397,8 +403,9 @@ export class HerdrHarnessSession {
       this.freeze("The bound agent was replaced", "The process-local input identity changed; no input will be sent to the replacement.");
       return null;
     }
-    // A validation that started earlier but finished after a later one must not move the claim or state back.
-    if (seq < this.committedSeq) return null;
+    // A validation that started earlier but finished after a later one must not move the claim or state back. It
+    // returns what the later one committed (the session is still active here, so that commit did not freeze it).
+    if (seq < this.committedSeq) return this.committed;
     this.committedSeq = seq;
     if (this.deps.claimPane && !this.deps.claimPane(agent.terminal_id)) {
       this.freeze(`This ${this.adapter.label} agent is already open in another conversation`,
@@ -413,6 +420,7 @@ export class HerdrHarnessSession {
     this.state.status = agent.agent_status;
     if (!previous || moved) this.persist();
     if (moved) this.live.paneChanged();
+    this.committed = agent;
     return agent;
   }
 

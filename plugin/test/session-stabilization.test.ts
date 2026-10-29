@@ -151,6 +151,56 @@ it("keeps the independent harness interrupt key and waits for native abort", asy
   expect(turns(events).map((event) => event.state)).toEqual(["started", "canceled"]);
 });
 
+/** `listAgents` that parks every call until the test resolves it, so overlapping validations finish in a chosen order. */
+function gatedList(agent: AgentInfo) {
+  const gates: Array<() => void> = [];
+  let gated = false;
+  const listAgents = async () => {
+    if (!gated) return [agent];
+    const parked = Promise.withResolvers<void>();
+    gates.push(parked.resolve);
+    await parked.promise;
+    return [agent];
+  };
+  return { listAgents, gates, gate: () => { gated = true; }, ungate: () => { gated = false; } };
+}
+
+it("an overlapping reconcile that commits first does not fail the prompt of the older validation", async () => {
+  const agent = makeAgent();
+  const list = gatedList(agent);
+  const { session, delivered, events } = await setup({ listAgents: list.listAgents });
+  list.gate();
+  const sending = session.prompt(prompt("one"));
+  await vi.waitFor(() => expect(list.gates).toHaveLength(1));
+  const polling = session.live.reconcile();
+  await vi.waitFor(() => expect(list.gates).toHaveLength(2));
+  list.gates[1]!();
+  await polling;
+  list.ungate();
+  list.gates[0]!();
+  await sending;
+  expect(delivered.map((request) => request.method)).toEqual(["agent.prompt"]);
+  expect(events.filter((event) => event.type === "session.prompt_result")).toMatchObject([{ result: { type: "turn" } }]);
+});
+
+it("an overlapping reconcile that commits first does not drop the Stop key of the older validation", async () => {
+  const agent = makeAgent();
+  const list = gatedList(agent);
+  const { session, delivered } = await setup({ listAgents: list.listAgents });
+  await session.prompt(prompt("first"));
+  list.gate();
+  const stopping = session.interrupt("stop");
+  await vi.waitFor(() => expect(list.gates).toHaveLength(1));
+  const polling = session.live.reconcile();
+  await vi.waitFor(() => expect(list.gates).toHaveLength(2));
+  list.gates[1]!();
+  await polling;
+  list.ungate();
+  list.gates[0]!();
+  await stopping;
+  expect(delivered.at(-1)).toEqual({ method: "pane.send_keys", params: { pane_id: "pane", keys: ["ctrl+c"] } });
+});
+
 it("rebinds the moved pane only when retained native and occupant identity match", async () => {
   const { session, agent, delivered } = await setup();
   agent.pane_id = "moved-pane";

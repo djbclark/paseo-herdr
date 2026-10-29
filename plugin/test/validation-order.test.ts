@@ -56,7 +56,7 @@ const claimHeld = (terminalId: string): boolean => {
   return release === null;
 };
 
-it("a validation that started earlier but resolves later does not move the claim or pane back", async () => {
+it("a validation that started earlier but resolves later does not commit, and returns the newer committed agent", async () => {
   const { session, lists } = rig();
   const earlier = session.validateAgent();
   const later = session.validateAgent();
@@ -65,13 +65,64 @@ it("a validation that started earlier but resolves later does not move the claim
   lists[1]!.resolve([agentAt("t-new", "p-new")]);
   expect((await later)?.terminal_id).toBe("t-new");
   lists[0]!.resolve([agentAt("t-old", "p-old")]);
-  expect(await earlier).toBeNull();
+  // Not null: the session is healthy, so the caller of the superseded call must not read it as "unavailable".
+  expect((await earlier)?.terminal_id).toBe("t-new");
 
   expect(session.state.paneId).toBe("p-new");
   expect(session.state.binding.terminalId).toBe("t-new");
   expect(claimHeld("t-new")).toBe(true);
   expect(claimHeld("t-old")).toBe(false);
   expect(session.state.outcome).toBe("active");
+});
+
+it("a superseded validation of the same unchanged agent resolves to it", async () => {
+  const { session, lists } = rig();
+  const earlier = session.validateAgent();
+  const later = session.validateAgent();
+  lists[1]!.resolve([agentAt("t-1", "p-1")]);
+  await later;
+  lists[0]!.resolve([agentAt("t-1", "p-1")]);
+  expect((await earlier)?.pane_id).toBe("p-1");
+  expect(session.state.outcome).toBe("active");
+});
+
+it("a superseded validation returns null when the newer one froze the session", async () => {
+  const { session, lists } = rig();
+  const earlier = session.validateAgent();
+  const later = session.validateAgent();
+  // The newer call finds the bound ref replaced and freezes; the older one finishes afterwards.
+  lists[1]!.resolve([{ ...agentAt("t-0", "p-0"), agent_session: { source: "herdr:fake", agent: "fake", kind: "id", value: "other" } }]);
+  expect(await later).toBeNull();
+  expect(session.state.outcome).toBe("readonly");
+  lists[0]!.resolve([agentAt("t-1", "p-1")]);
+  expect(await earlier).toBeNull();
+  expect(session.state.binding.terminalId).toBe("t-0");
+});
+
+it("a superseded validation returns null once the session is closed", async () => {
+  const { session, lists } = rig();
+  const earlier = session.validateAgent();
+  const later = session.validateAgent();
+  lists[1]!.resolve([agentAt("t-1", "p-1")]);
+  await later;
+  session.close();
+  lists[0]!.resolve([agentAt("t-1", "p-1")]);
+  expect(await earlier).toBeNull();
+});
+
+it("a superseded validation whose move retry is exhausted does not mark the pane disconnected", async () => {
+  // The older call keeps getting alias pane ids; a newer call already committed, so the older one must not write connectivity loss.
+  const { session, lists } = rig((paneId, call) => (call === 2 || call === 3 ? "p-alias" : paneId));
+  session.state.connected = true; // the rig never opens the session; open() sets this
+  const earlier = session.validateAgent();
+  const later = session.validateAgent();
+  lists[1]!.resolve([agentAt("t-1", "p-1")]);
+  await later;
+  lists[0]!.resolve([agentAt("t-1", "p-1")]);
+  await vi.waitFor(() => expect(lists).toHaveLength(3));
+  lists[2]!.resolve([agentAt("t-1", "p-1")]);
+  expect((await earlier)?.terminal_id).toBe("t-1");
+  expect(session.state.connected).toBe(true);
 });
 
 it("validations resolving in start order still commit in order", async () => {
