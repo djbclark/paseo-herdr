@@ -28,7 +28,7 @@ import type { AgentStatus } from "./herdr/schema.js";
  *   was ever observed).
  * - Observer disconnection is separate from native failure; `unknown` is
  *   transient until it persists past a threshold (in status mode it is simply
- *   tolerated: panes without screen detection report it permanently).
+ *   tolerated: panes without screen detection report it permanently, so only an accepted or uncertain turn is failed after the window).
  */
 
 export type TurnOrigin = "paseo" | "terminal";
@@ -104,6 +104,8 @@ export interface PendingSubmission {
 
 /** Truthful wording for a reservation that no evidence ever confirmed: delivery failed, nothing was resent. */
 const UNCERTAIN_FAILURE = "Paseo could not confirm the prompt reached the agent; it was not resent. Check the terminal.";
+/** Status evidence: the pane reported `unknown` for the whole unknown window after the turn began; the turn's fate is not knowable. */
+const UNKNOWN_TURN_FAILURE = "Herdr has reported this agent's status as unknown for too long, so Paseo cannot tell whether the turn finished. Check the terminal.";
 
 export class TurnTracker {
   private phase: Phase = { kind: "idle" };
@@ -321,7 +323,8 @@ export class TurnTracker {
    * held past `idleSettleMs` (after observed activity) or `noActivitySettleMs` (with an info notice) ends the
    * turn. All work observed after an accepted send belongs to the Paseo turn (the wave-2 ruling), so a pending
    * uncertain reservation accepts as soon as the pane shows work or any state change. `unknown` is tolerated
-   * without starting or ending anything (panes without screen detection report it permanently).
+   * without starting or ending anything (panes without screen detection report it permanently); an accepted or uncertain
+   * turn still fails once `unknown` has lasted `unknownBindingLossMs`.
    */
   observeStatusEvidence(evidence: StatusEvidence): void {
     if (this.mode !== "status") return;
@@ -332,11 +335,19 @@ export class TurnTracker {
     this.lastCompletion = evidence.completionSeq;
 
     if (evidence.status === "unknown") {
-      // Tolerated: no turn starts or ends, no binding-loss clock runs, and no idle window is held through it.
+      // No turn starts or ends from `unknown` itself, and no idle window is held through it (panes without screen
+      // detection report it permanently). But an accepted or uncertain turn must not wait forever on a pane that
+      // stays unknown: past the long unknown window it ends as failed, and the binding stays usable.
       this.idleSince = null;
       if (this.phase.kind === "pending" && this.phase.responseReported) this.phase.uncertainIdleSince = null;
+      if (this.unknownSince === null) this.unknownSince = now;
+      if (this.unknownStatusExpired(now)) {
+        this.unknownSince = null;
+        this.bindingLost(UNKNOWN_TURN_FAILURE);
+      }
       return;
     }
+    this.unknownSince = null;
 
     const busy = evidence.status === "working" || evidence.status === "blocked";
     // The idle hold needs continuous quiet: work (or any state change while idle) restarts the clock.
@@ -347,8 +358,11 @@ export class TurnTracker {
       if (!this.phase.responseReported) {
         // The delivery result decides ownership: remember the status but do not accept while it is in flight.
         if (busy) this.phase.busyDuringDelivery = true;
-      } else if (busy || seqAdvanced) {
+      } else if (busy || this.phase.busyDuringDelivery || this.uncertainEvidenceAdvanced(evidence, seqAdvanced)) {
         this.acceptPending();
+        // acceptPending clears the idle hold for a fresh turn; this observation is itself idle, so the hold (and an
+        // already-advanced completion counter) must be judged by the settle below, not a poll later.
+        if (!busy) this.idleSince = now;
       } else {
         // Idle with no state change: keep waiting; only continuous idle for the full window settles it as failed.
         if (this.phase.uncertainIdleSince === null) this.phase.uncertainIdleSince = now;
@@ -373,6 +387,30 @@ export class TurnTracker {
     this.tickInterrupt(now);
   }
 
+  /** A turn the status counters have yet to settle: accepted/ending, or an uncertain reservation. */
+  private get turnAwaitsEvidence(): boolean {
+    return this.phase.kind === "active" || this.phase.kind === "ending" ||
+      (this.phase.kind === "pending" && this.phase.responseReported);
+  }
+
+  private unknownStatusExpired(now: number): boolean {
+    return this.unknownSince !== null && this.turnAwaitsEvidence &&
+      now - this.unknownSince >= this.thresholds.unknownBindingLossMs;
+  }
+
+  /**
+   * Evidence that an uncertain reservation's prompt reached the agent. Measured against the admission baseline, so
+   * work done while the send was still in flight (counters moved before `pendingUncertain`) still counts; with no
+   * baseline only an advance since the previous observation is available.
+   */
+  private uncertainEvidenceAdvanced(evidence: StatusEvidence, seqAdvanced: boolean): boolean {
+    if (this.phase.kind !== "pending") return false;
+    const baseline = this.phase.baseline;
+    if (!baseline) return seqAdvanced;
+    return evidence.stateChangeSeq > baseline.stateChangeSeq ||
+      (evidence.completionSeq !== null && (baseline.completionSeq === null || evidence.completionSeq > baseline.completionSeq));
+  }
+
   /** Status-evidence end rules for an active turn whose latest observation is `idle`/`done` (`idleSince` set). */
   private settleActiveFromStatus(now: number, evidence: StatusEvidence): void {
     if (this.phase.kind !== "active" || this.idleSince === null) return;
@@ -385,12 +423,14 @@ export class TurnTracker {
     const viaIdle = sawActivity && idleHeld >= this.thresholds.idleSettleMs;
     const viaNoActivity = !sawActivity && idleHeld >= this.thresholds.noActivitySettleMs;
     if (!viaCompletion && !viaIdle && !viaNoActivity) return;
+    // A pending interrupt means the turn was stopped (the status counters cannot tell a stop from a natural end).
+    const state = this.interruptedAt !== null ? "canceled" : "completed";
     this.phase = { kind: "idle" };
     this.interruptedAt = null;
     this.interruptNoticed = false;
     this.earlyAbort = null;
-    this.emit({ type: "turn", turnId, state: "completed" });
-    if (viaNoActivity) {
+    this.emit({ type: "turn", turnId, state });
+    if (viaNoActivity && state === "completed") {
       // Nothing but idle was ever observed: the "turn" may only be slow to start, so the heuristic is labelled.
       this.emit({
         type: "notice",
@@ -507,7 +547,7 @@ export class TurnTracker {
 
   private tickInterrupt(now: number): void {
     if (this.interruptedAt === null || this.interruptNoticed) return;
-    if (now - this.interruptedAt > this.thresholds.interruptPendingMs) {
+    if (now - this.interruptedAt >= this.thresholds.interruptPendingMs) {
       this.interruptNoticed = true;
       this.emit({
         type: "notice",
@@ -533,6 +573,9 @@ export class TurnTracker {
       consider(this.idleSince + (active ? this.thresholds.idleSettleMs : this.thresholds.noActivitySettleMs));
     } else if (this.phase.kind === "pending" && this.phase.responseReported && this.phase.uncertainIdleSince !== null) {
       consider(this.phase.uncertainIdleSince + this.thresholds.uncertainSettleMs);
+    }
+    if (this.mode === "status" && this.unknownSince !== null && this.turnAwaitsEvidence) {
+      consider(this.unknownSince + this.thresholds.unknownBindingLossMs);
     }
     if (this.interruptedAt !== null && !this.interruptNoticed) consider(this.interruptedAt + this.thresholds.interruptPendingMs);
     return deadline;

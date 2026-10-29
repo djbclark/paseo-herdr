@@ -91,7 +91,8 @@ it("status mode: Stop on an uncertain delivery while the pane is working interru
   await session.live.reconcile();
   advance(3_000);
   await session.live.reconcile();
-  expect(turns(events).map((t) => t.state)).toEqual(["started", "completed"]);
+  // An interrupt was pending, so the idle settle reads as a stop, not a natural end (adversary B4).
+  expect(turns(events).map((t) => t.state)).toEqual(["started", "canceled"]);
   expect(keys()).toHaveLength(1);
   await session.prompt(prompt("p2", "again"));
   expect(results(events)).toEqual(["p1:turn", "p2:turn"]);

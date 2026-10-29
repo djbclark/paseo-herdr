@@ -94,7 +94,7 @@ describe("status-evidence turns (turnEvidence: status)", () => {
     expect(turnStates(events)).toEqual(["started", "completed", "started", "completed"]);
   });
 
-  it("Stop with no transcript entry never early-aborts; the turn completes via the no-activity settle", async () => {
+  it("Stop with no transcript entry never early-aborts; the turn ends canceled via the no-activity settle", async () => {
     const { session, agent, events, sent } = await setup();
     await session.prompt(prompt("p1"));
     await session.interrupt("stop-1");
@@ -105,11 +105,25 @@ describe("status-evidence turns (turnEvidence: status)", () => {
     expect(turnStates(events)).toEqual(["started"]); // transcript mode would have canceled by ~2.4 s
     advance(2_300); // 16_300: 15 s held since the first idle observation
     await session.live.reconcile();
-    expect(turnStates(events)).toEqual(["started", "completed"]);
-    expect(noticeIds(events)).toContain("no-activity");
+    expect(turnStates(events)).toEqual(["started", "canceled"]);
+    expect(noticeIds(events)).not.toContain("no-activity"); // that notice says "marked complete"
     expect(session.state.pending).toBeNull();
     await session.prompt(prompt("p2", "again"));
     expect(results(events)).toEqual(["p1:turn", "p2:turn"]);
+  });
+
+  it("Stop on a working turn, then idle with a state change, ends canceled on the short settle", async () => {
+    const { session, agent, events } = await setup();
+    await session.prompt(prompt("p1"));
+    agent.agent_status = "working"; agent.state_change_seq = 1;
+    await session.live.reconcile();
+    await session.interrupt("stop-1");
+    agent.agent_status = "idle"; agent.state_change_seq = 2;
+    await session.live.reconcile();
+    expect(turnStates(events)).toEqual(["started"]);
+    await vi.advanceTimersByTimeAsync(3_000);
+    await flush();
+    expect(turnStates(events)).toEqual(["started", "canceled"]);
   });
 
   it("arms one reconcile timer for the tracker's next deadline", async () => {
@@ -139,6 +153,25 @@ describe("status-evidence turns (turnEvidence: status)", () => {
     agent.agent_status = "done"; agent.completion_seq = 1;
     await session.live.reconcile();
     expect(turnStates(events)).toEqual(["started", "completed"]);
+  });
+
+  it("an accepted turn whose status stays unknown fails by the deadline timer and frees the chat", async () => {
+    const { session, agent, events } = await setup();
+    await session.prompt(prompt("p1"));
+    agent.agent_status = "working"; agent.state_change_seq = 1;
+    await session.live.reconcile();
+    agent.agent_status = "unknown";
+    await session.live.reconcile(); // starts the unknown clock and arms the deadline timer
+    expect(turnStates(events)).toEqual(["started"]);
+    await vi.advanceTimersByTimeAsync(30_000); // no further poll: the timer alone must end the turn
+    await flush();
+    expect(turnStates(events)).toEqual(["started", "failed"]);
+    expect(session.state.outcome).toBe("active"); // not frozen
+    expect(session.state.pending).toBeNull();
+    agent.agent_status = "idle";
+    await session.live.reconcile();
+    await session.prompt(prompt("p2", "again"));
+    expect(results(events)).toEqual(["p1:turn", "p2:turn"]);
   });
 
   it("an uncertain delivery is accepted when Herdr shows the work", async () => {
