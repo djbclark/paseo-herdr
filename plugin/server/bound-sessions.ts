@@ -10,7 +10,7 @@ export class BoundSessions {
     let flushed = 0;
     for (const session of this.sessions) {
       if (session.isAborted) {
-        this.sessions.delete(session); // closed: prune instead of wiring removal into every close path
+        this.delete(session);
         continue;
       }
       const { binding } = session.state;

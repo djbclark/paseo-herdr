@@ -9,12 +9,13 @@ import {
 import type { HarnessAdapter } from "./harness/types.js";
 import { HerdrClient, checkHerdrStatus, type SubscriptionDescriptor } from "./herdr/client.js";
 import { AgentListResultSchema, type AgentInfo } from "./herdr/schema.js";
-import { bindingOf, parseBinding } from "./binding.js";
+import { bindingOf, parseBinding, type Binding } from "./binding.js";
 import { discoverSessions } from "./discovery.js";
 import { launchAgent } from "./launch.js";
 import { HerdrHarnessSession, capabilitiesFor, pendingBinding, type SessionDeps } from "./session.js";
 import { ModelCache } from "./config.js";
 import type { BoundSessions } from "./bound-sessions.js";
+import { paneClaims } from "./pane-claims.js";
 import type { PermissionResponder } from "./host.js";
 import { HERDR_BIND_OPTION, NATIVE_DEFAULT_MODEL } from "../shared/model.js";
 
@@ -71,6 +72,8 @@ export function createHerdrProvider(
       const capabilities = negotiateProviderCapabilities(request.capabilities, capabilitiesFor(adapter));
       const listeners = new Set<(event: ProviderEvent) => void>();
       const sessions = new Map<string, HerdrHarnessSession>();
+      const claims = new Map<HerdrHarnessSession, () => void>();
+      const controller = new AbortController();
       let closed = false;
       const emit = (event: ProviderEvent) => { if (!closed) for (const listener of listeners) listener(event); };
       const list = async (signal?: AbortSignal): Promise<AgentInfo[]> => {
@@ -79,11 +82,13 @@ export function createHerdrProvider(
       };
       // Each session pins the socket and Herdr session it opened on: a settings change applies to new
       // operations only and never moves an open chat to another Herdr daemon (P3.7A).
-      const sessionDeps = async (): Promise<SessionDeps> => {
-        const herdr = new HerdrClient(await getSocketPath());
+      const sessionDeps = async (): Promise<SessionDeps & { socketPath: string }> => {
+        const socketPath = await getSocketPath();
+        const herdr = new HerdrClient(socketPath);
         const herdrSession = hooks.getHerdrSession?.() ?? null;
         const request: SessionDeps["request"] = (method, params = {}, options) => herdr.request(method, params, options);
         return {
+          socketPath,
           adapter,
           listAgents: async (signal?: AbortSignal) => AgentListResultSchema.parse(await herdr.request("agent.list", {}, { signal })).agents,
           request,
@@ -98,7 +103,28 @@ export function createHerdrProvider(
         };
       };
 
+      const claim = (session: HerdrHarnessSession, socketPath: string, terminalId = session.state.binding.terminalId) => {
+        const release = paneClaims.claim(socketPath, session.state.binding.herdrSession, terminalId, session);
+        if (!release) throw new Error(`This ${adapter.label} agent is already open in another conversation`);
+        claims.set(session, release);
+      };
+      const register = (sessionId: string, binding: Binding, deps: SessionDeps & { socketPath: string }): HerdrHarnessSession | null => {
+        const session = new HerdrHarnessSession(sessionId, binding, deps);
+        session.signal.addEventListener("abort", () => {
+          if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+          hooks.boundSessions?.delete(session);
+          claims.get(session)?.();
+          claims.delete(session);
+        }, { once: true });
+        if (closed) { session.close(); return null; }
+        try { if (binding.terminalId) claim(session, deps.socketPath); }
+        catch (error) { session.close(); throw error; }
+        sessions.set(sessionId, session);
+        return session;
+      };
+
       const dispatch = async (input: ProviderInput): Promise<void> => {
+        if (closed) return;
         switch (input.type) {
           case "catalog": {
             if (modelCache.stale) {
@@ -123,30 +149,31 @@ export function createHerdrProvider(
           case "session.open": {
             if (sessions.has(input.sessionId)) throw new Error("Session already open");
             if (!input.persistence) {
-              if (hooks.isEnabled && !(await hooks.isEnabled())) {
-                throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
+              if (hooks.isEnabled) {
+                const enabled = await hooks.isEnabled();
+                if (closed) return;
+                if (!enabled) throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
               }
               const bindOption = input.config.providerOptions?.[HERDR_BIND_OPTION];
               if (bindOption !== undefined) {
                 const parsed = BindOptionSchema.safeParse(bindOption);
                 if (!parsed.success) throw new Error("Invalid herdrBind option: expected { terminalId, paneId? }");
                 const deps = await sessionDeps();
-                const agent = (await deps.listAgents()).find((candidate) => candidate.terminal_id === parsed.data.terminalId);
+                if (closed) return;
+                const agent = (await deps.listAgents(controller.signal)).find((candidate) => candidate.terminal_id === parsed.data.terminalId);
+                if (closed) return;
                 if (!agent) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is no longer running`);
                 if (agent.agent !== adapter.id) throw new Error(`The Herdr agent in terminal ${parsed.data.terminalId} is not a ${adapter.label} agent`);
                 const binding = bindingOf(agent, adapter, deps.getHerdrSession?.() ?? null);
-                // A read-only chat on the same agent doesn't count: after a restart the client binds a fresh chat and archives the old one.
-                const taken = () => [...sessions.values()].some((open) => open.state.outcome === "active" &&
-                  open.state.binding.terminalId === binding.terminalId && open.state.binding.herdrSession === binding.herdrSession);
                 if (sessions.has(input.sessionId)) throw new Error("Session already open");
-                if (taken()) throw new Error(`This ${adapter.label} agent is already open in another conversation`);
-                const session = new HerdrHarnessSession(input.sessionId, binding, deps);
-                sessions.set(input.sessionId, session);
+                const session = register(input.sessionId, binding, deps);
+                if (!session) return;
                 hooks.boundSessions?.add(session);
                 try {
                   const config = { ...input.config };
                   if (config.model === NATIVE_DEFAULT_MODEL) delete config.model;
                   await session.bind(config, input.requestId);
+                  if (closed) session.close();
                 } catch (error) {
                   const closedMeanwhile = session.isAborted;
                   session.close();
@@ -159,19 +186,28 @@ export function createHerdrProvider(
               let companion: { ok: boolean; diagnostic?: string } | undefined;
               try { companion = await adapter.inputCompanionStatus?.(); }
               catch (error) { companion = { ok: false, diagnostic: `Input companion check failed: ${String(error)}` }; }
+              if (closed) return;
               if (companion && !companion.ok) {
                 throw new Error(companion.diagnostic ?? `The ${adapter.label} input companion is not installed`);
               }
               const deps = await sessionDeps();
+              if (closed) return;
               if (sessions.has(input.sessionId)) throw new Error("Session already open");
-              const session = new HerdrHarnessSession(input.sessionId,
+              const session = register(input.sessionId,
                 pendingBinding(adapter, deps.getHerdrSession?.() ?? null, input.config.cwd), deps);
-              sessions.set(input.sessionId, session);
+              if (!session) return;
+              const launch = deps.launch!;
+              deps.launch = async (config, signal) => {
+                const launched = await launch(config, signal);
+                if (!closed && !signal.aborted) claim(session, deps.socketPath, launched.terminalId);
+                return launched;
+              };
               try {
                 // This launch-only selection must never reach a harness as a literal model ID.
                 const config = { ...input.config };
                 if (config.model === NATIVE_DEFAULT_MODEL) delete config.model;
                 await session.create(config, input.history, input.requestId);
+                if (closed) session.close();
               } catch (error) {
                 const closedMeanwhile = session.isAborted;
                 session.close();
@@ -183,20 +219,22 @@ export function createHerdrProvider(
             }
             const binding = parseBinding(input.persistence, adapter);
             const deps = await sessionDeps();
+            if (closed) return;
             const target = deps.getHerdrSession?.() ?? null;
             if (binding.herdrSession !== target) {
               const name = (session: string | null) => (session ? `Herdr session "${session}"` : "the default Herdr session");
               throw new Error(`This conversation belongs to ${name(binding.herdrSession)}, but the Herdr plugin now targets ${name(target)}. Change the plugin's Herdr settings back to reopen it.`);
             }
             if (sessions.has(input.sessionId)) throw new Error("Session already open");
-            const session = new HerdrHarnessSession(input.sessionId, binding, deps);
-            sessions.set(input.sessionId, session);
+            const session = register(input.sessionId, binding, deps);
+            if (!session) return;
             try {
               await session.open(input.config, input.history, input.requestId);
+              if (closed) session.close();
             } catch (error) {
+              const closedMeanwhile = session.isAborted;
               session.close();
-              sessions.delete(input.sessionId);
-              throw error;
+              if (!closedMeanwhile) throw error;
             }
             return;
           }
@@ -248,7 +286,7 @@ export function createHerdrProvider(
           }); });
         },
         onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
-        async close() { closed = true; for (const session of sessions.values()) session.close(); sessions.clear(); listeners.clear(); },
+        async close() { closed = true; controller.abort(); for (const session of sessions.values()) session.close(); sessions.clear(); listeners.clear(); },
       } satisfies ProviderConnection;
     },
   };
