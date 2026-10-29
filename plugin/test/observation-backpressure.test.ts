@@ -158,6 +158,27 @@ it("drops the oldest queued notifications on overflow and reports them once as a
   expect(kept[0]).toBe(total - kept.length);
 });
 
+it("also bounds the queue by total queued characters: a few large lines evict the oldest, reported once", async () => {
+  const { fake: herdr, iterator } = await openStream();
+  const total = 200; // far below the line-count cap
+  const pad = "x".repeat(200 * 1024); // under the line size cap; 200 of them is ~40 MiB against a 16 MiB budget
+  for (let i = 0; i < total; i++) herdr.pushEvent({ event: "custom", data: { n: i, pad } });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const seen: SubscriptionEventEnvelope[] = [];
+  for (;;) {
+    const result = await iterator.next();
+    seen.push(result.value as SubscriptionEventEnvelope);
+    if (result.value?.event === "custom" && nOf(result.value) === total - 1) break;
+  }
+  expect(seen[0].event).toBe("observer.resync");
+  expect(seen.filter((envelope) => envelope.event === "observer.resync")).toHaveLength(1);
+  const kept = seen.slice(1).map(nOf);
+  expect(kept.length).toBeLessThan(total);
+  expect(kept.length * pad.length).toBeLessThanOrEqual(16 * 1024 * 1024);
+  // What survives is the newest contiguous tail.
+  expect(kept[0]).toBe(total - kept.length);
+});
+
 it("does not buffer an oversized line: it is dropped, reported once, and the stream carries on", async () => {
   const { fake: herdr, iterator } = await openStream();
   const stream = herdr.openSubscriptions[0];

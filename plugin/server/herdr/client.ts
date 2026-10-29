@@ -59,9 +59,10 @@ export const DEFAULT_BASE_DELAY_MS = 500;
 export const DEFAULT_MAX_DELAY_MS = 5000;
 export const DEFAULT_MAX_RECONNECT_ATTEMPTS = 20;
 
-/** Bounds on subscription backlog: a longer line or a deeper queue is dropped and reported as `observer.resync`. */
-const MAX_LINE_CHARS = 1024 * 1024;
+/** Bounds on subscription backlog: a longer line, a deeper queue or too many queued characters is dropped and reported as `observer.resync`. */
+const MAX_LINE_CHARS = 256 * 1024;
 const MAX_QUEUED_LINES = 1024;
+const MAX_QUEUED_CHARS = 16 * 1024 * 1024;
 
 /** Error raised when the server replies with an `error` envelope (incl. `events_lost`). */
 export class HerdrError extends Error {
@@ -312,7 +313,7 @@ export class HerdrClient {
       let lostSignaled = false;
       try {
         while (!closed) {
-          const lines = new AsyncQueue<string>(MAX_QUEUED_LINES);
+          const lines = new AsyncQueue<string>(MAX_QUEUED_LINES, MAX_QUEUED_CHARS, (line) => line.length);
           try {
             const sock = await connectSubscription(lines);
             if (closed) return;
@@ -510,23 +511,28 @@ export class HerdrClient {
 }
 
 /**
- * Bounded async queue used by the subscription stream. When full, the oldest value is dropped and the next `next()`
- * reports it once as `dropped`, so a consumer learns that something was lost without the queue ever growing.
+ * Bounded async queue used by the subscription stream. When it holds too many values, or too much by `sizeOf`, the
+ * oldest values are dropped and the next `next()` reports it once as `dropped`, so a consumer learns that something
+ * was lost without the queue ever growing.
  */
 class AsyncQueue<T> {
-  private items: Array<{ value: T } | { error: unknown }> = [];
+  private items: Array<{ value: T; size: number } | { error: unknown }> = [];
   private waiting: Array<(item: { value?: T; error?: unknown; dropped?: true }) => void> = [];
   private dropped = false;
+  private queuedSize = 0;
 
-  constructor(private readonly limit: number) {}
+  constructor(private readonly limit: number, private readonly sizeLimit: number, private readonly sizeOf: (value: T) => number) {}
 
   push(value: T): void {
-    if (!this.waiting.length && this.items.length >= this.limit) {
+    const size = this.sizeOf(value);
+    while (!this.waiting.length && (this.items.length >= this.limit || this.queuedSize + size > this.sizeLimit)) {
       const oldest = this.items.findIndex((item) => "value" in item);
-      if (oldest !== -1) this.items.splice(oldest, 1);
+      if (oldest === -1) break;
+      const [removed] = this.items.splice(oldest, 1);
+      if (removed && "size" in removed) this.queuedSize -= removed.size;
       this.dropped = true;
     }
-    this.deliver({ value });
+    this.deliver({ value, size });
   }
 
   pushError(error: unknown): void {
@@ -547,14 +553,18 @@ class AsyncQueue<T> {
     }
     const item = this.items.shift();
     if (item) {
+      if ("value" in item) this.queuedSize -= item.size;
       return Promise.resolve("value" in item ? { value: item.value } : { error: item.error });
     }
     return new Promise((resolve) => this.waiting.push(resolve));
   }
 
-  private deliver(item: { value: T } | { error: unknown }): void {
+  private deliver(item: { value: T; size: number } | { error: unknown }): void {
     const waiter = this.waiting.shift();
-    if (waiter) waiter(item);
-    else this.items.push(item);
+    if (waiter) waiter("value" in item ? { value: item.value } : item);
+    else {
+      this.items.push(item);
+      if ("value" in item) this.queuedSize += item.size;
+    }
   }
 }

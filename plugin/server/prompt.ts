@@ -83,6 +83,9 @@ export class PromptController {
       if (!session.current(generation)) return;
       if (outcome.type === "rejected") {
         state.tracker.rejectPending(outcome.message);
+        // `working` seen while delivery was in flight belongs to a terminal turn only if one was started; otherwise it
+        // must not suppress the late-`working` guard of the next turn (see LiveSession.doReadTranscript).
+        if (!state.tracker.activeTurn) state.workingSeen = false;
         state.pending = null;
       } else if (outcome.type === "uncertain") {
         state.tracker.pendingUncertain();
