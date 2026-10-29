@@ -312,9 +312,9 @@ it("close during launch aborts the launch and emits no session events afterwards
 });
 
 it("OMP launch args pass model and thinking and never disable extensions (the companion must load)", () => {
-  expect(ompAdapter.launchArgs({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
-  expect(ompAdapter.launchArgs(config)).toEqual([]);
-  expect(ompAdapter.launchArgs({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
+  expect(ompAdapter.launch!.args({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
+  expect(ompAdapter.launch!.args(config)).toEqual([]);
+  expect(ompAdapter.launch!.args({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
 });
 
 // --- P3.5A: configure capability, catalog and dispatch ---------------------------------------

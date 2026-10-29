@@ -2,7 +2,37 @@ import type { ProviderSessionConfig, ProviderTimelineItem } from "@getpaseo/plug
 import type { AgentSessionRef, PaneProcessInfo } from "../herdr/schema.js";
 
 export type NativeTurnEnd = "completed" | "aborted" | "error" | "unknown";
-export interface TranscriptLocator { path: string; nativeSessionKey: string; }
+
+/** How a session learns that a native turn ended: by reading the transcript, or from Herdr's agent status alone. */
+export type TurnEvidence = "transcript" | "status";
+
+/** How a session binds to its agent: a native session ref, or the pane itself. */
+export type BindingMode = "native-ref" | "pane";
+
+/** One Herdr request on a pinned connection/daemon (the session deps' `request`). */
+export type HerdrRequestFn = (method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }) => Promise<unknown>;
+
+/**
+ * Per-session pinned view of one Herdr pane. Never another daemon's: `request` is the connection the session
+ * opened, and `signal` covers the session lifetime (or a discovery-scoped snapshot).
+ */
+export interface PaneObservation {
+  readonly terminalId: string;
+  readonly herdrSession: string | null;
+  /** Current pane id; follows pane moves. */
+  paneId(): string | null;
+  /** The session's pinned Herdr request. */
+  request: HerdrRequestFn;
+  /** Session lifetime (or a discovery-scoped one). */
+  readonly signal: AbortSignal;
+}
+
+export interface TranscriptLocator {
+  path: string;
+  nativeSessionKey: string;
+  /** Live pane view for pane-bound sessions; adapters must not persist the locator. */
+  pane?: PaneObservation;
+}
 export interface TranscriptSnapshot {
   items: ProviderTimelineItem[];
   timestamps: Readonly<Record<string, string>>;
@@ -105,7 +135,8 @@ export type ResolveResult =
 /** P3.5B: a sibling native session forked off ours by another process. */
 export interface NativeFork { path: string; sessionId: string; }
 export interface TranscriptReader {
-  snapshot(): Promise<TranscriptSnapshot>;
+  /** `signal` aborts an in-flight re-read; readers may ignore it. */
+  snapshot(signal?: AbortSignal): Promise<TranscriptSnapshot>;
   /** Notify when the underlying transcript may have changed (P2A live sync). */
   subscribe(listener: () => void): () => void;
   close(): void;
@@ -114,15 +145,38 @@ export type PromptDelivery =
   | { type: "accepted" }
   | { type: "rejected"; message: string }
   | { type: "uncertain"; message: string };
-export type RestoredPromptOutcome = "cleared" | "kept" | "unsupported";
-export interface InputTarget { pid: number; ref: AgentSessionRef; }
+/** "unknown" = the harness could not tell (transport failure, identity mismatch, unrecognized reply). */
+export type RestoredPromptOutcome = "cleared" | "kept" | "unknown" | "unsupported";
+export interface InputTarget {
+  pid: number;
+  /** Null only when the adapter's binding mode is "pane". */
+  ref: AgentSessionRef | null;
+  /** Present for pane-bound sessions; process info as last validated. */
+  pane?: { paneId: string; terminalId: string; process: PaneProcessInfo };
+}
+/** How to start a new agent of this harness; absent = the harness is import/bind only. */
+export interface LaunchSpec {
+  /** Herdr `agent.start` kind; distinct from the adapter id, which owns persistence. */
+  readonly kind: string;
+  args(config: ProviderSessionConfig): string[];
+}
 export interface HarnessAdapter {
+  /** Persistence owner and `herdr-<id>` provider prefix (unchanged). */
   readonly id: string;
   readonly label: string;
   /** Plugin-directory-relative path to a self-contained SVG; Paseo shows it beside this harness's chats and import rows. */
   readonly icon?: string;
-  readonly herdrIntegration: string;
-  resolveTranscript(ref: AgentSessionRef | null, ctx: { cwd: string }): Promise<TranscriptLocator | null>;
+  /** Herdr `agent` values this adapter claims for new work; "any" = the fallback adapter. */
+  readonly nativeKinds: readonly string[] | "any";
+  /** Herdr integration this adapter requires; null = no integration required. */
+  readonly herdrIntegration: string | null;
+  /** Launch description; absent = import/bind only. */
+  readonly launch?: LaunchSpec;
+  /** How sessions bind to their agent: a native session ref, or the pane itself. */
+  readonly binding: BindingMode;
+  /** How a session learns that a native turn ended. */
+  readonly turnEvidence: TurnEvidence;
+  resolveTranscript(ref: AgentSessionRef | null, ctx: { cwd: string; pane?: PaneObservation }): Promise<TranscriptLocator | null>;
   nativeSessionKey(ref: AgentSessionRef): string;
   openTranscript(locator: TranscriptLocator): TranscriptReader;
   /** Process-local input endpoint; identity survives pane moves, not process replacement. */
@@ -133,7 +187,6 @@ export interface HarnessAdapter {
   }): Promise<PromptDelivery>;
   readonly interruptKeys: readonly string[];
   readonly promptWhileWorking: "reject";
-  launchArgs(config: ProviderSessionConfig): string[];
   isOccupant(proc: PaneProcessInfo): boolean;
   readonly blockedHint: string;
   /** Optional: input companion install check; a not-ok result keeps import read-only. */

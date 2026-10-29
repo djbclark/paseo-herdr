@@ -276,21 +276,24 @@ export async function configureOmp(
 }
 
 /**
- * Drop the prompt text OMP restored to its editor after an early Stop. One attempt, never retried. Anything that is
- * not an authenticated "cleared" is reported as kept; an older companion that doesn't know the op is "unsupported".
+ * Drop the prompt text OMP restored to its editor after an early Stop. One attempt, never retried. Only an
+ * authenticated "cleared" or "kept" reply is reported as such; a transport failure, an identity mismatch or
+ * any unrecognized reply is "unknown" (we cannot tell what the editor holds). An older companion that
+ * doesn't know the op is "unsupported".
  */
 export async function clearOmpRestoredPrompt(pid: number, ref: AgentSessionRef, instanceId: string, text: string, signal?: AbortSignal): Promise<RestoredPromptOutcome> {
-  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof instanceId !== "string" || instanceId.length === 0 || typeof text !== "string" || text.length === 0) return "kept";
+  if (!Number.isSafeInteger(pid) || pid <= 0 || typeof instanceId !== "string" || instanceId.length === 0 || typeof text !== "string" || text.length === 0) return "unknown";
   const nonce = randomUUID();
   const result = await roundTrip(pid, { op: "clearDraft", nonce, pid, ref, instanceId, text }, signal);
-  if (result.line === undefined) return "kept";
+  if (result.line === undefined) return "unknown";
   let reply: Record<string, unknown>;
-  try { reply = parseReply(result.line); } catch { return "kept"; }
-  if (!replyMatches(reply, pid, ref, nonce, instanceId)) return "kept";
+  try { reply = parseReply(result.line); } catch { return "unknown"; }
+  if (!replyMatches(reply, pid, ref, nonce, instanceId)) return "unknown";
   if (reply.type === "cleared") return "cleared";
   // An older companion rejects the unknown op as a bad request.
   if (reply.type === "rejected" && reply.code === "bad_request") return "unsupported";
-  return "kept";
+  if (reply.type === "kept") return "kept";
+  return "unknown";
 }
 
 const OUTCOMES = new Set(["approved", "denied", "answered", "cancelled", "timed_out", "chat"]);

@@ -597,7 +597,7 @@ describe("OMP companion clearDraft (restored prompt after an early Stop)", () =>
     expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n1", pid: process.pid, ref: REF, instanceId: "stale", text: TEXT })).code).toBe("identity_mismatch");
     expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n2", pid: process.pid + 1, ref: REF, instanceId: identity.instanceId, text: TEXT })).code).toBe("identity_mismatch");
     expect((await wireRequest(process.pid, { op: "clearDraft", nonce: "n3", pid: process.pid, ref: { kind: "path", value: "/other" }, instanceId: identity.instanceId, text: TEXT })).code).toBe("ref_mismatch");
-    await expect(clearOmpRestoredPrompt(process.pid, REF, "stale", TEXT)).resolves.toBe("kept");
+    await expect(clearOmpRestoredPrompt(process.pid, REF, "stale", TEXT)).resolves.toBe("unknown");
     expect(companion.state.draft).toBe(TEXT);
     expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
   });
@@ -610,7 +610,7 @@ describe("OMP companion clearDraft (restored prompt after an early Stop)", () =>
     else if (condition === "no UI") companion.ctx.hasUI = false;
     else if (condition === "subagent") companion.ctx.agent.kind = "sub";
     else companion.ctx.ui.getEditorText.mockImplementation(() => { throw new Error("boom"); });
-    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("kept");
+    await expect(clearOmpRestoredPrompt(process.pid, REF, identity.instanceId, TEXT)).resolves.toBe("unknown");
     expect(companion.ctx.ui.setEditorText).not.toHaveBeenCalled();
   });
 
@@ -630,10 +630,17 @@ describe("OMP companion clearDraft (restored prompt after an early Stop)", () =>
     await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("unsupported");
   });
 
-  it("treats a mismatched reply identity as kept", async () => {
+  it("reports unknown when the companion never replies", async () => {
+    await inputServer((_request, socket) => {
+      socket.end();
+    });
+    await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("unknown");
+  });
+
+  it("treats a mismatched reply identity as unknown", async () => {
     await inputServer((request, socket) => {
       socket.end(`${JSON.stringify({ nonce: "other", pid: PID, instanceId: INSTANCE, ref: REF, type: "cleared" })}\n`);
     });
-    await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("kept");
+    await expect(clearOmpRestoredPrompt(PID, REF, INSTANCE, TEXT)).resolves.toBe("unknown");
   });
 });

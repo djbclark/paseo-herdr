@@ -20,11 +20,30 @@ import { findOmpForks } from "./forks.js";
  * path itself. `nativeSessionKey` is the path, which is what Phase 0 used, so
  * stable timeline ids remain `omp:<path>:<entryId>:<kind>:<n>`.
  */
+
+/** OMP binds by native session ref; a null ref is a caller bug, never a pane-mode session. */
+function requireNativeRef(ref: AgentSessionRef | null): AgentSessionRef {
+  if (!ref) throw new Error("OMP requires a native session ref.");
+  return ref;
+}
+
 export const ompAdapter: HarnessAdapter = {
   id: "omp",
   label: "OMP",
   icon: "assets/omp-herdr.svg",
+  nativeKinds: ["omp"],
   herdrIntegration: "omp",
+  binding: "native-ref",
+  turnEvidence: "transcript",
+  launch: {
+    kind: "omp",
+    args: (config: ProviderSessionConfig): string[] => {
+      const args: string[] = [];
+      if (config.model) args.push("--model", config.model);
+      if (config.thinkingOption) args.push("--thinking", config.thinkingOption);
+      return args;
+    },
+  },
   resolveTranscript: async (ref) =>
     ref?.kind === "path" ? { path: ref.value, nativeSessionKey: ref.value } : null,
   nativeSessionKey: (ref) => ref.value,
@@ -77,9 +96,9 @@ export const ompAdapter: HarnessAdapter = {
       },
     };
   },
-  inspectInput: ({ pid, ref }, signal) => inspectOmpInput(pid, ref, signal),
-  submitPrompt: ({ pid, ref, instanceId }, text, { signal }) => submitOmpInput(pid, ref, instanceId, text, signal),
-  discardRestoredPrompt: ({ pid, ref, instanceId }, text, signal) => clearOmpRestoredPrompt(pid, ref, instanceId, text, signal),
+  inspectInput: ({ pid, ref }, signal) => inspectOmpInput(pid, requireNativeRef(ref), signal),
+  submitPrompt: ({ pid, ref, instanceId }, text, { signal }) => submitOmpInput(pid, requireNativeRef(ref), instanceId, text, signal),
+  discardRestoredPrompt: ({ pid, ref, instanceId }, text, signal) => clearOmpRestoredPrompt(pid, requireNativeRef(ref), instanceId, text, signal),
   findForks: findOmpForks,
   readConfig: ({ pid, ref, instanceId }, signal) => readOmpConfig(pid, ref, instanceId, signal),
   configure: ({ pid, ref, instanceId }, changes, signal) => configureOmp(pid, ref, instanceId, changes, signal),
@@ -87,12 +106,6 @@ export const ompAdapter: HarnessAdapter = {
   resolveApproval: ({ pid, ref, instanceId }, id, decision, signal) => resolveOmpApproval(pid, ref, instanceId, id, decision, signal),
   interruptKeys: ["esc"],
   promptWhileWorking: "reject",
-  launchArgs: (config: ProviderSessionConfig): string[] => {
-    const args: string[] = [];
-    if (config.model) args.push("--model", config.model);
-    if (config.thinkingOption) args.push("--thinking", config.thinkingOption);
-    return args;
-  },
   isOccupant: (proc: PaneProcessInfo): boolean =>
     proc.foreground_process_group_id !== null &&
     proc.foreground_process_group_id !== undefined &&

@@ -498,6 +498,14 @@ describe("checkHerdrStatus", () => {
     });
   });
 
+  it("skips the integration check for an adapter that needs no integration", async () => {
+    fake = await FakeHerdr.create();
+    fake.reply("ping", { type: "pong", version: "0.9.3", protocol: 22 });
+    const client = new HerdrClient(fake.socketPath);
+    await expect(checkHerdrStatus(client, null)).resolves.toEqual({ available: true });
+    expect(fake.requestsFor("integration.list")).toEqual([]);
+  });
+
   it("reports unavailable for an old Herdr version", async () => {
     fake = await FakeHerdr.create();
     fake.reply("ping", { type: "pong", version: "0.9.2", protocol: 21 });

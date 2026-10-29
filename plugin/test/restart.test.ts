@@ -10,7 +10,7 @@ const agentInfo = (over: object = {}) => ({ terminal_id: "t1", name: null, agent
 const proc = (pid: number, name: string) => ({ type: "pane_process_info", process_info: { pane_id: "w1:p1", foreground_process_group_id: pid, foreground_processes: [{ pid, name }] } });
 
 /** Scripted Herdr: OMP (pid 10) until SIGTERM, then the shell, then OMP again (pid 20) once started. */
-function rig(options: { name?: string; status?: string; exits?: boolean; startErrors?: Error[]; restartedRef?: typeof SESSION; ready?: boolean } = {}) {
+function rig(options: { name?: string; status?: string; exits?: boolean; startErrors?: Error[]; restartedRef?: typeof SESSION; ready?: boolean; kind?: string } = {}) {
   const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
   const signals: number[] = [];
   let phase: "old" | "shell" | "new" = "old";
@@ -22,7 +22,7 @@ function rig(options: { name?: string; status?: string; exits?: boolean; startEr
     signal: (pid: number) => { signals.push(pid); if (options.exits !== false) phase = "shell"; },
     request: async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params });
-      if (method === "agent.list") return { type: "agent_list", agents: phase === "shell" ? [] : [agentInfo({ name: options.name ?? null,
+      if (method === "agent.list") return { type: "agent_list", agents: phase === "shell" ? [] : [agentInfo({ agent: options.kind ?? "omp", name: options.name ?? null,
         ...(phase === "new" ? { agent_session: options.restartedRef ?? SESSION, interactive_ready: options.ready ?? true } : {}),
         agent_status: phase === "old" ? options.status ?? "idle" : "idle" })] };
       if (method === "pane.process_info") return phase === "old" ? proc(10, "omp") : phase === "shell" ? proc(5, "zsh") : proc(20, "omp");
@@ -93,6 +93,22 @@ it("retries only while Herdr still reports the pane busy", async () => {
   expect(error).toBeInstanceOf(RestartError);
   expect(String(error)).toMatch(/starting it again failed.*omp --resume \/s\/a.jsonl/);
   expect(failed.calls.filter((call) => call.method === "agent.start")).toHaveLength(1);
+});
+
+it("starts the agent with launch.kind when it differs from the adapter id", async () => {
+  const { deps, calls, signals } = rig({ kind: "omp-tui" });
+  const kindAdapter = { ...ompAdapter, launch: { kind: "omp-tui", args: () => [] } };
+  await expect(restartAgent(deps, kindAdapter, { terminalId: "t1", paneId: "w1:p1" })).resolves.toEqual({ pid: 20 });
+  expect(calls.find((call) => call.method === "agent.start")?.params).toMatchObject({ kind: "omp-tui" });
+  expect(signals).toEqual([10]);
+});
+
+it("refuses an adapter without launch before any request or signal", async () => {
+  const { deps, calls, signals } = rig();
+  const bindOnly = { ...ompAdapter, launch: undefined };
+  await expect(restartAgent(deps, bindOnly, { terminalId: "t1", paneId: "w1:p1" })).rejects.toThrow(/can't be restarted/);
+  expect(calls).toEqual([]);
+  expect(signals).toEqual([]);
 });
 
 it("refuses an agent that moved panes or has no saved session", async () => {

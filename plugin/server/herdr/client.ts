@@ -134,10 +134,12 @@ export interface HerdrStatus {
  * Probe a client's Herdr server and installed integration (IMPLEMENTATION.md §3
  * Phase 1 `status()`): resolve → `ping` → require `version` ≥ 0.9.3 → confirm
  * the integration is installed and current/outdated (`integration.list`).
+ * `integration === null` means the adapter requires no Herdr integration, so
+ * the version probe alone decides and `integration.list` is never sent.
  */
 export async function checkHerdrStatus(
   client: Pick<HerdrClient, "ping" | "integrationList">,
-  integration: string,
+  integration: string | null,
 ): Promise<HerdrStatus> {
   let ping: PingResult;
   try {
@@ -149,6 +151,7 @@ export async function checkHerdrStatus(
   if (!version || !versionAtLeast(version, MIN_HERDR_VERSION)) {
     return { available: false, diagnostic: "Herdr 0.9.3 or newer required" };
   }
+  if (integration === null) return { available: true };
   let list: IntegrationListResult;
   try {
     list = await client.integrationList();
