@@ -3,6 +3,12 @@ import { diffTimeline, hashItem } from "./timeline.js";
 import type { HerdrHarnessSession } from "./session.js";
 import { ForkWatcher } from "./forks.js";
 
+/**
+ * Minimum gap between notification-driven reconciles. A burst collapses into one trailing refresh, so a fast-output
+ * pane cannot outrun validation plus transcript reads; the first notification after a quiet spell still runs at once.
+ */
+const NOTIFY_MIN_INTERVAL_MS = 250;
+
 /** Scheduling only: binding, turn, connectivity and transcript state live in SessionState. */
 export class LiveSession {
   private running = false;
@@ -11,13 +17,17 @@ export class LiveSession {
   private streamController: AbortController | null = null;
   private streamEpoch = 0;
   private queue: Promise<void> = Promise.resolve();
+  /** The one reconcile that is queued behind the running work and has not started yet. */
+  private queuedReconcile: Promise<void> | null = null;
+  private notifyTimer: NodeJS.Timeout | undefined;
+  private lastNotifyAt = 0;
   private readonly forks: ForkWatcher;
 
   constructor(private readonly session: HerdrHarnessSession) { this.forks = new ForkWatcher(session); }
   start(): void {
     if (this.running || this.session.isAborted) return;
     this.running = true;
-    this.readerUnsubscribe = this.session.state.reader?.subscribe(() => { void this.reconcile(); }) ?? null;
+    this.readerUnsubscribe = this.session.state.reader?.subscribe(() => { this.notify(); }) ?? null;
     this.subscribePane();
     this.timer = setInterval(() => { void this.reconcile(); }, 2000);
     this.forks.start();
@@ -32,6 +42,8 @@ export class LiveSession {
     this.readerUnsubscribe = null;
     clearInterval(this.timer);
     this.timer = undefined;
+    clearTimeout(this.notifyTimer);
+    this.notifyTimer = undefined;
     clearTimeout(this.earlyAbortTimer);
     this.forks.stop();
   }
@@ -79,8 +91,9 @@ export class LiveSession {
       this.disconnected();
       return;
     }
-    // Even a valid socket acknowledgement is not a validated native session.
-    if (event.event === "observer.connected") { await this.reconcile(); return; }
+    // Even a valid socket acknowledgement is not a validated native session. A resync marker means notifications were
+    // dropped locally (see the client's queue bounds): one fresh snapshot recovers whatever they carried.
+    if (event.event === "observer.connected" || event.event === "observer.resync") { await this.reconcile(); return; }
     const data = event.data as Record<string, unknown> | undefined;
     if (event.event === "pane.agent_status_changed" || event.event === "pane_agent_status_changed") {
       const paneId = typeof data?.pane_id === "string" ? data.pane_id : subscribedPane;
@@ -88,7 +101,7 @@ export class LiveSession {
     }
     // Lifecycle events are deliberately re-resolved by terminal identity. Never
     // mutate our native ref from a global event for another pane.
-    await this.reconcile();
+    this.notify();
   }
 
   private serialize(work: () => Promise<void>): Promise<void> {
@@ -97,8 +110,30 @@ export class LiveSession {
     return next;
   }
   readTranscript(): Promise<void> { return this.serialize(() => this.doReadTranscript()); }
+
+  /** Ask for a refresh without waiting for it; bursts are spaced by NOTIFY_MIN_INTERVAL_MS. */
+  private notify(): void {
+    if (!this.running || this.notifyTimer) return;
+    const now = Date.now();
+    const wait = Math.min(NOTIFY_MIN_INTERVAL_MS, this.lastNotifyAt + NOTIFY_MIN_INTERVAL_MS - now);
+    const run = () => {
+      this.notifyTimer = undefined;
+      if (!this.running) return;
+      this.lastNotifyAt = Date.now();
+      void this.reconcile();
+    };
+    if (wait <= 0) run();
+    else this.notifyTimer = setTimeout(run, wait);
+  }
+
+  /**
+   * At most one reconcile waits behind the running work. It reads the state when it starts, so a caller that joins it
+   * observes state at least as new as its own call: the latest state wins and a burst never grows the queue.
+   */
   reconcile(): Promise<void> {
-    return this.serialize(async () => {
+    if (this.queuedReconcile) return this.queuedReconcile;
+    const next = this.serialize(async () => {
+      this.queuedReconcile = null;
       const session = this.session;
       if (session.isAborted || session.state.outcome !== "active") return;
       const generation = session.state.generation;
@@ -132,6 +167,8 @@ export class LiveSession {
         if (session.current(generation)) this.disconnected();
       }
     });
+    this.queuedReconcile = next;
+    return next;
   }
 
   private earlyAbortTimer: NodeJS.Timeout | undefined;

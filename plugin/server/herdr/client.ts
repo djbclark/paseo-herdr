@@ -33,7 +33,7 @@ export interface SubscriptionDescriptor {
 }
 
 export interface SubscriptionEventEnvelope {
-  /** Native event name, or synthetic observer.connected / observer.disconnected. */
+  /** Native event name, or synthetic observer.connected / observer.disconnected / observer.resync (local drop). */
   event: string;
   data: unknown;
   /** Set when events were dropped server-side (see `ReconnectOptions.onEventsLost`). */
@@ -58,6 +58,10 @@ export interface ReconnectOptions {
 export const DEFAULT_BASE_DELAY_MS = 500;
 export const DEFAULT_MAX_DELAY_MS = 5000;
 export const DEFAULT_MAX_RECONNECT_ATTEMPTS = 20;
+
+/** Bounds on subscription backlog: a longer line or a deeper queue is dropped and reported as `observer.resync`. */
+const MAX_LINE_CHARS = 1024 * 1024;
+const MAX_QUEUED_LINES = 1024;
 
 /** Error raised when the server replies with an `error` envelope (incl. `events_lost`). */
 export class HerdrError extends Error {
@@ -275,9 +279,10 @@ export class HerdrClient {
       });
     }
 
-    /** Feed complete newline-delimited lines from a socket into the queue. */
+    /** Feed complete newline-delimited lines from a socket into the queue; oversized lines are dropped, not buffered. */
     function attachReader(sock: Socket, lines: AsyncQueue<string>): void {
       let buffer = "";
+      let discarding = false; // inside the tail of a line already dropped for its size
       sock.setEncoding("utf8");
       sock.on("data", (chunk: string) => {
         buffer += chunk;
@@ -285,8 +290,15 @@ export class HerdrClient {
         while (newline !== -1) {
           const line = buffer.slice(0, newline);
           buffer = buffer.slice(newline + 1);
-          lines.push(line);
+          if (discarding) discarding = false;
+          else if (line.length > MAX_LINE_CHARS) lines.noteDropped();
+          else lines.push(line);
           newline = buffer.indexOf("\n");
+        }
+        if (buffer.length > MAX_LINE_CHARS) {
+          buffer = "";
+          if (!discarding) lines.noteDropped();
+          discarding = true;
         }
       });
       sock.on("error", (error) => lines.pushError(error));
@@ -300,7 +312,7 @@ export class HerdrClient {
       let lostSignaled = false;
       try {
         while (!closed) {
-          const lines = new AsyncQueue<string>();
+          const lines = new AsyncQueue<string>(MAX_QUEUED_LINES);
           try {
             const sock = await connectSubscription(lines);
             if (closed) return;
@@ -308,6 +320,7 @@ export class HerdrClient {
             const ack = await lines.next();
             if (closed) return;
             if (ack.error) throw ack.error;
+            if (ack.dropped) throw new Error("herdr subscription ack was dropped");
             self.assertAck(ack.value);
             attempt = 0;
             disconnected = false;
@@ -318,6 +331,11 @@ export class HerdrClient {
               const item = await lines.next();
               if (closed) return;
               if (item.error) throw item.error;
+              if (item.dropped) {
+                // Notifications were dropped locally; the consumer resyncs from a fresh snapshot.
+                yield { event: "observer.resync", data: undefined };
+                continue;
+              }
               const line = item.value;
               if (line === undefined) break;
               const envelope = self.parseEnvelope(line);
@@ -491,12 +509,23 @@ export class HerdrClient {
   }
 }
 
-/** Minimal bounded async queue used by the subscription stream. */
+/**
+ * Bounded async queue used by the subscription stream. When full, the oldest value is dropped and the next `next()`
+ * reports it once as `dropped`, so a consumer learns that something was lost without the queue ever growing.
+ */
 class AsyncQueue<T> {
   private items: Array<{ value: T } | { error: unknown }> = [];
-  private waiting: Array<(item: { value: T } | { error: unknown }) => void> = [];
+  private waiting: Array<(item: { value?: T; error?: unknown; dropped?: true }) => void> = [];
+  private dropped = false;
+
+  constructor(private readonly limit: number) {}
 
   push(value: T): void {
+    if (!this.waiting.length && this.items.length >= this.limit) {
+      const oldest = this.items.findIndex((item) => "value" in item);
+      if (oldest !== -1) this.items.splice(oldest, 1);
+      this.dropped = true;
+    }
     this.deliver({ value });
   }
 
@@ -504,7 +533,18 @@ class AsyncQueue<T> {
     this.deliver({ error });
   }
 
-  next(): Promise<{ value?: T; error?: unknown }> {
+  /** Record that data was discarded before reaching the queue (e.g. an oversized line). */
+  noteDropped(): void {
+    const waiter = this.waiting.shift();
+    if (waiter) waiter({ dropped: true });
+    else this.dropped = true;
+  }
+
+  next(): Promise<{ value?: T; error?: unknown; dropped?: true }> {
+    if (this.dropped) {
+      this.dropped = false;
+      return Promise.resolve({ dropped: true });
+    }
     const item = this.items.shift();
     if (item) {
       return Promise.resolve("value" in item ? { value: item.value } : { error: item.error });
