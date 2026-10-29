@@ -1,5 +1,5 @@
 import type { ProviderConfigChanges, ProviderEvent, ProviderPrompt, ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
-import type { HarnessAdapter, TranscriptReader, TranscriptSnapshot } from "./harness/types.js";
+import type { HarnessAdapter, RestoredPromptOutcome, TranscriptReader, TranscriptSnapshot } from "./harness/types.js";
 import { PaneProcessInfoResultSchema, type AgentInfo, type AgentStatus } from "./herdr/schema.js";
 import type { HerdrSubscription, SubscriptionDescriptor } from "./herdr/client.js";
 import { persistenceOf, sameRef, sessionRefOf, type Binding } from "./binding.js";
@@ -251,16 +251,19 @@ export class HerdrHarnessSession {
     const occupant = this.state.binding.occupant;
     const ref = this.state.binding.sessionRef;
     const label = this.adapter.label;
-    let outcome: "cleared" | "kept" | "unsupported" = "unsupported";
+    let outcome: RestoredPromptOutcome = "unsupported";
     try {
       if (this.adapter.discardRestoredPrompt && occupant && ref) {
         outcome = await this.adapter.discardRestoredPrompt({ pid: occupant.pid, ref, instanceId: occupant.instanceId }, text, this.signal);
       }
-    } catch { outcome = "kept"; }
+    } catch { /* the adapter could not tell: same as unsupported */ }
     if (outcome === "cleared" || !this.current(generation)) return;
+    // Only an adapter that answered "kept" saw the draft; with no answer nothing is known about the input box.
+    const restored = outcome === "kept";
     this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
-      id: "restored-prompt", severity: "info", title: `${label} put your message back in its input box`,
-      description: `The message was not sent. To remove it, clear the input box in the terminal (Herdr screen, then ⋯, then Open in terminal).`,
+      id: "restored-prompt", severity: "info",
+      title: restored ? `${label} put your message back in its input box` : `${label} may have kept your message in its input box`,
+      description: `${restored ? "The message was not sent." : "If the message was not sent, it may still be in the input box."} To remove it, clear the input box in the terminal (Herdr screen, then ⋯, then Open in terminal).`,
     } });
   }
 

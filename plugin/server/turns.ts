@@ -14,8 +14,9 @@ import type { AgentStatus } from "./herdr/schema.js";
  * - Sequential interaction: Paseo OR terminal, never both. A `working`/`blocked`
  *   observation with no pending Paseo submission starts an autonomous
  *   (terminal-originated) turn. A `working` observation that arrives while a
- *   pending submission is reserved reconciles against that submission rather
- *   than starting a duplicate.
+ *   pending submission is still being delivered is only remembered: the
+ *   delivery result (accepted/rejected) or the transcript entry decides whether
+ *   the work was ours, so a later rejection is never turned into an acceptance.
  * - A prompt result is emitted once: acceptance reports its reserved turn,
  *   uncertain delivery reports the reservation without claiming acceptance.
  * - A turn ends only after the adapter reports a known `NativeTurnEnd` from a final
@@ -64,7 +65,7 @@ export type TurnEffect =
 
 type Phase =
   | { kind: "idle" }
-  | { kind: "pending"; turnId: string; clientMessageId: string; since: number; responseReported: boolean; uncertainSince: number | null }
+  | { kind: "pending"; turnId: string; clientMessageId: string; since: number; responseReported: boolean; uncertainSince: number | null; busyDuringDelivery: boolean }
   | { kind: "active"; turnId: string; origin: TurnOrigin; since: number }
   | { kind: "ending"; turnId: string; origin: TurnOrigin };
 
@@ -114,7 +115,7 @@ export class TurnTracker {
     if (this.phase.kind !== "idle") {
       throw new Error("a turn is already in progress");
     }
-    this.phase = { kind: "pending", turnId: submission.turnId, clientMessageId: submission.clientMessageId, since: this.now(), responseReported: false, uncertainSince: null };
+    this.phase = { kind: "pending", turnId: submission.turnId, clientMessageId: submission.clientMessageId, since: this.now(), responseReported: false, uncertainSince: null, busyDuringDelivery: false };
   }
 
   /** `agent.prompt` was accepted; the pending submission becomes an active Paseo turn. */
@@ -126,16 +127,24 @@ export class TurnTracker {
     this.emit({ type: "turn", turnId, state: "started" });
   }
 
-  /** A definite rejection reports failure, or ends the turn if uncertainty was already reported. */
+  /**
+   * A definite rejection reports failure, or ends the turn if uncertainty was already reported. Work Herdr showed
+   * while the delivery was in flight was not ours (the agent refused our input), so it continues as a terminal turn.
+   */
   rejectPending(message: string): void {
     if (this.phase.kind !== "pending") return;
     if (this.phase.responseReported) {
       this.bindingLost(message);
       return;
     }
-    const { clientMessageId } = this.phase;
+    const { clientMessageId, busyDuringDelivery } = this.phase;
     this.phase = { kind: "idle" };
     this.emit({ type: "prompt_failed", clientMessageId, message });
+    if (busyDuringDelivery && (this.lastStatus === "working" || this.lastStatus === "blocked")) {
+      const turnId = `turn-${this.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      this.phase = { kind: "active", turnId, origin: "terminal", since: this.now() };
+      this.emit({ type: "turn", turnId, state: "started" });
+    }
   }
 
   /**
@@ -190,9 +199,9 @@ export class TurnTracker {
 
     if (status === "working" || status === "blocked") {
       if (this.phase.kind === "pending") {
-        // Reconcile a `working` event that raced the prompt response. An uncertain
-        // reservation is settled only by its transcript entry, never by status.
-        if (!this.phase.responseReported) this.acceptPending();
+        // The delivery result decides ownership: remember the status but do not accept while it is in flight, or a
+        // later definite rejection would be lost. An uncertain reservation is settled only by its transcript entry.
+        if (!this.phase.responseReported) this.phase.busyDuringDelivery = true;
       } else if (this.phase.kind === "idle") {
         const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 8)}`;
         this.phase = { kind: "active", turnId, origin: "terminal", since: now };

@@ -55,7 +55,8 @@ describe("TurnTracker", () => {
     tracker.acceptPending();
     tracker.pendingUncertain();
     tracker.rejectPending("A late rejection cannot undo the observed turn");
-    expect(effects.slice(0, 2)).toEqual([
+    // A `blocked` observation raised while delivery was in flight may emit its notice before the acceptance.
+    expect(effects.filter((effect) => effect.type !== "notice").slice(0, 2)).toEqual([
       { type: "prompt_accepted", clientMessageId: "m1", turnId: "t1" },
       { type: "turn", turnId: "t1", state: "started" },
     ]);
