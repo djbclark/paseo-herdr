@@ -795,6 +795,128 @@ describe("TurnTracker (status evidence)", () => {
     expect(tracker.nextDeadline).toBeNull();
   });
 
+  describe("a Stop on a failed turn never reaches a later turn (wave-3 B)", () => {
+    const terminalStates = (effects: TurnEffect[]) =>
+      turnEvents(effects).filter((effect) => effect.turnId !== "t1").map((effect) => effect.state);
+    const interruptNotices = (effects: TurnEffect[]) => effects.filter((effect) => effect.type === "notice" && effect.id === "interrupt-pending");
+
+    it("unknown-window expiry after Stop: the later terminal turn completes, with no stale interrupt notice", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { unknownBindingLossMs: 30_000, interruptPendingMs: 10_000 } });
+      reserve(tracker);
+      tracker.acceptPending();
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("working", 1));
+      advance(1_000);
+      tracker.interruptRequested();
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("unknown", 2));
+      advance(31_000);
+      tracker.observeStatusEvidence(evidence("unknown", 2));
+      expect(turnEvents(effects).map((effect) => `${effect.turnId}:${effect.state}`)).toEqual(["t1:started", "t1:failed"]);
+      expect(tracker.nextDeadline).toBeNull();
+      advance(6_000);
+      tracker.observeStatusEvidence(evidence("idle", 3));
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("working", 4));
+      advance(9_000);
+      tracker.observeStatusEvidence(evidence("idle", 5, 5));
+      expect(terminalStates(effects)).toEqual(["started", "completed"]);
+      expect(interruptNotices(effects)).toEqual([]);
+    });
+
+    it("unknown-window expiry after Stop: a new Paseo prompt is not canceled", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { unknownBindingLossMs: 30_000, idleSettleMs: 3_000 } });
+      reserve(tracker);
+      tracker.acceptPending();
+      tracker.observeStatusEvidence(evidence("working", 1));
+      tracker.interruptRequested();
+      tracker.observeStatusEvidence(evidence("unknown", 2));
+      advance(30_000);
+      tracker.observeStatusEvidence(evidence("unknown", 2));
+      expect(turnEvents(effects).at(-1)).toMatchObject({ turnId: "t1", state: "failed" });
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("idle", 3));
+      tracker.reservePending({ turnId: "t2", clientMessageId: "m-t2", baseline: { stateChangeSeq: 3, completionSeq: null } });
+      tracker.acceptPending();
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("working", 4));
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("idle", 5, 5));
+      expect(turnEvents(effects).filter((effect) => effect.turnId === "t2").map((effect) => effect.state)).toEqual(["started", "completed"]);
+    });
+
+    it("a binding loss on an uncertain reservation clears the armed Stop", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, interruptPendingMs: 10_000 } });
+      reserve(tracker);
+      tracker.pendingUncertain();
+      tracker.interruptRequested();
+      tracker.bindingLost("pane gone");
+      expect(turnEvents(effects).map((effect) => effect.state)).toEqual(["started", "failed"]);
+      expect(tracker.nextDeadline).toBeNull();
+      tracker.observeStatusEvidence(evidence("working", 1));
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("idle", 2, 2));
+      expect(terminalStates(effects)).toEqual(["started", "completed"]);
+    });
+
+    it("a connectivity give-up on an interrupted turn clears the armed Stop", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { reconnectGiveUpMs: 60_000, interruptPendingMs: 10_000 } });
+      reserve(tracker);
+      tracker.acceptPending();
+      tracker.observeStatusEvidence(evidence("working", 1));
+      tracker.interruptRequested();
+      tracker.observeConnectivityLost();
+      advance(61_000);
+      tracker.observeConnectivityRestored();
+      expect(turnEvents(effects).at(-1)).toMatchObject({ turnId: "t1", state: "failed" });
+      expect(tracker.nextDeadline).toBeNull();
+      tracker.observeStatusEvidence(evidence("idle", 2));
+      tracker.observeStatusEvidence(evidence("working", 3));
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("idle", 4, 4));
+      expect(terminalStates(effects)).toEqual(["started", "completed"]);
+      expect(interruptNotices(effects)).toEqual([]);
+    });
+  });
+
+  describe("the unknown clock never predates the turn (wave-3 C)", () => {
+    it("an unknown run before the reservation does not fail the fresh turn at its first unknown observation", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { unknownBindingLossMs: 30_000 } });
+      tracker.observeStatusEvidence(evidence("unknown", 1));
+      advance(40_000);
+      tracker.observeStatusEvidence(evidence("unknown", 1));
+      advance(1_000);
+      tracker.reservePending({ turnId: "t1", clientMessageId: "m-t1", baseline: { stateChangeSeq: 2, completionSeq: null } });
+      tracker.acceptPending();
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("unknown", 3));
+      expect(turnEvents(effects).map((effect) => effect.state)).toEqual(["started"]);
+      expect(tracker.nextDeadline).toBe(42_000 + 30_000);
+      advance(29_999);
+      tracker.observeStatusEvidence(evidence("unknown", 3));
+      expect(tracker.isActive).toBe(true);
+      advance(1);
+      tracker.observeStatusEvidence(evidence("unknown", 3));
+      expect(turnEvents(effects).map((effect) => effect.state)).toEqual(["started", "failed"]);
+    });
+
+    it("an unknown run during delivery does not count towards the accepted turn's window", () => {
+      const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { unknownBindingLossMs: 30_000 } });
+      reserve(tracker);
+      tracker.observeStatusEvidence(evidence("unknown", 0));
+      advance(25_000);
+      tracker.acceptPending();
+      advance(1_000);
+      tracker.observeStatusEvidence(evidence("unknown", 0));
+      advance(10_000); // 36 s after the first unknown, 10 s after the acceptance
+      tracker.observeStatusEvidence(evidence("unknown", 0));
+      expect(turnEvents(effects).map((effect) => effect.state)).toEqual(["started"]);
+      advance(20_000); // 30 s of unknown since the first one after acceptance
+      tracker.observeStatusEvidence(evidence("unknown", 0));
+      expect(turnEvents(effects).map((effect) => effect.state)).toEqual(["started", "failed"]);
+    });
+  });
+
   it("observeStatusEvidence is inert in transcript mode", () => {
     const { tracker, effects } = makeTracker();
     tracker.observeStatusEvidence(evidence("working", 5, 9));

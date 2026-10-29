@@ -165,7 +165,25 @@ export class TurnTracker {
       throw new Error("a turn is already in progress");
     }
     this.idleSince = null; // a new turn's idle hold must not inherit quiet time from before it started
+    this.clearInterrupt(); // a Stop on an earlier turn must never reach this one
+    this.restartUnknownClock();
     this.phase = { kind: "pending", turnId: submission.turnId, clientMessageId: submission.clientMessageId, since: this.now(), responseReported: false, uncertainSince: null, uncertainIdleSince: null, busyDuringDelivery: false, baseline: submission.baseline ?? null };
+  }
+
+  /** Drop every armed Stop (pending interrupt, its notice latch and the early-abort watch). */
+  private clearInterrupt(): void {
+    this.interruptedAt = null;
+    this.interruptNoticed = false;
+    this.earlyAbort = null;
+  }
+
+  /**
+   * Status evidence: the unknown window is measured "after the turn began", so an `unknown` run that started before
+   * the turn (admission's own listing does not feed the tracker) must not count towards it. Pane mode's binding-loss
+   * clock is a different rule and is left alone.
+   */
+  private restartUnknownClock(): void {
+    if (this.mode === "status") this.unknownSince = null;
   }
 
   /** `agent.prompt` was accepted; the pending submission becomes an active Paseo turn. */
@@ -175,6 +193,7 @@ export class TurnTracker {
     // Without an admission baseline (status mode), the last observed counters are the least-baseline that is still truthful.
     const start = baseline ?? (this.mode === "status" ? { stateChangeSeq: this.lastSeq, completionSeq: this.lastCompletion } : null);
     this.idleSince = null;
+    this.restartUnknownClock();
     this.phase = { kind: "active", turnId, origin: "paseo", since: this.now(),
       startSeq: start?.stateChangeSeq ?? 0, startCompletion: start?.completionSeq ?? null, activitySeen: false };
     if (!responseReported) this.emit({ type: "prompt_accepted", clientMessageId, turnId });
@@ -200,6 +219,7 @@ export class TurnTracker {
     if (busyDuringDelivery && (this.lastStatus === "working" || this.lastStatus === "blocked")) {
       const turnId = `turn-${this.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.idleSince = null;
+      this.clearInterrupt();
       this.phase = { kind: "active", turnId, origin: "terminal", since: this.now(), startSeq: this.lastSeq, startCompletion: this.lastCompletion, activitySeen: true };
       this.emit({ type: "turn", turnId, state: "started" });
     }
@@ -248,8 +268,7 @@ export class TurnTracker {
     if (this.phase.kind !== "pending" || !this.phase.responseReported) return false;
     const { turnId } = this.phase;
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
-    this.interruptNoticed = false;
+    this.clearInterrupt();
     this.emit({ type: "turn", turnId, state: "started" });
     this.emit({ type: "turn", turnId, state: "canceled", error: message });
     return true;
@@ -257,8 +276,7 @@ export class TurnTracker {
 
   private failUncertainReservation(turnId: string): void {
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
-    this.interruptNoticed = false;
+    this.clearInterrupt();
     this.emit({ type: "turn", turnId, state: "started" });
     this.emit({ type: "turn", turnId, state: "failed", error: UNCERTAIN_FAILURE });
   }
@@ -285,6 +303,7 @@ export class TurnTracker {
         if (!this.phase.responseReported) this.phase.busyDuringDelivery = true;
       } else if (this.phase.kind === "idle") {
         const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 8)}`;
+        this.clearInterrupt();
         this.phase = { kind: "active", turnId, origin: "terminal", since: now, startSeq: this.lastSeq, startCompletion: this.lastCompletion, activitySeen: true };
         this.emit({ type: "turn", turnId, state: "started" });
       }
@@ -372,6 +391,7 @@ export class TurnTracker {
       }
     } else if (this.phase.kind === "idle" && busy) {
       const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 8)}`;
+      this.clearInterrupt();
       this.phase = { kind: "active", turnId, origin: "terminal", since: now,
         startSeq: evidence.stateChangeSeq, startCompletion: evidence.completionSeq, activitySeen: true };
       this.emit({ type: "turn", turnId, state: "started" });
@@ -426,9 +446,7 @@ export class TurnTracker {
     // A pending interrupt means the turn was stopped (the status counters cannot tell a stop from a natural end).
     const state = this.interruptedAt !== null ? "canceled" : "completed";
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
-    this.interruptNoticed = false;
-    this.earlyAbort = null;
+    this.clearInterrupt();
     this.emit({ type: "turn", turnId, state });
     if (viaNoActivity && state === "completed") {
       // Nothing but idle was ever observed: the "turn" may only be slow to start, so the heuristic is labelled.
@@ -451,14 +469,14 @@ export class TurnTracker {
     if (this.phase.kind !== "ending") return;
     const { turnId } = this.phase;
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
-    this.interruptNoticed = false;
+    this.clearInterrupt();
     const state = end === "aborted" ? "canceled" : end === "error" ? "failed" : "completed";
     this.emit({ type: "turn", turnId, state });
   }
 
   /** The bound pane/agent disappeared or was replaced. */
   bindingLost(message: string): void {
+    this.clearInterrupt();
     if (this.phase.kind === "active" || this.phase.kind === "ending") {
       const { turnId } = this.phase;
       this.phase = { kind: "idle" };
@@ -498,6 +516,7 @@ export class TurnTracker {
       if (elapsed > this.thresholds.reconnectGiveUpMs) {
         const { turnId } = this.phase;
         this.phase = { kind: "idle" };
+        this.clearInterrupt();
         this.emit({
           type: "turn", turnId, state: "failed",
           error: "The observer lost Herdr and could not reconcile the in-flight turn; the agent may still be running in the terminal",
@@ -538,9 +557,7 @@ export class TurnTracker {
     if (this.earlyAbort.count < 2 || now - this.earlyAbort.since < this.thresholds.earlyAbortSettleMs) return "watching";
     const { turnId } = this.phase;
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
-    this.interruptNoticed = false;
-    this.earlyAbort = null;
+    this.clearInterrupt();
     this.emit({ type: "turn", turnId, state: "canceled", error: message });
     return "canceled";
   }
@@ -584,7 +601,7 @@ export class TurnTracker {
   /** Detach: drop state without emitting a terminal event (daemon discarded the session). */
   close(): void {
     this.phase = { kind: "idle" };
-    this.interruptedAt = null;
+    this.clearInterrupt();
     this.disconnectedSince = null;
     this.unknownSince = null;
     this.idleSince = null;
