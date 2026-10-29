@@ -23,6 +23,8 @@ export interface SessionDeps {
   subscribe(subscriptions: SubscriptionDescriptor[], options?: { signal?: AbortSignal }): Promise<HerdrSubscription>;
   emit(event: ProviderEvent): void;
   getHerdrSession?: () => string | null;
+  /** Claim a validated terminal, releasing the previous terminal after a move. */
+  claimPane?: (terminalId: string) => boolean;
   /** Create path: launch a new agent. Absent when the provider cannot create agents. */
   launch?(config: ProviderSessionConfig, signal: AbortSignal): Promise<LaunchResult>;
   /** Install-wide model list shared by every session of the provider (catalog source). */
@@ -338,6 +340,11 @@ export class HerdrHarnessSession {
     if (!this.current(generation) || this.state.outcome !== "active") return null;
     if (identity.pid !== pid || (previous && previous.instanceId !== identity.instanceId)) {
       this.freeze("The bound agent was replaced", "The process-local input identity changed; no input will be sent to the replacement.");
+      return null;
+    }
+    if (this.deps.claimPane && !this.deps.claimPane(agent.terminal_id)) {
+      this.freeze(`This ${this.adapter.label} agent is already open in another conversation`,
+        "This conversation is read-only; the other conversation keeps control of the running agent.");
       return null;
     }
     const moved = binding.terminalId !== agent.terminal_id || this.state.paneId !== agent.pane_id;

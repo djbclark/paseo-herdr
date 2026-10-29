@@ -69,7 +69,7 @@ async function rig() {
       config: entry === "bind" ? { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: agent.terminal_id } } } : config,
       ...(entry === "import" ? { persistence } : {}),
     });
-  return { fake, adapter, transcript, boundSessions, launched, launch, provider, connect, open, persistence };
+  return { fake, agent, adapter, transcript, boundSessions, launched, launch, provider, connect, open, persistence };
 }
 
 it.each(["bind", "import", "create"] as const)("abandons a %s waiting for its pinned socket when the connection closes", async (entry) => {
@@ -193,7 +193,7 @@ it.each(["session.close", "connection.close", "failure"] as const)("removes boun
   await second.ready("replacement");
 });
 
-it.each(["bind", "import", "create"] as const)("refuses a competing %s across providers, including while the first open is pending", async (entry) => {
+it.each(["bind", "create"] as const)("refuses a competing %s across providers, including while the first open is pending", async (entry) => {
   const world = await rig();
   const locator = await world.adapter.resolveTranscript(world.transcript.ref(), { cwd: "/work" });
   const gate = deferred<typeof locator>();
@@ -212,6 +212,65 @@ it.each(["bind", "import", "create"] as const)("refuses a competing %s across pr
   await second.ready("replacement");
 });
 
+it.each([false, true])("opens claimed persisted history read-only (owner pending: %s)", async (pending) => {
+  const world = await rig();
+  const locator = await world.adapter.resolveTranscript(world.transcript.ref(), { cwd: "/work" });
+  const gate = deferred<typeof locator>();
+  const resolving = vi.spyOn(world.adapter, "resolveTranscript");
+  if (pending) resolving.mockImplementationOnce(() => gate.promise);
+  const added = vi.spyOn(world.boundSessions, "add");
+  const submit = vi.spyOn(world.adapter, "submitPrompt");
+  const first = await world.connect();
+  const second = await world.connect();
+  await world.open(first.connection, "first");
+  if (pending) await vi.waitFor(() => expect(resolving).toHaveBeenCalledOnce());
+  else await first.ready("first");
+  await second.connection.send({ type: "session.open", requestId: "history", sessionId: "history", config,
+    persistence: world.persistence, history: "replay" });
+  await second.ready("history");
+  expect(second.events).toContainEqual(expect.objectContaining({ type: "session.opened", sessionId: "history" }));
+  expect(second.events).toContainEqual(expect.objectContaining({ type: "timeline.item", item: expect.objectContaining({ text: "Hello" }) }));
+  expect(second.events).toContainEqual(expect.objectContaining({ type: "session.notice", notice: expect.objectContaining({
+    title: "This Fake agent is already open in another conversation", description: expect.stringContaining("read-only"),
+  }) }));
+  expect(second.events.some((event) => event.type === "request.failed")).toBe(false);
+  await second.connection.send({ type: "session.prompt", sessionId: "history", prompt: {
+    clientMessageId: "readonly", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "No input" }] },
+  } });
+  await vi.waitFor(() => expect(second.events).toContainEqual(expect.objectContaining({
+    type: "session.prompt_result", clientMessageId: "readonly", result: expect.objectContaining({ type: "failed" }),
+  })));
+  expect(submit).not.toHaveBeenCalled();
+  if (pending) { gate.resolve(locator); await first.ready("first"); }
+  const owner = added.mock.calls[0][0];
+  await second.connection.close();
+  expect(await owner.validateAgent()).not.toBeNull();
+  expect(owner.state.outcome).toBe("active");
+  await first.connection.send({ type: "session.prompt", sessionId: "first", prompt: {
+    clientMessageId: "owner", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "Still controlled" }] },
+  } });
+  await vi.waitFor(() => expect(submit).toHaveBeenCalledOnce());
+});
+
+it("does not reserve a persisted pane before its agent is validated", async () => {
+  const world = await rig();
+  const locator = await world.adapter.resolveTranscript(world.transcript.ref(), { cwd: "/work" });
+  const gate = deferred<typeof locator>();
+  const resolving = vi.spyOn(world.adapter, "resolveTranscript").mockImplementationOnce(() => gate.promise);
+  const first = await world.connect();
+  const second = await world.connect();
+  await world.open(first.connection, "pending", "import");
+  await vi.waitFor(() => expect(resolving).toHaveBeenCalledOnce());
+  await world.open(second.connection, "live", "import");
+  await second.ready("live");
+  expect(second.events.some((event) => event.type === "session.notice")).toBe(false);
+  gate.resolve(locator);
+  await first.ready("pending");
+  expect(first.events).toContainEqual(expect.objectContaining({ type: "session.notice", notice: expect.objectContaining({
+    title: "This Fake agent is already open in another conversation",
+  }) }));
+});
+
 it("shares claims between connections of one provider and between different harness providers", async () => {
   const world = await rig();
   const provider = world.provider();
@@ -219,12 +278,77 @@ it("shares claims between connections of one provider and between different harn
   const second = await world.connect(provider);
   await world.open(first.connection, "first");
   await first.ready("first");
-  await world.open(second.connection, "second", "import");
+  await world.open(second.connection, "second");
   expect(await second.failure("second")).toMatchObject({ error: { message: "This Fake agent is already open in another conversation" } });
   const other = await world.connect(world.provider({ adapter: { ...world.adapter, id: "other", label: "Other" } }));
-  await other.connection.send({ type: "session.open", requestId: "other", sessionId: "other", config, history: "skip",
-    persistence: { ...world.persistence, data: { ...(world.persistence.data as Record<string, unknown>), harness: "other" } } });
+  world.fake.reply("agent.list", { type: "agent_list", agents: [{ ...world.agent, agent: "other" }] });
+  await other.connection.send({ type: "session.open", requestId: "other", sessionId: "other", history: "skip",
+    config: { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: "term-live" } } } });
   expect(await other.failure("other")).toMatchObject({ error: { message: "This Other agent is already open in another conversation" } });
+});
+
+it("moves a validated pane claim to its new terminal and releases both keys at the right time", async () => {
+  const world = await rig();
+  const added = vi.spyOn(world.boundSessions, "add");
+  const first = await world.connect();
+  await world.open(first.connection, "first");
+  await first.ready("first");
+  const owner = added.mock.calls[0][0];
+  const moved = { ...world.agent, terminal_id: "term-moved", pane_id: "pane-moved" };
+  world.fake.reply("agent.list", { type: "agent_list", agents: [moved] });
+  world.fake.reply("pane.process_info", { type: "pane_process_info", process_info: {
+    pane_id: "pane-moved", foreground_process_group_id: 77, tty: "/dev/pts/fake", foreground_processes: [{ pid: 77, name: "fake" }] } });
+  expect(await owner.validateAgent()).toEqual(moved);
+  expect(owner.state.binding.terminalId).toBe("term-moved");
+  expect(owner.state.outcome).toBe("active");
+  const second = await world.connect();
+  const movedConfig = { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: "term-moved" } } };
+  await second.connection.send({ type: "session.open", requestId: "competing", sessionId: "competing", config: movedConfig, history: "skip" });
+  expect(await second.failure("competing")).toMatchObject({ error: { message: "This Fake agent is already open in another conversation" } });
+  const replacement = { ...world.agent, agent_session: { ...world.agent.agent_session!, value: "replacement-session" } };
+  world.fake.reply("agent.list", { type: "agent_list", agents: [moved, replacement] });
+  world.fake.reply("pane.process_info", { type: "pane_process_info", process_info: {
+    pane_id: "pane-live", foreground_process_group_id: 88, tty: "/dev/pts/replacement", foreground_processes: [{ pid: 88, name: "fake" }] } });
+  await world.open(second.connection, "old-terminal");
+  await second.ready("old-terminal");
+  expect(added.mock.calls[1][0].state.outcome).toBe("active");
+  await first.connection.close();
+  world.fake.reply("pane.process_info", { type: "pane_process_info", process_info: {
+    pane_id: "pane-moved", foreground_process_group_id: 77, tty: "/dev/pts/fake", foreground_processes: [{ pid: 77, name: "fake" }] } });
+  const third = await world.connect();
+  await third.connection.send({ type: "session.open", requestId: "new-owner", sessionId: "new-owner", config: movedConfig, history: "skip" });
+  await third.ready("new-owner");
+  expect(added.mock.calls[2][0].state.outcome).toBe("active");
+});
+
+it("freezes a moving conversation when its destination terminal is already claimed", async () => {
+  const world = await rig();
+  const added = vi.spyOn(world.boundSessions, "add");
+  const first = await world.connect();
+  await world.open(first.connection, "first");
+  await first.ready("first");
+  const owner = added.mock.calls[0][0];
+  const moved = { ...world.agent, terminal_id: "term-moved" };
+  world.fake.reply("agent.list", { type: "agent_list", agents: [world.agent, moved] });
+  const second = await world.connect();
+  await second.connection.send({ type: "session.open", requestId: "destination", sessionId: "destination", history: "skip",
+    config: { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: "term-moved" } } } });
+  await second.ready("destination");
+  const destination = added.mock.calls[1][0];
+  world.fake.reply("agent.list", { type: "agent_list", agents: [moved] });
+  expect(await owner.validateAgent()).toBeNull();
+  expect(owner.state.outcome).toBe("readonly");
+  expect(owner.state.binding.terminalId).toBe("term-live");
+  expect(first.events).toContainEqual(expect.objectContaining({ type: "session.notice", notice: expect.objectContaining({
+    title: "This Fake agent is already open in another conversation",
+  }) }));
+  await first.connection.close();
+  expect(await destination.validateAgent()).not.toBeNull();
+  expect(destination.state.outcome).toBe("active");
+  const third = await world.connect();
+  await third.connection.send({ type: "session.open", requestId: "competing", sessionId: "competing", history: "skip",
+    config: { ...config, providerOptions: { [HERDR_BIND_OPTION]: { terminalId: "term-moved" } } } });
+  expect(await third.failure("competing")).toMatchObject({ error: { message: "This Fake agent is already open in another conversation" } });
 });
 
 it("does not acquire a late launch's claim after connection close", async () => {

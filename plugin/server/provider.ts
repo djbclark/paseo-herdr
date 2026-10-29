@@ -108,8 +108,19 @@ export function createHerdrProvider(
         if (!release) throw new Error(`This ${adapter.label} agent is already open in another conversation`);
         claims.set(session, release);
       };
-      const register = (sessionId: string, binding: Binding, deps: SessionDeps & { socketPath: string }): HerdrHarnessSession | null => {
+      const register = (sessionId: string, binding: Binding, deps: SessionDeps & { socketPath: string }, claimOnRegister = true): HerdrHarnessSession | null => {
         const session = new HerdrHarnessSession(sessionId, binding, deps);
+        deps.claimPane = (terminalId) => {
+          const binding = session.state.binding;
+          const release = paneClaims.move(deps.socketPath, binding.herdrSession, binding.terminalId, terminalId, session);
+          if (!release) {
+            claims.get(session)?.();
+            claims.delete(session);
+            return false;
+          }
+          claims.set(session, release);
+          return true;
+        };
         session.signal.addEventListener("abort", () => {
           if (sessions.get(sessionId) === session) sessions.delete(sessionId);
           hooks.boundSessions?.delete(session);
@@ -117,7 +128,7 @@ export function createHerdrProvider(
           claims.delete(session);
         }, { once: true });
         if (closed) { session.close(); return null; }
-        try { if (binding.terminalId) claim(session, deps.socketPath); }
+        try { if (claimOnRegister && binding.terminalId) claim(session, deps.socketPath); }
         catch (error) { session.close(); throw error; }
         sessions.set(sessionId, session);
         return session;
@@ -226,7 +237,7 @@ export function createHerdrProvider(
               throw new Error(`This conversation belongs to ${name(binding.herdrSession)}, but the Herdr plugin now targets ${name(target)}. Change the plugin's Herdr settings back to reopen it.`);
             }
             if (sessions.has(input.sessionId)) throw new Error("Session already open");
-            const session = register(input.sessionId, binding, deps);
+            const session = register(input.sessionId, binding, deps, false);
             if (!session) return;
             try {
               await session.open(input.config, input.history, input.requestId);
