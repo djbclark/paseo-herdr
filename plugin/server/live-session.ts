@@ -21,9 +21,18 @@ export class LiveSession {
   private queuedReconcile: Promise<void> | null = null;
   private notifyTimer: NodeJS.Timeout | undefined;
   private lastNotifyAt = 0;
+  /** Status-evidence mode: one reconcile timer armed for the tracker's next deadline. */
+  private deadlineTimer: NodeJS.Timeout | undefined;
   private readonly forks: ForkWatcher;
+  /** The adapter's `turnEvidence`: status mode drives turn ends from Herdr counters, not the transcript. */
+  private readonly statusEvidence: boolean;
 
-  constructor(private readonly session: HerdrHarnessSession) { this.forks = new ForkWatcher(session); }
+  constructor(private readonly session: HerdrHarnessSession) {
+    this.forks = new ForkWatcher(session);
+    this.statusEvidence = session.adapter.turnEvidence === "status";
+    // The session constructs the tracker before it is wired here; pin the adapter's evidence mode onto it.
+    if (this.statusEvidence) session.state.tracker.adoptEvidenceMode("status");
+  }
   start(): void {
     if (this.running || this.session.isAborted) return;
     this.running = true;
@@ -44,6 +53,8 @@ export class LiveSession {
     this.timer = undefined;
     clearTimeout(this.notifyTimer);
     this.notifyTimer = undefined;
+    clearTimeout(this.deadlineTimer);
+    this.deadlineTimer = undefined;
     clearTimeout(this.earlyAbortTimer);
     this.forks.stop();
   }
@@ -142,19 +153,27 @@ export class LiveSession {
         const agent = await session.validateAgent();
         if (!agent || !session.current(generation)) return;
         const state = session.state;
-        if (!state.tracker.activeTurn && (agent.agent_status === "working" || agent.agent_status === "blocked")) {
-          state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
-        }
-        const working = agent.agent_status === "working";
-        const echo = state.staleWorking;
-        if (!state.tracker.activeTurn && echo && working && state.snapshot?.lastTurnEndId === echo.endId) {
-          // Late `working` for a turn the transcript already ended: no news, so no phantom turn.
-          echo.echoed = true;
-          state.tracker.observeStatus("idle");
+        if (this.statusEvidence) {
+          // Status evidence: the tracker owns turn starts and ends from Herdr's counters alone; the transcript
+          // echo bookkeeping (turn baseline, staleWorking, workingSeen) below is transcript-mode machinery.
+          state.tracker.observeStatusEvidence({ status: agent.agent_status, stateChangeSeq: agent.state_change_seq, completionSeq: agent.completion_seq ?? null });
+          // A reservation the tracker resolved by itself (settled, failed or canceled) frees the pending slot.
+          if (state.pending && !state.tracker.activeTurn) state.pending = null;
         } else {
-          if (echo?.echoed && !working) state.staleWorking = null;
-          state.tracker.observeStatus(agent.agent_status);
-          if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
+          if (!state.tracker.activeTurn && (agent.agent_status === "working" || agent.agent_status === "blocked")) {
+            state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
+          }
+          const working = agent.agent_status === "working";
+          const echo = state.staleWorking;
+          if (!state.tracker.activeTurn && echo && working && state.snapshot?.lastTurnEndId === echo.endId) {
+            // Late `working` for a turn the transcript already ended: no news, so no phantom turn.
+            echo.echoed = true;
+            state.tracker.observeStatus("idle");
+          } else {
+            if (echo?.echoed && !working) state.staleWorking = null;
+            state.tracker.observeStatus(agent.agent_status);
+            if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
+          }
         }
         session.approvals.observeStatus(agent.agent_status);
         await this.doReadTranscript();
@@ -162,7 +181,9 @@ export class LiveSession {
         state.connected = true;
         state.tracker.observeConnectivityRestored();
         if (!wasConnected) session.approvals.connectivityRestored();
-        this.checkEarlyAbort(generation);
+        // Early abort is a transcript-evidence heuristic; in status mode the tracker's own end rules apply.
+        if (this.statusEvidence) this.armDeadline();
+        else this.checkEarlyAbort(generation);
       } catch {
         if (session.current(generation)) this.disconnected();
       }
@@ -172,6 +193,25 @@ export class LiveSession {
   }
 
   private earlyAbortTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * Status-evidence mode: arm one reconcile timer for the tracker's next deadline (an idle-settle or
+   * uncertain-settle boundary), so the deciding observation happens on the boundary instead of waiting for
+   * the poll interval. Re-armed on every reconcile; cleared in stop().
+   */
+  private armDeadline(): void {
+    if (this.deadlineTimer) {
+      clearTimeout(this.deadlineTimer);
+      this.deadlineTimer = undefined;
+    }
+    if (!this.running) return;
+    const deadline = this.session.state.tracker.nextDeadline;
+    if (deadline === null) return;
+    this.deadlineTimer = setTimeout(() => {
+      this.deadlineTimer = undefined;
+      void this.reconcile();
+    }, Math.max(deadline - Date.now(), 0));
+  }
 
   /**
    * A Stop that lands before the harness records the prompt leaves no transcript trace, so only Herdr's idle status plus
@@ -215,7 +255,9 @@ export class LiveSession {
     const oldUserIds = new Set(previous?.items.filter((item) => item.type === "user_message").map((item) => item.id) ?? []);
     const newUsers = snapshot.items.filter((item) => item.type === "user_message" && !oldUserIds.has(item.id));
     const pending = state.pending;
-    if (pending) {
+    // Status evidence: rows are still diffed and emitted below, but turn ownership never comes from the
+    // transcript — no user-row matching, no terminal-turn synthesis from new user rows.
+    if (!this.statusEvidence && pending) {
       const user = snapshot.items.find((item) => item.type === "user_message" && !pending.previousUserIds.has(item.id) && item.text === pending.text);
       if (user) {
         if (state.binding.submittedMessages[user.id] !== pending.clientMessageId) {
@@ -236,7 +278,7 @@ export class LiveSession {
           }
         }
       }
-    } else if (newUsers.length && !state.tracker.activeTurn) {
+    } else if (!this.statusEvidence && newUsers.length && !state.tracker.activeTurn) {
       state.turnBaselineEndId = previous?.lastTurnEndId ?? null;
       state.tracker.observeStatus("working");
       state.tracker.observeStatus(state.status);
@@ -251,9 +293,10 @@ export class LiveSession {
     }
     state.timeline = nextTimeline;
     state.snapshot = snapshot;
-    if (state.staleWorking && snapshot.lastTurnEndId !== state.staleWorking.endId) state.staleWorking = null;
+    if (!this.statusEvidence && state.staleWorking && snapshot.lastTurnEndId !== state.staleWorking.endId) state.staleWorking = null;
     session.onSnapshot(previous, snapshot);
-    if (state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
+    // The native-end block is transcript evidence; status-mode turns end inside observeStatusEvidence instead.
+    if (!this.statusEvidence && state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
         snapshot.turnState === "idle" && snapshot.lastTurnEndId && snapshot.lastTurnEndId !== state.turnBaselineEndId &&
         snapshot.lastTurnEnd && snapshot.lastTurnEnd !== "unknown") {
       state.tracker.observeNativeTurnEnd(snapshot.lastTurnEnd);

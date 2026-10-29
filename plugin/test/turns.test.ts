@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
+import type { TurnEvidence } from "../server/harness/types.js";
 import { TurnTracker, type TurnEffect, type TurnTrackerThresholds } from "../server/turns.js";
 
-function makeTracker(options: { thresholds?: Partial<TurnTrackerThresholds> } = {}) {
+function makeTracker(options: { thresholds?: Partial<TurnTrackerThresholds>; mode?: TurnEvidence } = {}) {
   const effects: TurnEffect[] = [];
   let clock = 0;
   const now = () => clock;
   const tracker = new TurnTracker({
+    mode: options.mode,
     now,
     thresholds: options.thresholds,
     onEffect: (effect) => effects.push(effect),
@@ -132,25 +134,40 @@ describe("TurnTracker", () => {
     ]);
   });
 
-  it("settles uncertain delivery only after native idle holds past the window", () => {
+  it("settles uncertain delivery only after native idle holds the window from its first observation", () => {
     const { tracker, effects, advance } = makeTracker({ thresholds: { uncertainSettleMs: 15_000 } });
     tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
     tracker.pendingUncertain();
     advance(10_000);
+    // The hold is measured from the first idle observation, not from the uncertainty report.
     expect(tracker.settleUncertain({ nativeIdle: true, foreignUserEntry: false })).toBe(false);
     advance(5_000);
-    expect(tracker.settleUncertain({ nativeIdle: false, foreignUserEntry: false })).toBe(false);
+    expect(tracker.settleUncertain({ nativeIdle: false, foreignUserEntry: false })).toBe(false); // hold broken
+    expect(tracker.settleUncertain({ nativeIdle: true, foreignUserEntry: false })).toBe(false); // hold restarts
     expect(tracker.isPending).toBe(true);
+    advance(15_000);
     expect(tracker.settleUncertain({ nativeIdle: true, foreignUserEntry: false })).toBe(true);
     expect(turnEvents(effects)).toEqual([
       { type: "turn", turnId: "t1", state: "started" },
-      { type: "turn", turnId: "t1", state: "failed", error: expect.stringContaining("was not resent") },
+      { type: "turn", turnId: "t1", state: "failed",
+        error: "Paseo could not confirm the prompt reached the agent; it was not resent. Check the terminal." },
     ]);
     expect(promptResults(effects)).toEqual([{ type: "prompt_uncertain", clientMessageId: "m1", turnId: "t1" }]);
     expect(tracker.activeTurn).toBeNull();
     expect(tracker.isUncertain).toBe(false);
     tracker.reservePending({ turnId: "t2", clientMessageId: "m2" });
     expect(tracker.activeTurn).toBe("t2");
+  });
+
+  it("does not settle on the first idle observation after a long turn (F6)", () => {
+    const { tracker, effects, advance } = makeTracker({ thresholds: { uncertainSettleMs: 15_000 } });
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
+    tracker.pendingUncertain();
+    // The delivery landed and the agent worked past the whole settle window without a transcript match.
+    advance(16_000);
+    expect(tracker.settleUncertain({ nativeIdle: true, foreignUserEntry: false })).toBe(false);
+    expect(tracker.isPending).toBe(true);
+    expect(turnEvents(effects)).toEqual([]);
   });
 
   it("settles uncertain delivery immediately when a foreign user entry appears", () => {
@@ -414,6 +431,246 @@ describe("TurnTracker", () => {
     tracker.bindingLost("Binding disappeared after close");
     tracker.observeNativeTurnEnd("completed");
     expect(effects).toEqual(before);
+    expect(tracker.activeTurn).toBeNull();
+  });
+
+  it("a rejection can skip the synthesized terminal turn (SC fold-in F2)", () => {
+    const plain = makeTracker();
+    plain.tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
+    plain.tracker.observeStatus("working");
+    plain.tracker.rejectPending("Agent is busy");
+    expect(plain.effects.filter((effect) => effect.type !== "notice")).toEqual([
+      { type: "prompt_failed", clientMessageId: "m1", message: "Agent is busy" },
+      { type: "turn", turnId: expect.any(String), state: "started" },
+    ]);
+    const quiet = makeTracker();
+    quiet.tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
+    quiet.tracker.observeStatus("working");
+    quiet.tracker.rejectPending("Agent is busy", { startTerminalTurn: false });
+    expect(quiet.effects).toEqual([{ type: "prompt_failed", clientMessageId: "m1", message: "Agent is busy" }]);
+    expect(quiet.tracker.activeTurn).toBeNull();
+    expect(quiet.tracker.isPending).toBe(false);
+  });
+
+  it("cancelUncertain ends an uncertain reservation as canceled exactly once", () => {
+    const { tracker, effects } = makeTracker();
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
+    expect(tracker.cancelUncertain("Stopped before delivery was confirmed")).toBe(false);
+    tracker.pendingUncertain();
+    expect(tracker.cancelUncertain("Stopped. Paseo could not confirm delivery; nothing was resent.")).toBe(true);
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "canceled", error: "Stopped. Paseo could not confirm delivery; nothing was resent." },
+    ]);
+    expect(tracker.cancelUncertain("Second Stop")).toBe(false);
+    expect(tracker.activeTurn).toBeNull();
+    tracker.reservePending({ turnId: "t2", clientMessageId: "m2" });
+    expect(tracker.activeTurn).toBe("t2");
+  });
+
+  it("an uncertain prompt result carries the adapter's message when given", () => {
+    const { tracker, effects } = makeTracker();
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1" });
+    tracker.pendingUncertain("the companion did not answer");
+    expect(promptResults(effects)).toEqual([
+      { type: "prompt_uncertain", clientMessageId: "m1", turnId: "t1", message: "the companion did not answer" },
+    ]);
+    const bare = makeTracker();
+    bare.tracker.reservePending({ turnId: "t2", clientMessageId: "m2" });
+    bare.tracker.pendingUncertain();
+    expect(promptResults(bare.effects)).toEqual([{ type: "prompt_uncertain", clientMessageId: "m2", turnId: "t2" }]);
+  });
+});
+
+describe("TurnTracker (status evidence)", () => {
+  const reserve = (tracker: TurnTracker, turnId = "t1") =>
+    tracker.reservePending({ turnId, clientMessageId: `m-${turnId}`, baseline: { stateChangeSeq: 0, completionSeq: null } });
+  const evidence = (status: Parameters<TurnTracker["observeStatusEvidence"]>[0]["status"], stateChangeSeq = 0, completionSeq: number | null = null) =>
+    ({ status, stateChangeSeq, completionSeq });
+
+  it("ends an accepted turn only after idle holds the settle window (2.9 s no, 3.0 s yes)", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    reserve(tracker);
+    tracker.acceptPending();
+    tracker.observeStatusEvidence(evidence("working", 1));
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    advance(2_900);
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(turnEvents(effects)).toEqual([{ type: "turn", turnId: "t1", state: "started" }]);
+    advance(100);
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "completed" },
+    ]);
+    expect(effects.filter((effect) => effect.type === "notice")).toEqual([]);
+  });
+
+  it("restarts the idle clock when work interrupts the hold", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    reserve(tracker);
+    tracker.acceptPending();
+    tracker.observeStatusEvidence(evidence("idle", 1));   // hold starts
+    advance(2_000);
+    tracker.observeStatusEvidence(evidence("working", 1)); // hold broken
+    advance(500);
+    tracker.observeStatusEvidence(evidence("idle", 1));    // hold restarts
+    advance(2_900);
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(turnEvents(effects)).toHaveLength(1);
+    advance(100);
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(turnEvents(effects)).toHaveLength(2);
+  });
+
+  it("ends at once when completionSeq advanced at the first idle poll (a turn that finished between polls)", () => {
+    const { tracker, effects } = makeTracker({ mode: "status" });
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1", baseline: { stateChangeSeq: 4, completionSeq: 2 } });
+    tracker.acceptPending();
+    tracker.observeStatusEvidence(evidence("done", 4, 3));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "completed" },
+    ]);
+  });
+
+  it("a stateChangeSeq advance alone settles on the short window, with no notice", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1", baseline: { stateChangeSeq: 5, completionSeq: null } });
+    tracker.acceptPending();
+    tracker.observeStatusEvidence(evidence("idle", 6));
+    advance(3_000);
+    tracker.observeStatusEvidence(evidence("idle", 6));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "completed" },
+    ]);
+    expect(effects.filter((effect) => effect.type === "notice" && effect.id === "no-activity")).toEqual([]);
+  });
+
+  it("with no evidence at all, settles on the long window with an info notice", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    tracker.reservePending({ turnId: "t1", clientMessageId: "m1", baseline: { stateChangeSeq: 5, completionSeq: null } });
+    tracker.acceptPending();
+    tracker.observeStatusEvidence(evidence("idle", 5));
+    advance(14_900);
+    tracker.observeStatusEvidence(evidence("idle", 5));
+    expect(turnEvents(effects)).toHaveLength(1);
+    advance(100);
+    tracker.observeStatusEvidence(evidence("idle", 5));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "completed" },
+    ]);
+    expect(effects.filter((effect) => effect.type === "notice")).toEqual([
+      { type: "notice", id: "no-activity", severity: "info", title: "Turn ended with no activity observed",
+        description: expect.stringContaining("no state change") },
+    ]);
+  });
+
+  it("a terminal-originated turn uses the same end rules", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    tracker.observeStatusEvidence(evidence("working", 3));
+    expect(turnEvents(effects)).toEqual([{ type: "turn", turnId: expect.any(String), state: "started" }]);
+    tracker.observeStatusEvidence(evidence("idle", 4));
+    advance(3_000);
+    tracker.observeStatusEvidence(evidence("idle", 4));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: expect.any(String), state: "started" },
+      { type: "turn", turnId: expect.any(String), state: "completed" },
+    ]);
+    expect(promptResults(effects)).toEqual([]);
+  });
+
+  it("accepts an uncertain reservation when the pane shows work", () => {
+    const { tracker, effects } = makeTracker({ mode: "status" });
+    reserve(tracker);
+    tracker.pendingUncertain();
+    tracker.observeStatusEvidence(evidence("working", 1));
+    expect(tracker.isActive).toBe(true);
+    expect(promptResults(effects)).toEqual([{ type: "prompt_uncertain", clientMessageId: "m-t1", turnId: "t1" }]);
+    expect(turnEvents(effects)).toEqual([{ type: "turn", turnId: "t1", state: "started" }]);
+  });
+
+  it("accepts an uncertain reservation on a state-change advance alone", () => {
+    const { tracker, effects } = makeTracker({ mode: "status" });
+    reserve(tracker);
+    tracker.observeStatusEvidence(evidence("idle", 0)); // counters observed during delivery
+    tracker.pendingUncertain();
+    tracker.observeStatusEvidence(evidence("idle", 1)); // the pane moved without a status flip
+    expect(tracker.isActive).toBe(true);
+    expect(turnEvents(effects)).toEqual([{ type: "turn", turnId: "t1", state: "started" }]);
+  });
+
+  it("fails an uncertain reservation only after idle holds the full window", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { uncertainSettleMs: 15_000 } });
+    reserve(tracker);
+    tracker.pendingUncertain();
+    tracker.observeStatusEvidence(evidence("idle", 0));
+    advance(14_900);
+    tracker.observeStatusEvidence(evidence("idle", 0));
+    expect(tracker.isUncertain).toBe(true);
+    advance(100);
+    tracker.observeStatusEvidence(evidence("idle", 0));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: "t1", state: "started" },
+      { type: "turn", turnId: "t1", state: "failed",
+        error: "Paseo could not confirm the prompt reached the agent; it was not resent. Check the terminal." },
+    ]);
+    expect(tracker.activeTurn).toBeNull();
+  });
+
+  it("tolerates an unknown status without ending a turn or running the binding-loss clock", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { unknownBindingLossMs: 30_000, idleSettleMs: 3_000, noActivitySettleMs: 15_000 } });
+    tracker.observeStatusEvidence(evidence("working", 2));
+    advance(31_000);
+    tracker.observeStatusEvidence(evidence("unknown", 2));
+    tracker.observeStatusEvidence(evidence("unknown", 2));
+    expect(turnEvents(effects)).toEqual([{ type: "turn", turnId: expect.any(String), state: "started" }]);
+    expect(tracker.isActive).toBe(true);
+    tracker.observeStatusEvidence(evidence("done", 3, 1));
+    expect(turnEvents(effects)).toEqual([
+      { type: "turn", turnId: expect.any(String), state: "started" },
+      { type: "turn", turnId: expect.any(String), state: "completed" },
+    ]);
+  });
+
+  it("records an interrupt for an uncertain reservation and keeps it through acceptance", () => {
+    const { tracker, effects, advance } = makeTracker({ mode: "status", thresholds: { interruptPendingMs: 10_000 } });
+    reserve(tracker);
+    tracker.pendingUncertain();
+    tracker.interruptRequested(); // valid on pending+reported; no notice yet
+    expect(effects.filter((effect) => effect.type === "notice")).toEqual([]);
+    tracker.observeStatusEvidence(evidence("working", 1));
+    advance(10_500);
+    tracker.observeStatusEvidence(evidence("working", 1));
+    expect(effects.filter((effect) => effect.type === "notice" && effect.id === "interrupt-pending")).toHaveLength(1);
+  });
+
+  it("nextDeadline exposes the earliest settle boundary, and null when nothing is time-sensitive", () => {
+    const { tracker, advance } = makeTracker({ mode: "status", thresholds: { idleSettleMs: 3_000, noActivitySettleMs: 15_000, uncertainSettleMs: 15_000 } });
+    expect(tracker.nextDeadline).toBeNull();
+    tracker.observeStatusEvidence(evidence("idle", 0));
+    reserve(tracker);
+    tracker.acceptPending();
+    expect(tracker.nextDeadline).toBeNull(); // never observed idle while active
+    tracker.observeStatusEvidence(evidence("idle", 1)); // activity: seq advanced past the baseline
+    expect(tracker.nextDeadline).toBe(3_000);
+    advance(3_000);
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(tracker.activeTurn).toBeNull();
+    expect(tracker.nextDeadline).toBeNull();
+    tracker.reservePending({ turnId: "t2", clientMessageId: "m2" });
+    tracker.pendingUncertain();
+    expect(tracker.nextDeadline).toBeNull(); // not idle yet
+    tracker.observeStatusEvidence(evidence("idle", 1));
+    expect(tracker.nextDeadline).toBe(18_000); // 3_000 + 15_000 held from the first idle observation
+  });
+
+  it("observeStatusEvidence is inert in transcript mode", () => {
+    const { tracker, effects } = makeTracker();
+    tracker.observeStatusEvidence(evidence("working", 5, 9));
+    expect(effects).toEqual([]);
     expect(tracker.activeTurn).toBeNull();
   });
 });

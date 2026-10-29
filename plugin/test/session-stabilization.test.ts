@@ -226,7 +226,12 @@ it("settles an uncertain prompt once native idle holds past the window, then adm
   expect(events.filter((event) => event.type === "session.prompt_result" && event.clientMessageId === "refused"))
     .toMatchObject([{ result: { type: "failed", error: { message: "Agent is already working" } } }]);
   expect(turns(events)).toEqual([]);
+  // F6: the settle clock starts at the first idle evidence (+10 s), not at the uncertainty, so
+  // 16 s after the report is not enough; 15 s of continuous idle is.
   vi.setSystemTime(Date.now() + 6_000);
+  await session.live.reconcile();
+  expect(turns(events)).toEqual([]);
+  vi.setSystemTime(Date.now() + 9_000);
   await session.live.reconcile();
   expect(turns(events).map((event) => event.state)).toEqual(["started", "failed"]);
   expect(session.state.tracker.activeTurn).toBeNull();
