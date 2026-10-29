@@ -210,8 +210,8 @@ it("flags agents without an input endpoint and offers an in-place restart", asyn
 it("restarts through the injected routine and refuses an agent that is gone", async () => {
   seed();
   const { call } = setup({ restart: async (_deps, adapter) => { expect(adapter.id).toBe("omp"); return { pid: 99 }; } });
-  expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).toEqual({ pid: 99 });
-  await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" })).rejects.toThrow(/no longer running/);
+  expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).toEqual({ pid: 99 });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" }, list([]))).rejects.toThrow(/no longer running/);
 });
 
 // --- F3 routing + F4 duplicates -----------------------------------------------------------------------------
@@ -259,7 +259,79 @@ it("the restart RPC refuses an adapter that cannot launch, before touching the p
   seed();
   const generic = makeFakeAdapter(undefined, { id: "generic", nativeKinds: "any", launch: null });
   const { call } = setup({ harnesses: [generic], resolver: createResolver([generic]) });
-  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).rejects.toThrow(/can't be restarted from Paseo/);
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).rejects.toThrow(/can't be restarted from Paseo/);
   expect(fake.requestsFor("agent.start")).toHaveLength(0);
+  expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
+});
+
+it("the restart RPC refuses a disabled adapter before restarting anything", async () => {
+  seed();
+  let restarted = false;
+  const { call } = setup({
+    readTarget: async () => ({ target: target(fake.socketPath), ompEnabled: false, enabled: (adapterId: string) => adapterId !== "omp" }),
+    restart: async () => { restarted = true; return { pid: 1 }; },
+  });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).rejects.toThrow(/turned off in the Herdr plugin settings/);
+  expect(restarted).toBe(false);
+});
+
+it("the restart RPC refuses to guess the owner adapter when the chat list fails", async () => {
+  seed();
+  let restarted = false;
+  const { call } = setup({ restart: async () => { restarted = true; return { pid: 1 }; } });
+  const failing = { agents: { list: async () => { throw new Error("paseo offline"); } } };
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, failing)).rejects.toThrow(/chat list is unavailable \(paseo offline\)/);
+  expect(restarted).toBe(false);
+});
+
+// --- B6: pane-mode liveness follows the process, not just the terminal ---------------------------------------
+const paneChat = (id: string, occupant: { pid: number; tty: string | null } | null, extra: object = {}) => ({
+  id, provider: "herdr-panefake", archivedAt: null,
+  title: id, cwd: "/a", status: "idle", updatedAt: "2026-10-13T10:00:00Z", lastUserMessageAt: null,
+  persistence: { provider: "herdr-panefake", sessionId: "x", metadata: { pluginProviderPersistence: persistenceOf({
+    harness: "panefake", herdrSession: "work", terminalId: "t-p1", agentName: null, sessionRef: null, cwd: "/a", submittedMessages: {},
+    ...(occupant ? { occupant: { ...occupant, instanceId: "fake-instance" } } : {}),
+  }) } },
+  ...extra,
+});
+function paneRow(foreground: { pid: number; tty?: string } | "unreadable") {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [agent("p1", "tab1", "panefake", null)] });
+  if (foreground === "unreadable") fake.replyError("pane.process_info", "pane_not_found");
+  else fake.reply("pane.process_info", { type: "pane_process_info", process_info: { pane_id: "p1", foreground_process_group_id: foreground.pid, tty: foreground.tty ?? "/dev/pts/1", foreground_processes: [{ pid: foreground.pid, name: "panefake" }] } });
+  const paneAdapter = makeFakeAdapter(undefined, { id: "panefake", nativeKinds: ["panefake"], binding: "pane" });
+  const { call } = setup({ harnesses: [paneAdapter], resolver: createResolver([paneAdapter]) });
+  return async (chats: unknown[]) => (await call(herdrOverviewRpc, {}, list(chats))).workspaces[0].tabs[0].agents[0];
+}
+
+it("a pane-mode chat whose agent was replaced in the terminal no longer owns the row, nor is reported as a duplicate", async () => {
+  const row = await paneRow({ pid: 99 })([
+    paneChat("replaced", { pid: 41, tty: "/dev/pts/1" }, { updatedAt: "2026-10-13T11:00:00Z" }),
+    paneChat("current", { pid: 99, tty: "/dev/pts/1" }, { updatedAt: "2026-10-13T09:00:00Z" }),
+  ]);
+  // The newest chat is the frozen one: it must neither win "Open chat" nor push the live chat into duplicates.
+  expect(row.paseoAgentId).toBe("current");
+  expect(row.duplicateChatIds).toEqual([]);
+});
+
+it("a terminal whose pane-mode chats were all replaced offers a fresh bind instead of a frozen chat", async () => {
+  const row = await paneRow({ pid: 99 })([paneChat("replaced", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBeNull();
+  expect(row.provider).toBe("herdr-panefake");
+});
+
+it("a pane-mode chat is replaced by a different tty even at the same pid", async () => {
+  const row = await paneRow({ pid: 41, tty: "/dev/pts/9" })([paneChat("old", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBeNull();
+});
+
+it("a pane-mode chat stays live when the process cannot be read", async () => {
+  const row = await paneRow("unreadable")([paneChat("bound", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBe("bound");
+});
+
+it("a pane-mode chat that never bound a process stays live and costs no process read", async () => {
+  const row = await paneRow({ pid: 99 })([paneChat("never-validated", null)]);
+  expect(row.paseoAgentId).toBe("never-validated");
   expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
 });

@@ -14,7 +14,7 @@ import { attachArgs, attachCommand } from "./herdr-commands.js";
 import { resolveSocketPath } from "./herdr/socket-path.js";
 import { HerdrClient } from "./herdr/client.js";
 import { listPaneTargets } from "./herdr/targets.js";
-import { type AgentInfo, PaneProcessInfoResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
+import { type AgentInfo, type PaneProcessInfo, PaneProcessInfoResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
 import type { ReadyTarget } from "./herdr/target.js";
 import type { HarnessAdapter } from "./harness/types.js";
 import { adapterAcceptsKind, createResolver, type AdapterResolver } from "./harness/resolve.js";
@@ -92,6 +92,8 @@ export interface HerdrChat {
   cwd: string;
   /** Latest user message or chat update; the newest chat wins when several are bound to one agent. */
   lastActivityAt: string;
+  /** The foreground process the chat was bound to, when the session had validated one (pane-mode liveness). */
+  occupant?: { pid: number; tty: string | null };
 }
 
 /** Every unarchived Paseo chat owned by one of the registered harness providers. */
@@ -112,6 +114,7 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
           harnessId: adapter.id, sessionRef: binding.sessionRef,
           title: agent.title ?? null, cwd: agent.cwd,
           lastActivityAt: activityTime(agent.lastUserMessageAt, agent.updatedAt),
+          ...(binding.occupant ? { occupant: { pid: binding.occupant.pid, tty: binding.occupant.tty } } : {}),
         });
       } catch {
         // Foreign or corrupt persistence: ignore.
@@ -132,8 +135,45 @@ function activityTime(userMessageAt: string | null | undefined, updatedAt: strin
   return userMessageAt && timestamp(userMessageAt) > timestamp(updatedAt) ? userMessageAt : updatedAt;
 }
 
+/** The foreground process of terminals hosting a pane-mode chat that bound a process; `null` when Herdr could not say. */
+type PaneProcesses = ReadonlyMap<string, PaneProcessInfo | null>;
+
+/**
+ * Pane-mode bindings carry no native session ref, so the persisted occupant is the only evidence that the
+ * agent in the terminal is still the one the chat was bound to. Reads one `pane.process_info` per such
+ * terminal; a terminal nobody bound a process to costs nothing.
+ */
+async function paneProcesses(
+  chats: readonly HerdrChat[],
+  agents: ReadonlyMap<string, AgentInfo>,
+  target: HerdrTarget,
+  resolver: AdapterResolver,
+  read: (method: string, params: Record<string, unknown>) => Promise<unknown>,
+): Promise<PaneProcesses> {
+  const panes = new Map<string, AgentInfo>();
+  for (const chat of chats) {
+    const agent = agents.get(chat.terminalId);
+    if (chat.herdrSession === target.herdrSession && agent && chat.occupant && resolver.byId(chat.harnessId)?.binding === "pane") panes.set(chat.terminalId, agent);
+  }
+  return new Map(await Promise.all([...panes].map(async ([terminalId, agent]): Promise<[string, PaneProcessInfo | null]> => {
+    try {
+      const { process_info: info } = PaneProcessInfoResultSchema.parse(await read("pane.process_info", { pane_id: agent.pane_id }));
+      // An alias answer (Herdr resolved a moved pane id) is not evidence about this terminal.
+      return [terminalId, info.pane_id === agent.pane_id ? info : null];
+    } catch {
+      return [terminalId, null];
+    }
+  })));
+}
+
+/** The same replacement test the session applies on validation: not the harness, another pid, or another tty. */
+function occupantReplaced(adapter: HarnessAdapter, occupant: NonNullable<HerdrChat["occupant"]>, info: PaneProcessInfo): boolean {
+  const pid = info.foreground_process_group_id;
+  return !pid || !adapter.isOccupant(info) || pid !== occupant.pid || (info.tty ?? null) !== occupant.tty;
+}
+
 /** A terminal can host a new native conversation after /new; keep its older chats separate. */
-function liveChat(chat: HerdrChat, agents: ReadonlyMap<string, AgentInfo>, target: HerdrTarget, resolver: AdapterResolver): AgentInfo | undefined {
+function liveChat(chat: HerdrChat, agents: ReadonlyMap<string, AgentInfo>, target: HerdrTarget, resolver: AdapterResolver, processes?: PaneProcesses): AgentInfo | undefined {
   if (chat.herdrSession !== target.herdrSession) return undefined;
   const agent = agents.get(chat.terminalId);
   if (!agent) return undefined;
@@ -142,6 +182,10 @@ function liveChat(chat: HerdrChat, agents: ReadonlyMap<string, AgentInfo>, targe
   const adapter = resolver.byId(chat.harnessId);
   if (!adapter || !adapterAcceptsKind(adapter, agent.agent)) return undefined;
   if (adapter.binding === "native-ref" && !sameRef(chat.sessionRef, sessionRefOf(agent))) return undefined;
+  // A pane-mode chat whose agent was replaced in the terminal is frozen history, not the pane's live chat.
+  // An unreadable pane (no entry, or null) keeps the chat live rather than guessing.
+  const info = adapter.binding === "pane" && chat.occupant ? processes?.get(chat.terminalId) : null;
+  if (info && chat.occupant && occupantReplaced(adapter, chat.occupant, info)) return undefined;
   return agent;
 }
 
@@ -162,9 +206,10 @@ export function reconcileChats(
   live: ReadonlyMap<string, AgentInfo>,
   target: HerdrTarget,
   resolver: AdapterResolver,
+  processes?: PaneProcesses,
 ): Map<string, ReconciledTerminal> {
   const out = new Map<string, ReconciledTerminal>();
-  for (const chat of chats.filter((chat) => liveChat(chat, live, target, resolver)).sort(newestFirst)) {
+  for (const chat of chats.filter((chat) => liveChat(chat, live, target, resolver, processes)).sort(newestFirst)) {
     const key = chatKey(chat.herdrSession, chat.terminalId);
     const entry = out.get(key);
     if (entry) entry.duplicates.push(chat);
@@ -260,7 +305,7 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
         listPaneTargets(targets(socket)),
       ]);
       const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
-      const reconciled = reconcileChats(chats, live, target, resolver);
+      const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
       // Read-only detection: does each harness process have its input endpoint? (one process_info per agent)
       const inputReady = new Map(await Promise.all(agents.map(async (agent): Promise<[string, boolean | null]> => {
         const adapter = ownerAdapter(reconciled, agent, target, resolver);
@@ -329,18 +374,24 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
   });
 
   server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }, { paseo }) => {
-    const { target } = await deps.readTarget();
+    const { target, enabled: enabledFor } = await deps.readTarget();
     await deps.ensureReady(target);
     const socket = target.socketPath;
     const agents = await listPaneTargets(targets(socket));
     const agent = agents.find((candidate) => candidate.terminal_id === terminalId);
     if (!agent) throw new Error("The agent is no longer running in Herdr.");
-    // Same routing as the overview row: the owner chat's adapter if one exists, else new-work
-    // routing. A chat listing that fails must not block a restart.
-    const chats = await herdrChats(paseo, deps.harnesses).catch(() => []);
-    const reconciled = reconcileChats(chats, new Map(agents.map((candidate): [string, AgentInfo] => [candidate.terminal_id, candidate])), target, resolver);
+    // Same routing as the overview row: the owner chat's adapter if one exists, else new-work routing.
+    // Without the chat list the owner is unknown and `select` could pick a different adapter than the
+    // overview offered, so a failed listing refuses the restart instead of guessing.
+    let chats: HerdrChat[];
+    try { chats = await herdrChats(paseo, deps.harnesses); }
+    catch (error) { throw new Error(`Can't restart this agent: Paseo's chat list is unavailable (${errorMessage(error)}), so the adapter that owns it is unknown. Try again.`); }
+    const live = new Map(agents.map((candidate): [string, AgentInfo] => [candidate.terminal_id, candidate]));
+    const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
     const adapter = ownerAdapter(reconciled, agent, target, resolver);
     if (!adapter) throw new Error("The agent is no longer running in Herdr.");
+    // The overview hides a disabled adapter's restart; a stale row or a direct call must not bypass that.
+    if (!(enabledFor?.(adapter.id) ?? true)) throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
     // An open chat on this agent stays read-only; the client binds a fresh chat and archives the old one.
     return (deps.restart ?? restartAgent)({ request: (method, params) => request(socket, method, params) }, adapter, { terminalId, paneId });
   });

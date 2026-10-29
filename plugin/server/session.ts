@@ -26,6 +26,12 @@ export interface SessionDeps {
   getHerdrSession?: () => string | null;
   /** Claim a validated terminal, releasing the previous terminal after a move. */
   claimPane?: (terminalId: string) => boolean;
+  /**
+   * New-work routing: whether Herdr `agent` kind `kind` routes to this session's adapter (`resolver.select(kind) === adapter`).
+   * Checked on the first validation of a binding (no occupant yet), so a pane detected as a specific kind
+   * after it was listed is not driven by the fallback adapter. Absent = not checked.
+   */
+  routesNewWork?: (kind: string | null | undefined) => boolean;
   /** Create path: launch a new agent. Absent when the provider cannot create agents. */
   launch?(config: ProviderSessionConfig, signal: AbortSignal): Promise<LaunchResult>;
   /** Install-wide model list shared by every session of the provider (catalog source). */
@@ -99,6 +105,9 @@ export class HerdrHarnessSession {
   private pendingHistory: TimelineRow[] | null = null;
   /** Pane-bound open: events emitted by the validation that runs before `session.opened`, replayed right after it. */
   private deferred: ProviderEvent[] | null = null;
+  /** `validateAgent` calls take a sequence number at the start; a commit older than the last committed one is dropped. */
+  private validationSeq = 0;
+  private committedSeq = 0;
   /** Live view of this session's pane for pane-bound adapters; it follows terminal and pane moves. */
   readonly observation: PaneObservation;
 
@@ -325,7 +334,7 @@ export class HerdrHarnessSession {
   }
 
   /** Refresh terminal, native session, foreground leader and process-local nonce. */
-  async validateAgent(moveRetry = false): Promise<AgentInfo | null> {
+  async validateAgent(moveRetry = false, seq = ++this.validationSeq): Promise<AgentInfo | null> {
     const generation = this.state.generation;
     const agents = await this.deps.listAgents(this.signal);
     if (!this.current(generation) || this.state.outcome !== "active") return null;
@@ -336,6 +345,13 @@ export class HerdrHarnessSession {
       const changedSession = adapterAcceptsKind(this.adapter, agent.agent) && nativeRef && !sameRef(sessionRefOf(agent), binding.sessionRef);
       this.freeze(changedSession ? "The native session changed" : "The bound agent was replaced",
         changedSession ? "The old conversation is frozen. Open Import session, choose the Herdr provider and import the current native conversation separately. Do not import it through the native provider: that creates a second process." : "The bound foreground agent changed; no input will be sent to its replacement.");
+      return null;
+    }
+    // First validation of a binding (an import or bind never validated): new-work routing decides the adapter.
+    // An existing occupant binding keeps `adapterAcceptsKind`, so a saved fallback chat survives a later detection.
+    if (agent && !binding.occupant && this.deps.routesNewWork && !this.deps.routesNewWork(agent.agent)) {
+      this.freeze(`This pane is handled by another provider`,
+        `Herdr detects ${agent.agent ? `a ${agent.agent} agent` : "another agent"} in this pane, so ${this.adapter.label} will not drive it. This conversation is read-only; import the pane again to use the matching provider.`);
       return null;
     }
     if (!agent) {
@@ -360,7 +376,7 @@ export class HerdrHarnessSession {
       // Herdr resolves an old pane id to its new location after a move. The move
       // can happen between agent.list and process_info; re-read both identities
       // instead of treating an alias response as a replaced process.
-      if (!moveRetry) return this.validateAgent(true);
+      if (!moveRetry) return this.validateAgent(true, seq);
       this.state.connected = false;
       this.state.tracker.observeConnectivityLost();
       return null;
@@ -381,6 +397,9 @@ export class HerdrHarnessSession {
       this.freeze("The bound agent was replaced", "The process-local input identity changed; no input will be sent to the replacement.");
       return null;
     }
+    // A validation that started earlier but finished after a later one must not move the claim or state back.
+    if (seq < this.committedSeq) return null;
+    this.committedSeq = seq;
     if (this.deps.claimPane && !this.deps.claimPane(agent.terminal_id)) {
       this.freeze(`This ${this.adapter.label} agent is already open in another conversation`,
         "This conversation is read-only; the other conversation keeps control of the running agent.");

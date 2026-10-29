@@ -2,12 +2,13 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createHerdrProvider } from "../server/provider.js";
 import { registerManagementRpcs } from "../server/rpc.js";
 import { createResolver } from "../server/harness/resolve.js";
+import { persistenceOf } from "../server/binding.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { makeFakeAdapter } from "./fake-harness.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HERDR_BIND_OPTION } from "../shared/model.js";
 import { herdrOverviewRpc, type HerdrTarget } from "../shared/rpc.js";
-import { ProviderEventSchema, type ProviderConnection, type ProviderEvent, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
+import { ProviderEventSchema, type ProviderConnection, type ProviderEvent, type ProviderPersistence, type ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 
 /**
  * F3 routing with two providers over one FakeHerdr: a specific adapter claiming kind "fake"
@@ -132,4 +133,53 @@ it("enableOmp=false hides only herdr-omp from the overview", async () => {
   expect(fakeKindRow).toMatchObject({ kind: "fakekind", harness: "Fake", provider: "herdr-fakekind" });
   // A hidden adapter's row is not probed for its input endpoint either.
   expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
+});
+
+// A fallback chat imported while Herdr listed its pane without a kind: the pane is detected as "fake" before the import opens.
+const importedGeneric = (occupant?: { pid: number; tty: string | null; instanceId: string }) => persistenceOf({
+  harness: "generic", herdrSession: null, terminalId: "term-fake", agentName: null,
+  sessionRef: { kind: "id", value: "fake-session-1" }, cwd: "/work", submittedMessages: {}, ...(occupant ? { occupant } : {}),
+});
+const openPersisted = async (persistence: ProviderPersistence) => {
+  const { connection, events } = await connect(generic);
+  await connection.send({ type: "session.open", requestId: "open", sessionId: "s1", config, history: "skip", persistence });
+  await vi.waitFor(() => expect(events.some((event) => event.type === "session.ready" || event.type === "request.failed")).toBe(true));
+  return events.flatMap((event) => (event.type === "session.notice" ? [event.notice.title] : []));
+};
+
+it("the first validation of an imported fallback chat refuses a pane that now routes to a specific adapter", async () => {
+  expect(await openPersisted(importedGeneric())).toEqual(["This pane is handled by another provider"]);
+  // Refused before any process read, so nothing was inspected or driven for the fallback.
+  expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
+});
+
+it("a fallback chat that already has an occupant still validates after the pane is detected as a specific kind", async () => {
+  expect(await openPersisted(importedGeneric({ pid: 77, tty: "/dev/pts/fake", instanceId: "fake-instance" }))).toEqual([]);
+  expect(fake.requestsFor("pane.process_info").length).toBeGreaterThan(0);
+});
+
+it("aborting the discovery scope aborts a pane read that passed its own long-lived signal", async () => {
+  fake.handle("pane.read", () => {}); // never answers: the read ends only by abort
+  const longLived = new AbortController();
+  const reads: Array<Promise<unknown>> = [];
+  const paneGeneric = makeFakeAdapter(undefined, {
+    id: "pgeneric", nativeKinds: "any", binding: "pane", turnEvidence: "status", launch: null, herdrIntegration: null,
+    paneReader: (observation) => {
+      const read = observation.request("pane.read", { pane_id: observation.paneId() }, { signal: longLived.signal });
+      read.catch(() => {});
+      reads.push(read);
+      return "";
+    },
+  });
+  const provider = createHerdrProvider(paneGeneric, async () => fake.socketPath, { resolver: createResolver([paneGeneric]) });
+  const connection = await provider.connect({ versions: [1], capabilities: ["session.list", "session.persistence", "prompt.message"] });
+  connections.push(connection);
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => events.push(ProviderEventSchema.parse(event)));
+  await connection.send({ type: "sessions", requestId: "list" });
+  expect(await sessionList(events, "list")).toHaveLength(3);
+  expect(reads).toHaveLength(3);
+  // Discovery finished and aborted its scope; the adapter's own signal never fired.
+  expect(longLived.signal.aborted).toBe(false);
+  for (const read of reads) await expect(read).rejects.toMatchObject({ code: "aborted" });
 });

@@ -102,6 +102,7 @@ export function createHerdrProvider(
           ...(hooks.getPaseo ? { getPaseo: hooks.getPaseo } : {}),
           ...(hooks.approvalSleep ? { approvalSleep: hooks.approvalSleep } : {}),
           getHerdrSession: () => herdrSession,
+          routesNewWork: (kind) => resolver.select(kind) === adapter,
           ...(hooks.bindHistoryDelayMs !== undefined ? { bindHistoryDelayMs: hooks.bindHistoryDelayMs } : {}),
           // An adapter without a launch spec is import/bind only; `session.open` refuses to create.
           ...(adapter.launch
@@ -175,7 +176,8 @@ export function createHerdrProvider(
                       terminalId: agent.terminal_id,
                       herdrSession: hooks.getHerdrSession?.() ?? null,
                       paneId: () => agent.pane_id,
-                      request: (method, params = {}, options) => herdr.request(method, params, { ...options, signal: options?.signal ?? signal }),
+                      // The discovery scope must still abort a read whose adapter passed its own, longer-lived signal.
+                      request: (method, params = {}, options) => herdr.request(method, params, { ...options, signal: options?.signal ? AbortSignal.any([signal, options.signal]) : signal }),
                       signal,
                     }),
                   }
