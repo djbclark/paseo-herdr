@@ -126,7 +126,7 @@ describe("OMP input client delivery classification", () => {
     const agentDir = await mkdtemp(path.join(os.tmpdir(), "omp-agent-"));
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     try {
-      await expect(inspectOmpInput(PID, REF)).rejects.toThrow(/required OMP input companion.*read-only.*npm run install:omp-companion.*omp --resume.*never restarts agents/);
+      await expect(inspectOmpInput(PID, REF)).rejects.toThrow(/required OMP input companion.*read-only.*paseo plugin update herdr-harness.*install-omp-companion\.mjs.*omp --resume.*never restarts agents/);
       await expect(submitOmpInput(PID, REF, INSTANCE, "prompt")).resolves.toMatchObject({ type: "rejected" });
     } finally {
       vi.unstubAllEnvs();

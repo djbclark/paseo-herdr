@@ -12,6 +12,7 @@ import { clearOmpRestoredPrompt, configureOmp, inspectOmpInput, ompInputSocketPa
 import { activeChain, lastTurnEndOf, lastTurnEndIdOf, modelOf, thinkingLevelOf, turnStateOf, parseOmpEntries, titleOf } from "./transcript.js";
 import { mapChainToProviderItems } from "./to-provider-items.js";
 import { companionInstallStatus } from "./companion-install.js";
+import { COMPANION_INSTALL_STEP } from "../../../shared/companion.js";
 import { findOmpForks } from "./forks.js";
 
 /**
@@ -118,8 +119,8 @@ export const ompAdapter: HarnessAdapter = {
   inputCompanionStatus: async () => {
     const status = await companionInstallStatus();
     if (status.state === "current") return { ok: true };
-    if (status.state === "missing") return { ok: false, diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents." };
-    if (status.state === "outdated") return { ok: false, diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents." };
-    return { ok: false, diagnostic: `A different file exists at ${status.path}. Rerun the installer with --force to replace it.` };
+    if (status.state === "missing") return { ok: false, diagnostic: `OMP input companion is not installed; imported agents are read-only. To install it, ${COMPANION_INSTALL_STEP}, then restart OMP agents.` };
+    if (status.state === "outdated") return { ok: false, diagnostic: `OMP input companion is outdated. To update it, ${COMPANION_INSTALL_STEP}, then restart OMP agents.` };
+    return { ok: false, diagnostic: `A different file exists at ${status.path}. To replace it, run \`node scripts/install-omp-companion.mjs --force\` from the installed plugin directory.` };
   },
 };

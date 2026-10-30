@@ -39,23 +39,29 @@ The `OMP (Herdr)` provider reports one of these. The provider stays available an
 
 | Status text | Meaning | Fix |
 |---|---|---|
-| "OMP input companion is not installed; imported agents are read-only." | `paseo4herdr-input.ts` isn't in OMP's extensions directory. | Run the installer ([below](#run-the-installer-by-hand)), then restart OMP agents. |
-| "OMP input companion is outdated." | The installed file differs from this plugin's, or an old `paseo-herdr-input.ts` is still present next to a current one (OMP would load both). | Rerun the installer. It updates the file and removes the old companion. |
-| "A different file exists at …. Rerun the installer with --force to replace it." | A file named `paseo4herdr-input.ts` exists that this project didn't write (it doesn't start with the marker line). | Inspect it. If it is safe to lose, run the installer with `--force`. |
+| "OMP input companion is not installed; imported agents are read-only." | `paseo4herdr-input.ts` isn't in OMP's extensions directory. | Run `paseo plugin update herdr-harness`, or the installer directly ([below](#run-the-installer-by-hand)), then restart OMP agents. |
+| "OMP input companion is outdated." | The installed file differs from this plugin's, or an old `paseo-herdr-input.ts` is still present next to a current one (OMP would load both). | Run `paseo plugin update herdr-harness`, or rerun the installer. It updates the file and removes the old companion. |
+| "A different file exists at …. To replace it, run `node scripts/install-omp-companion.mjs --force` from the installed plugin directory." | A file named `paseo4herdr-input.ts` exists that this project didn't write (it doesn't start with the marker line). | Inspect it. If it is safe to lose, run the installer with `--force`. |
 | "Input companion check failed: …" | The check itself threw, for example an unreadable directory. | Fix the error shown (permissions on OMP's extensions directory). |
 
 ### Run the installer by hand
 
-Paseo runs the installer on `paseo plugin install` and `paseo plugin update`. A plugin installed from a directory doesn't run it. Run it yourself from a clone of this repository:
+Paseo runs the installer (`node scripts/install-omp-companion.mjs`) on `paseo plugin install` and `paseo plugin update`, so for a Git install the usual repair is:
 
 ```bash
-node plugin/scripts/install-omp-companion.mjs            # install or update
-node plugin/scripts/install-omp-companion.mjs --force    # replace a file it didn't write
-node plugin/scripts/install-omp-companion.mjs --uninstall
-node plugin/scripts/install-omp-companion.mjs --print-path
+paseo plugin update herdr-harness
 ```
 
-(`npm run install:omp-companion` in `plugin/` is the same as the first line.) The installer prints where it writes, and prints one of `installed`, `updated`, `replaced` or `already current`. Output of a Paseo-run install is in `$PASEO_HOME/daemon.log`.
+To run it directly, use the installed plugin directory as the working directory; there is no `npm run` script to look for outside a clone. A plugin installed from a directory doesn't run the install step at all, so developers run it from a clone's `plugin/` directory (or `node plugin/scripts/install-omp-companion.mjs` from the repository root):
+
+```bash
+node scripts/install-omp-companion.mjs            # install or update
+node scripts/install-omp-companion.mjs --force    # replace a file it didn't write
+node scripts/install-omp-companion.mjs --uninstall
+node scripts/install-omp-companion.mjs --print-path
+```
+
+(In a clone, `npm run install:omp-companion` in `plugin/` is the same as the first line.) The installer prints where it writes, and prints one of `installed`, `updated`, `replaced` or `already current`. Output of a Paseo-run install is in `$PASEO_HOME/daemon.log`.
 
 ## OMP agent directory missing
 

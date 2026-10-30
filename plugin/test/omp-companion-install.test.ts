@@ -374,7 +374,7 @@ describe("OMP adapter inputCompanionStatus", () => {
   it("reports a missing companion with the install instruction", async () => {
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({
       ok: false,
-      diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents.",
+      diagnostic: "OMP input companion is not installed; imported agents are read-only. To install it, run `paseo plugin update herdr-harness` (its install step reinstalls the companion), or run `node scripts/install-omp-companion.mjs` from the installed plugin directory (from `plugin/` in a clone), then restart OMP agents.",
     });
   });
 
@@ -389,12 +389,12 @@ describe("OMP adapter inputCompanionStatus", () => {
     await writeFile(target, `${SOURCE}\n// stale\n`);
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({
       ok: false,
-      diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents.",
+      diagnostic: "OMP input companion is outdated. To update it, run `paseo plugin update herdr-harness` (its install step reinstalls the companion), or run `node scripts/install-omp-companion.mjs` from the installed plugin directory (from `plugin/` in a clone), then restart OMP agents.",
     });
     await writeFile(target, FOREIGN);
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({
       ok: false,
-      diagnostic: `A different file exists at ${target}. Rerun the installer with --force to replace it.`,
+      diagnostic: `A different file exists at ${target}. To replace it, run \`node scripts/install-omp-companion.mjs --force\` from the installed plugin directory.`,
     });
   });
 });
