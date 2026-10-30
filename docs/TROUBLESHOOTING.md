@@ -52,7 +52,7 @@ Paseo runs the installer (`node scripts/install-omp-companion.mjs`) on `paseo pl
 paseo plugin update herdr-harness
 ```
 
-To run it directly, use the installed plugin directory as the working directory; there is no `npm run` script to look for outside a clone. A plugin installed from a directory doesn't run the install step at all, so developers run it from a clone's `plugin/` directory (or `node plugin/scripts/install-omp-companion.mjs` from the repository root):
+To run it directly, use the installed plugin directory as the working directory; there is no `npm run` script to look for outside a clone. For a Git install that directory is `$PASEO_HOME/plugins/herdr-harness/<id>/checkout/plugin` (`~/.paseo/plugins/herdr-harness/<id>/checkout/plugin` by default); `<id>` is a generated folder name, so `ls "${PASEO_HOME:-$HOME/.paseo}/plugins/herdr-harness"` to find it, then `cd` into `<id>/checkout/plugin`. This is the layout Paseo created when this was written, not a documented contract: if the path isn't there, look for `install-omp-companion.mjs` under `$PASEO_HOME/plugins`. A plugin installed from a directory doesn't run the install step at all, so developers run it from a clone's `plugin/` directory (or `node plugin/scripts/install-omp-companion.mjs` from the repository root):
 
 ```bash
 node scripts/install-omp-companion.mjs            # install or update
