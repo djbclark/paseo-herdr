@@ -15,6 +15,7 @@ import {
 import {
   agentLabel,
   archiveDuplicatesLabel,
+  archiveFailureMessage,
   companionBanner,
   describeTarget,
   duplicateArchiveSkippedMessage,
@@ -291,14 +292,14 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
     // The row is up to one refetch old: archive only what a fresh overview still lists as duplicates of the same owner.
     mutationFn: async () => {
       const plan = freshDuplicatesToArchive(agent, (await fetchOverview({})).workspaces);
-      if (plan.skip) return { skip: plan.skip, failed: 0, attempted: 0 };
+      if (plan.skip) return { skip: plan.skip, failure: null };
       const results = await Promise.allSettled(plan.archive.map((id) => paseo.agents.ref(id).archive()));
-      return { skip: null, failed: results.filter((result) => result.status === "rejected").length, attempted: results.length };
+      return { skip: null, failure: archiveFailureMessage(results) };
     },
-    onSuccess: ({ skip, failed, attempted }) => {
+    onSuccess: ({ skip, failure }) => {
       onChanged();
       if (skip) toast.show(duplicateArchiveSkippedMessage(skip), { variant: "info" });
-      else if (failed > 0) toast.error(`Couldn't archive ${failed} of ${attempted} duplicate chats`);
+      else if (failure) toast.error(failure);
     },
     onError: (error) => toast.error(`Couldn't check the chats before archiving: ${errorMessage(error)}`),
   });

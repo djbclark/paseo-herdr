@@ -138,6 +138,16 @@ export function duplicateArchiveSkippedMessage(skip: Exclude<DuplicateArchivePla
   }
 }
 
+/**
+ * Toast text for a partly failed archive, with the first rejection's reason; null when every archive
+ * worked (or none was tried).
+ */
+export function archiveFailureMessage(results: readonly PromiseSettledResult<unknown>[]): string | null {
+  const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (rejected.length === 0) return null;
+  return `Couldn't archive ${rejected.length} of ${results.length} duplicate chats: ${errorMessage(rejected[0]!.reason)}`;
+}
+
 /** Button text for archiving `count` duplicate chats. */
 export function archiveDuplicatesLabel(count: number): string {
   return `Archive ${count} duplicate ${count === 1 ? "chat" : "chats"}`;

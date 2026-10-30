@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { archiveDuplicatesLabel, companionBanner, duplicateArchiveSkippedMessage, duplicateChatsToArchive, freshDuplicatesToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
+import { archiveDuplicatesLabel, archiveFailureMessage, companionBanner, duplicateArchiveSkippedMessage, duplicateChatsToArchive, freshDuplicatesToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
 
 describe("client helpers", () => {
   it("labels and tones statuses", () => {
@@ -81,6 +81,14 @@ describe("agentLabel", () => {
       expect(duplicateArchiveSkippedMessage("agent-gone")).toContain("no longer listed");
       expect(duplicateArchiveSkippedMessage("none-left")).toContain("already gone");
     });
+  });
+  it("names the first rejection in a partial archive failure and says nothing when all worked", () => {
+    const ok = { status: "fulfilled", value: undefined } as const;
+    const bad = (reason: unknown) => ({ status: "rejected", reason }) as const;
+    expect(archiveFailureMessage([ok, bad(new Error("agent is busy")), bad("second")])).toBe("Couldn't archive 2 of 3 duplicate chats: agent is busy");
+    expect(archiveFailureMessage([bad(undefined)])).toBe("Couldn't archive 1 of 1 duplicate chats: Something went wrong");
+    expect(archiveFailureMessage([ok, ok])).toBeNull();
+    expect(archiveFailureMessage([])).toBeNull();
   });
   it("words the archive-duplicates action by count", () => {
     expect(archiveDuplicatesLabel(1)).toBe("Archive 1 duplicate chat");
