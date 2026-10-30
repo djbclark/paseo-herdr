@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { archiveDuplicatesLabel, companionBanner, duplicateChatsToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
+import { archiveDuplicatesLabel, companionBanner, duplicateArchiveSkippedMessage, duplicateChatsToArchive, freshDuplicatesToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
 
 describe("client helpers", () => {
   it("labels and tones statuses", () => {
@@ -47,6 +47,40 @@ describe("agentLabel", () => {
     expect(duplicateChatsToArchive({ paseoAgentId: "new", duplicateChatIds: ["old1", "old2"] })).toEqual(["old1", "old2"]);
     expect(duplicateChatsToArchive({ paseoAgentId: "new", duplicateChatIds: ["old1", "new", "old1", ""] })).toEqual(["old1"]);
     expect(duplicateChatsToArchive({ paseoAgentId: null, duplicateChatIds: [] })).toEqual([]);
+  });
+  describe("fresh duplicate re-check before archiving", () => {
+    interface Row { terminalId: string; paneId: string; paseoAgentId: string | null; duplicateChatIds: string[] }
+    const row = (over: Partial<Row> = {}): Row =>
+      ({ terminalId: "t1", paneId: "p1", paseoAgentId: "owner", duplicateChatIds: ["dupA", "dupB"], ...over });
+    const overview = (...agents: Row[]) => [{ tabs: [{ agents: [row({ terminalId: "other", paneId: "px", duplicateChatIds: ["dupA"] })] }, { agents }] }];
+    it("archives every shown duplicate when the fresh row is unchanged", () => {
+      expect(freshDuplicatesToArchive(row(), overview(row()))).toEqual({ skip: null, archive: ["dupA", "dupB"] });
+    });
+    it("archives nothing when the owner changed, even if the shown ids are still listed or one is the new owner", () => {
+      expect(freshDuplicatesToArchive(row(), overview(row({ paseoAgentId: "dupB", duplicateChatIds: ["owner", "dupA"] })))).toEqual({ skip: "owner-changed", archive: [] });
+      expect(freshDuplicatesToArchive(row(), overview(row({ paseoAgentId: null })))).toEqual({ skip: "owner-changed", archive: [] });
+    });
+    it("skips a duplicate that is no longer listed and never adds one the user wasn't shown", () => {
+      expect(freshDuplicatesToArchive(row(), overview(row({ duplicateChatIds: ["dupB", "dupNew"] })))).toEqual({ skip: null, archive: ["dupB"] });
+    });
+    it("archives nothing when no shown duplicate is left", () => {
+      expect(freshDuplicatesToArchive(row(), overview(row({ duplicateChatIds: [] })))).toEqual({ skip: "none-left", archive: [] });
+      expect(freshDuplicatesToArchive(row(), overview(row({ duplicateChatIds: ["dupNew"] })))).toEqual({ skip: "none-left", archive: [] });
+    });
+    it("archives nothing when the agent row is gone or the pane is not the same one", () => {
+      expect(freshDuplicatesToArchive(row(), [])).toEqual({ skip: "agent-gone", archive: [] });
+      expect(freshDuplicatesToArchive(row(), overview(row({ terminalId: "t2" })))).toEqual({ skip: "agent-gone", archive: [] });
+      expect(freshDuplicatesToArchive(row(), overview(row({ paneId: "p2" })))).toEqual({ skip: "agent-gone", archive: [] });
+    });
+    it("finds the row in any workspace and tab, and never uses another agent's duplicates", () => {
+      const workspaces = [{ tabs: [{ agents: [row({ terminalId: "t0", paneId: "p0", duplicateChatIds: ["dupA", "dupB"] })] }] }, { tabs: [{ agents: [] }, { agents: [row({ duplicateChatIds: ["dupB"] })] }] }];
+      expect(freshDuplicatesToArchive(row(), workspaces)).toEqual({ skip: null, archive: ["dupB"] });
+    });
+    it("words each reason to skip", () => {
+      expect(duplicateArchiveSkippedMessage("owner-changed")).toContain("chat changed");
+      expect(duplicateArchiveSkippedMessage("agent-gone")).toContain("no longer listed");
+      expect(duplicateArchiveSkippedMessage("none-left")).toContain("already gone");
+    });
   });
   it("words the archive-duplicates action by count", () => {
     expect(archiveDuplicatesLabel(1)).toBe("Archive 1 duplicate chat");

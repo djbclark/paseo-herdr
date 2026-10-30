@@ -94,6 +94,50 @@ export function duplicateChatsToArchive(agent: { paseoAgentId: string | null; du
   return [...ids];
 }
 
+/** The part of an overview agent row the archive re-check reads. */
+interface DuplicateRow {
+  terminalId: string;
+  paneId: string;
+  paseoAgentId: string | null;
+  duplicateChatIds: readonly string[];
+}
+
+export type DuplicateArchivePlan =
+  | { skip: null; archive: string[] }
+  | { skip: "agent-gone" | "owner-changed" | "none-left"; archive: [] };
+
+/**
+ * Re-check an "Archive duplicate chats" tap against a fresh overview before archiving anything. Only ids
+ * the user was shown AND the fresh row still lists as duplicates are archived, and only when the same
+ * terminal and pane still has the same owner chat: if the owner changed (another chat became the newest)
+ * the shown list may now contain the chat in use, so nothing is archived.
+ */
+export function freshDuplicatesToArchive(
+  shown: DuplicateRow,
+  workspaces: readonly { tabs: readonly { agents: readonly DuplicateRow[] }[] }[],
+): DuplicateArchivePlan {
+  const fresh = workspaces
+    .flatMap((workspace) => workspace.tabs.flatMap((tab) => tab.agents))
+    .find((agent) => agent.terminalId === shown.terminalId && agent.paneId === shown.paneId);
+  if (!fresh) return { skip: "agent-gone", archive: [] };
+  if (fresh.paseoAgentId !== shown.paseoAgentId) return { skip: "owner-changed", archive: [] };
+  const stillShown = new Set(duplicateChatsToArchive(shown));
+  const archive = duplicateChatsToArchive(fresh).filter((id) => stillShown.has(id));
+  return archive.length === 0 ? { skip: "none-left", archive: [] } : { skip: null, archive };
+}
+
+/** Toast text when the re-check archived nothing. */
+export function duplicateArchiveSkippedMessage(skip: Exclude<DuplicateArchivePlan["skip"], null>): string {
+  switch (skip) {
+    case "agent-gone":
+      return "Nothing archived: this agent is no longer listed.";
+    case "owner-changed":
+      return "Nothing archived: the agent's chat changed since this list was shown. Check the row and try again.";
+    case "none-left":
+      return "Nothing archived: those duplicate chats are already gone.";
+  }
+}
+
 /** Button text for archiving `count` duplicate chats. */
 export function archiveDuplicatesLabel(count: number): string {
   return `Archive ${count} duplicate ${count === 1 ? "chat" : "chats"}`;

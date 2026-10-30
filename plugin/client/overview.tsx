@@ -17,8 +17,10 @@ import {
   archiveDuplicatesLabel,
   companionBanner,
   describeTarget,
+  duplicateArchiveSkippedMessage,
   duplicateChatsToArchive,
   errorMessage,
+  freshDuplicatesToArchive,
   OVERVIEW_QUERY_KEY,
   OVERVIEW_REFETCH_MS,
   statusLabel,
@@ -245,6 +247,7 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
   const readOnly = agent.inputReady === false;
   const idle = agent.status === "idle" || agent.status === "done";
   const ready = useRpc(herdrChatReadyRpc);
+  const fetchOverview = useRpc(herdrOverviewRpc);
   // Not linked yet: create a chat bound to this running agent (no new process) and open it.
   const link = useMutation({
     mutationFn: () => bindHerdrChat(paseo, ready, agent, label),
@@ -285,14 +288,19 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
   // Extra chats bound to this terminal make "tap an agent" ambiguous; the row's own chat is never archived.
   const duplicates = duplicateChatsToArchive(agent);
   const archiveDuplicates = useMutation({
+    // The row is up to one refetch old: archive only what a fresh overview still lists as duplicates of the same owner.
     mutationFn: async () => {
-      const results = await Promise.allSettled(duplicates.map((id) => paseo.agents.ref(id).archive()));
-      return results.filter((result) => result.status === "rejected").length;
+      const plan = freshDuplicatesToArchive(agent, (await fetchOverview({})).workspaces);
+      if (plan.skip) return { skip: plan.skip, failed: 0, attempted: 0 };
+      const results = await Promise.allSettled(plan.archive.map((id) => paseo.agents.ref(id).archive()));
+      return { skip: null, failed: results.filter((result) => result.status === "rejected").length, attempted: results.length };
     },
-    onSuccess: (failed) => {
+    onSuccess: ({ skip, failed, attempted }) => {
       onChanged();
-      if (failed > 0) toast.error(`Couldn't archive ${failed} of ${duplicates.length} duplicate chats`);
+      if (skip) toast.show(duplicateArchiveSkippedMessage(skip), { variant: "info" });
+      else if (failed > 0) toast.error(`Couldn't archive ${failed} of ${attempted} duplicate chats`);
     },
+    onError: (error) => toast.error(`Couldn't check the chats before archiving: ${errorMessage(error)}`),
   });
   const canOpen = Boolean(navigation && (paseoAgentId || (agent.provider && cwd)));
   return (
