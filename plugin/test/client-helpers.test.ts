@@ -98,6 +98,10 @@ describe("agentLabel", () => {
     expect(companionBanner({ state: "current", path: "/e/paseo4herdr-input.ts" }, true)).toBeNull();
     expect(companionBanner({ state: "missing", path: "/e/paseo4herdr-input.ts" }, false)).toBeNull();
   });
+  it("shows no companion banner when the daemon sent no companion state", () => {
+    expect(companionBanner(undefined, true)).toBeNull();
+    expect(companionBanner(undefined, false)).toBeNull();
+  });
   it("words the companion banner per state and names the fix command", () => {
     const fix = "paseo plugin update herdr-harness";
     const script = "node scripts/install-omp-companion.mjs";

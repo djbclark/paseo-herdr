@@ -157,8 +157,8 @@ export function archiveDuplicatesLabel(count: number): string {
  * Warning for the top of the Herdr screen when the OMP input companion isn't current; null when there is
  * nothing to warn about (current, or OMP turned off). It names the command, never runs it.
  */
-export function companionBanner(companion: CompanionStatus, ompEnabled: boolean): string | null {
-  if (!ompEnabled || companion.state === "current") return null;
+export function companionBanner(companion: CompanionStatus | undefined, ompEnabled: boolean): string | null {
+  if (!companion || !ompEnabled || companion.state === "current") return null;
   const where = companion.path ? ` (${companion.path})` : "";
   switch (companion.state) {
     case "missing":

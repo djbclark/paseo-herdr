@@ -122,8 +122,11 @@ export const herdrOverviewRpc = defineRpc({
     target: herdrTargetSchema,
     ompEnabled: z.boolean(),
     connection: connectionSchema,
-    /** OMP input companion install state; the client warns on anything but `current` while OMP is enabled. */
-    companion: companionStatusSchema,
+    /**
+     * OMP input companion install state; the client warns on anything but `current` while OMP is enabled.
+     * The server always sends it; it is optional so a client newer than the running daemon still shows the overview (without a banner).
+     */
+    companion: companionStatusSchema.optional(),
     /** Empty when the connection is unavailable. */
     workspaces: z.array(overviewWorkspaceSchema),
     /** Linking Herdr agents to Paseo chats failed; agents still show, but "Open chat" may be missing. */

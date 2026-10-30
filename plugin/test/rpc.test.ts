@@ -357,9 +357,14 @@ it("overview reports the companion state, including when the check fails or Herd
   expect(herdrOverviewRpc.output.parse(await offline.call(herdrOverviewRpc, {}, list([]))).companion).toEqual(states[0]);
 });
 
-it("overview schema requires a known companion state", () => {
+it("overview schema requires a known companion state when one is sent, and accepts a response from a daemon that sends none", () => {
   const base = { target: target("/s"), ompEnabled: true, connection: { status: "unavailable", error: "x" }, workspaces: [], chatError: null };
   expect(herdrOverviewRpc.output.safeParse({ ...base, companion: { state: "current" } }).success).toBe(true);
   expect(herdrOverviewRpc.output.safeParse({ ...base, companion: { state: "broken" } }).success).toBe(false);
-  expect(herdrOverviewRpc.output.safeParse(base).success).toBe(false);
+  expect(herdrOverviewRpc.output.safeParse(base).success).toBe(true);
+});
+
+it("the server always sends the companion state in the overview", async () => {
+  const { call } = setup();
+  expect(herdrOverviewRpc.output.parse(await call(herdrOverviewRpc, {}, list([]))).companion).toBeDefined();
 });
