@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { archiveDuplicatesLabel, duplicateChatsToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
+import { archiveDuplicatesLabel, companionBanner, duplicateChatsToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
 
 describe("client helpers", () => {
   it("labels and tones statuses", () => {
@@ -51,5 +51,31 @@ describe("agentLabel", () => {
   it("words the archive-duplicates action by count", () => {
     expect(archiveDuplicatesLabel(1)).toBe("Archive 1 duplicate chat");
     expect(archiveDuplicatesLabel(3)).toBe("Archive 3 duplicate chats");
+  });
+  it("shows no companion banner when current or when OMP is off", () => {
+    expect(companionBanner({ state: "current", path: "/e/paseo4herdr-input.ts" }, true)).toBeNull();
+    expect(companionBanner({ state: "missing", path: "/e/paseo4herdr-input.ts" }, false)).toBeNull();
+  });
+  it("words the companion banner per state and names the fix command", () => {
+    const fix = "paseo plugin update herdr-harness";
+    const script = "node scripts/install-omp-companion.mjs";
+    const missing = companionBanner({ state: "missing", path: "/e/paseo4herdr-input.ts" }, true)!;
+    expect(missing).toContain("isn't installed");
+    expect(missing).toContain(fix);
+    expect(missing).toContain(script);
+    const outdated = companionBanner({ state: "outdated", path: "/e/paseo4herdr-input.ts" }, true)!;
+    expect(outdated).toContain("is outdated (/e/paseo4herdr-input.ts)");
+    expect(outdated).toContain(fix);
+    const foreign = companionBanner({ state: "foreign", path: "/e/paseo4herdr-input.ts" }, true)!;
+    expect(foreign).toContain("/e/paseo4herdr-input.ts");
+    expect(foreign).toContain(`${script} --force`);
+    expect(companionBanner({ state: "unknown" }, true)).toContain("Couldn't check");
+  });
+  it("explains the two-companion outdated case that points at the legacy file", () => {
+    const text = companionBanner({ state: "outdated", path: "/e/paseo-herdr-input.ts" }, true)!;
+    expect(text).toContain("old OMP input companion paseo-herdr-input.ts (/e/paseo-herdr-input.ts)");
+    expect(text).toContain("paseo4herdr-input.ts");
+    expect(text).toContain("paseo plugin update herdr-harness");
+    expect(text).not.toContain("is outdated");
   });
 });

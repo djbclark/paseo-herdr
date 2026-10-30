@@ -5,7 +5,7 @@ import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin
 
 // Derived from the SDK: Paseo's compiler can't resolve @getpaseo/client in an install without node_modules.
 type PaseoApi = PluginHandlerContext["paseo"];
-import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type CompanionStatus, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
 import { expandHome, suggestFolders } from "./folders.js";
 import { restartAgent } from "./restart.js";
@@ -43,6 +43,8 @@ export interface ManagementDeps {
   boundSessions?: BoundSessions;
   /** Environment the CLI would resolve its socket with; defaults to `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
+  /** Reads the OMP input companion's install state. Required so tests inject a fake and never read the real home. */
+  companionStatus(): Promise<{ state: "current" | "outdated" | "missing" | "foreign"; path: string }>;
 }
 
 /** First executable `herdr` on PATH. Paseo terminals run commands without a shell, so pass an absolute path. */
@@ -263,6 +265,10 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     }
   };
 
+  /** A failing check is reported as `unknown` rather than failing the overview. */
+  const readCompanion = (): Promise<CompanionStatus> =>
+    deps.companionStatus().then((status): CompanionStatus => ({ state: status.state, path: status.path }), (): CompanionStatus => ({ state: "unknown" }));
+
   server.handle(herdrTargetRpc, async () => {
     const { target, ompEnabled } = await deps.readTarget();
     return { target, ompEnabled };
@@ -286,9 +292,10 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     ]);
     const chats = chatResult.status === "fulfilled" ? chatResult.value : [];
     const chatError = chatResult.status === "rejected" ? errorMessage(chatResult.reason) : null;
+    const companion = await readCompanion();
     const unavailable = (error: unknown) => ({
       target, ompEnabled, connection: { status: "unavailable" as const, error: errorMessage(error) },
-      workspaces: [], chatError,
+      companion, workspaces: [], chatError,
     });
     if (readyResult.status === "rejected") return unavailable(readyResult.reason);
     const ready = readyResult.value;
@@ -367,7 +374,7 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
           tabs: overviewTabs,
         };
       });
-      return { target, ompEnabled, connection: { status: "connected" as const, version: ready.version, autoStarted: ready.autoStarted }, workspaces: out, chatError };
+      return { target, ompEnabled, connection: { status: "connected" as const, version: ready.version, autoStarted: ready.autoStarted }, companion, workspaces: out, chatError };
     } catch (error) {
       return unavailable(error);
     }

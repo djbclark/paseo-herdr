@@ -99,6 +99,16 @@ export const overviewWorkspaceSchema = z.object({
 });
 export type OverviewWorkspace = z.infer<typeof overviewWorkspaceSchema>;
 
+/**
+ * State of the OMP input companion file, from `companionInstallStatus`. `unknown` means the check itself
+ * threw (for example an unreadable extensions directory); `path` is where the check looked, when known.
+ */
+export const companionStatusSchema = z.object({
+  state: z.enum(["current", "outdated", "missing", "foreign", "unknown"]),
+  path: z.string().optional(),
+});
+export type CompanionStatus = z.infer<typeof companionStatusSchema>;
+
 export const herdrTargetRpc = defineRpc({
   name: "herdr.target",
   input: z.object({}),
@@ -112,6 +122,8 @@ export const herdrOverviewRpc = defineRpc({
     target: herdrTargetSchema,
     ompEnabled: z.boolean(),
     connection: connectionSchema,
+    /** OMP input companion install state; the client warns on anything but `current` while OMP is enabled. */
+    companion: companionStatusSchema,
     /** Empty when the connection is unavailable. */
     workspaces: z.array(overviewWorkspaceSchema),
     /** Linking Herdr agents to Paseo chats failed; agents still show, but "Open chat" may be missing. */

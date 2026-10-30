@@ -1,5 +1,6 @@
+import { COMPANION_INSTALL_NAME, COMPANION_INSTALL_STEP, LEGACY_COMPANION_NAME } from "../shared/companion.js";
 import { cleanTitle } from "../shared/labels.js";
-import type { HerdrAgentStatus, HerdrTarget } from "../shared/rpc.js";
+import type { CompanionStatus, HerdrAgentStatus, HerdrTarget } from "../shared/rpc.js";
 
 /** Pure helpers for the Herdr client UI (no React, no React Native). */
 
@@ -96,4 +97,26 @@ export function duplicateChatsToArchive(agent: { paseoAgentId: string | null; du
 /** Button text for archiving `count` duplicate chats. */
 export function archiveDuplicatesLabel(count: number): string {
   return `Archive ${count} duplicate ${count === 1 ? "chat" : "chats"}`;
+}
+
+/**
+ * Warning for the top of the Herdr screen when the OMP input companion isn't current; null when there is
+ * nothing to warn about (current, or OMP turned off). It names the command, never runs it.
+ */
+export function companionBanner(companion: CompanionStatus, ompEnabled: boolean): string | null {
+  if (!ompEnabled || companion.state === "current") return null;
+  const where = companion.path ? ` (${companion.path})` : "";
+  switch (companion.state) {
+    case "missing":
+      return `The OMP input companion isn't installed, so OMP agents open read-only. To install it, ${COMPANION_INSTALL_STEP}, then restart your OMP agents.`;
+    case "outdated":
+      // Only the pre-rename file is reported by path: it is either alone or next to a current companion (two would be active).
+      return companion.path?.endsWith(LEGACY_COMPANION_NAME)
+        ? `The old OMP input companion ${LEGACY_COMPANION_NAME}${where} is still installed; OMP loads every file in that directory, so it must be replaced by ${COMPANION_INSTALL_NAME}. To fix it, ${COMPANION_INSTALL_STEP}, then restart your OMP agents.`
+        : `The OMP input companion is outdated${where}. To update it, ${COMPANION_INSTALL_STEP}, then restart your OMP agents.`;
+    case "foreign":
+      return `A file that isn't this plugin's companion is in the way${where}. Inspect it; to replace it, run \`node scripts/install-omp-companion.mjs --force\` from the installed plugin directory, then restart your OMP agents.`;
+    case "unknown":
+      return "Couldn't check the OMP input companion (for example OMP's extensions directory is unreadable). See Troubleshooting: Companion missing, outdated or foreign.";
+  }
 }

@@ -15,6 +15,7 @@ import {
 import {
   agentLabel,
   archiveDuplicatesLabel,
+  companionBanner,
   describeTarget,
   duplicateChatsToArchive,
   errorMessage,
@@ -495,6 +496,7 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
     void queryClient.invalidateQueries({ queryKey: OVERVIEW_QUERY_KEY });
   }, [queryClient]);
   const data = query.data;
+  const companionNotice = data ? companionBanner(data.companion, data.ompEnabled) : null;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.root}>
@@ -510,6 +512,7 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
       {!data && !query.error ? <Text style={styles.muted}>Loading…</Text> : null}
       {data ? (
         <>
+          {companionNotice ? <Text accessibilityRole="alert" style={styles.warning}>{companionNotice}</Text> : null}
           {data.connection.status !== "connected" ? (
             <Text accessibilityRole="alert" style={styles.danger}>
               Herdr unavailable: {data.connection.error}

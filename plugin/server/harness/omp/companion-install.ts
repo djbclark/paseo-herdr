@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { COMPANION_INSTALL_NAME, LEGACY_COMPANION_NAME } from "../../../shared/companion.js";
 import { COMPANION_SHA256 } from "./companion-hash.js";
 
 // Mirrors scripts/install-omp-companion.mjs; keep the two in sync.
-export const COMPANION_INSTALL_NAME = "paseo4herdr-input.ts";
+export { COMPANION_INSTALL_NAME, LEGACY_COMPANION_NAME };
 const COMPANION_MARKER = "// paseo4herdr OMP input companion.";
-// Pre-rename (paseo-herdr) companion; the installer migrates it away.
-export const LEGACY_COMPANION_NAME = "paseo-herdr-input.ts";
+// Pre-rename (paseo-herdr) companion (LEGACY_COMPANION_NAME); the installer migrates it away.
 const LEGACY_MARKER = "// paseo-herdr OMP input companion.";
 
 function expandTilde(value: string, home: string): string {

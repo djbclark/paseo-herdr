@@ -35,7 +35,7 @@ Paseo never restarts an agent unless you confirm it.
 
 ## Companion missing, outdated or foreign
 
-The `OMP (Herdr)` provider reports one of these. The provider stays available and imported agents are read-only until it is fixed.
+The `OMP (Herdr)` provider reports one of these. The provider stays available and imported agents are read-only until it is fixed. The Herdr screen shows the same state as a warning at the top (it names the command to run, and appears whenever the companion isn't current and OMP is enabled in settings); the screen never installs anything itself.
 
 | Status text | Meaning | Fix |
 |---|---|---|
