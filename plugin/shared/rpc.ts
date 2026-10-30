@@ -154,6 +154,8 @@ export const diagnosticsSchema = z.object({
     connected: z.boolean(),
     /** Herdr's version from its ping; null when it couldn't be reached. */
     version: z.string().nullable(),
+    /** True when this plugin started Herdr (this report may be what started it, so `connected` is the state after that start); false when Herdr was already running or couldn't be reached. */
+    autoStarted: z.boolean(),
     /** Why Herdr was unreachable or couldn't be listed (cut to 300 characters); null when fine. */
     error: z.string().nullable(),
   }),

@@ -54,7 +54,7 @@ it("herdr.diagnostics returns the bug-report shape with Herdr version, target, c
     pluginVersion: PLUGIN_VERSION,
     target: { socketPath: fake.socketPath, herdrSession: "work", source: "settingSession", autoStart: true },
     ompEnabled: true,
-    herdr: { connected: true, version: "0.9.3", error: null },
+    herdr: { connected: true, version: "0.9.3", autoStarted: false, error: null },
     companion: { state: "missing", path: join(dir, "paseo4herdr-input.ts") },
     agents: [{ paneId: "p1", inputReady: null }, { paneId: "p2", inputReady: null }],
     counts: { agents: 2, inputReady: 0, readOnly: 0, unknown: 2 },
@@ -78,9 +78,19 @@ it("herdr.diagnostics never leaks prompts, titles, folders, agent names or env v
 it("herdr.diagnostics still answers when Herdr is unavailable", async () => {
   const result = await setup({ ensureReady: async () => { throw new Error(`Herdr is not running at ${fake.socketPath}`); } })();
   expect(diagnosticsSchema.parse(result)).toMatchObject({
-    herdr: { connected: false, version: null, error: `Herdr is not running at ${fake.socketPath}` },
+    herdr: { connected: false, version: null, autoStarted: false, error: `Herdr is not running at ${fake.socketPath}` },
     agents: [], counts: { agents: 0, inputReady: 0, readOnly: 0, unknown: 0 },
   });
+});
+
+it("herdr.diagnostics says when this plugin started Herdr, and not when it was already running or unreachable", async () => {
+  fake.reply("agent.list", { type: "agent_list", agents: [] });
+  const started = await setup({ ensureReady: async (t) => ({ target: t, version: "0.9.3", autoStarted: true }) })();
+  expect(started.herdr).toEqual({ connected: true, version: "0.9.3", autoStarted: true, error: null });
+  const running = await setup()();
+  expect(running.herdr.autoStarted).toBe(false);
+  const down = await setup({ ensureReady: async () => { throw new Error("nope"); } })();
+  expect(down.herdr).toEqual({ connected: false, version: null, autoStarted: false, error: "nope" });
 });
 
 it("herdr.diagnostics reports a failed companion check as unknown without a path", async () => {
@@ -95,7 +105,7 @@ it("buildDiagnostics copies allowlisted fields only, counts readiness and bounds
     pluginVersion: "9.9.9",
     target: { ...baseTarget("/s"), apiToken: "tok-secret" },
     ompEnabled: false,
-    herdr: { connected: false, version: null, error: "x".repeat(1000), env: { KEY: "v-secret" } },
+    herdr: { connected: false, version: null, autoStarted: false, error: "x".repeat(1000), env: { KEY: "v-secret" } },
     companion: { state: "outdated", path: "/e/x.ts", contents: "file-secret" },
     agents: [
       { paneId: "a", inputReady: true, prompt: "prompt-secret", cwd: "/cwd-secret", env: { K: "env-secret" } },
@@ -107,7 +117,7 @@ it("buildDiagnostics copies allowlisted fields only, counts readiness and bounds
   const out = buildDiagnostics(input);
   expect(Object.keys(out).sort()).toEqual(TOP_KEYS);
   expect(Object.keys(out.target).sort()).toEqual(["autoStart", "herdrSession", "socketPath", "source"]);
-  expect(Object.keys(out.herdr).sort()).toEqual(["connected", "error", "version"]);
+  expect(Object.keys(out.herdr).sort()).toEqual(["autoStarted", "connected", "error", "version"]);
   expect(Object.keys(out.companion).sort()).toEqual(["path", "state"]);
   expect(out.agents.map((a) => Object.keys(a).sort())).toEqual([["inputReady", "paneId"], ["inputReady", "paneId"], ["inputReady", "paneId"]]);
   expect(out.counts).toEqual({ agents: 3, inputReady: 1, readOnly: 1, unknown: 1 });
@@ -116,14 +126,14 @@ it("buildDiagnostics copies allowlisted fields only, counts readiness and bounds
 });
 
 const homeInput = (over: Partial<DiagnosticsInput>): DiagnosticsInput => ({
-  pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: null, error: null }, companion: { state: "current" }, agents: [], home: "/Users/bob", ...over,
+  pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: null, autoStarted: false, error: null }, companion: { state: "current" }, agents: [], home: "/Users/bob", ...over,
 });
 
 it("buildDiagnostics shows a path under the home directory as ~/..., in the socket, companion path and error text", () => {
   const out = buildDiagnostics(homeInput({
     target: baseTarget("/Users/bob/.config/herdr/herdr.sock"),
     companion: { state: "missing", path: "/Users/bob/.omp/agent/extensions/paseo4herdr-input.ts" },
-    herdr: { connected: false, version: null, error: "Herdr is not running at /Users/bob/.config/herdr/herdr.sock (ENOENT /Users/bob/.config/herdr/herdr.sock)" },
+    herdr: { connected: false, version: null, autoStarted: false, error: "Herdr is not running at /Users/bob/.config/herdr/herdr.sock (ENOENT /Users/bob/.config/herdr/herdr.sock)" },
   }));
   expect(out.target.socketPath).toBe("~/.config/herdr/herdr.sock");
   expect(out.companion.path).toBe("~/.omp/agent/extensions/paseo4herdr-input.ts");
@@ -134,7 +144,7 @@ it("buildDiagnostics shows a path under the home directory as ~/..., in the sock
 it("buildDiagnostics also abbreviates the home directory itself and one that ends the text or is quoted", () => {
   const out = buildDiagnostics(homeInput({
     target: baseTarget("/Users/bob"),
-    herdr: { connected: false, version: null, error: "cannot read '/Users/bob': denied; tried /Users/bob" },
+    herdr: { connected: false, version: null, autoStarted: false, error: "cannot read '/Users/bob': denied; tried /Users/bob" },
   }));
   expect(out.target.socketPath).toBe("~");
   expect(out.herdr.error).toBe("cannot read '~': denied; tried ~");
@@ -144,7 +154,7 @@ it("buildDiagnostics leaves paths outside the home directory alone", () => {
   const out = buildDiagnostics(homeInput({
     target: baseTarget("/run/user/1000/herdr.sock"),
     companion: { state: "missing", path: "/opt/Users/bob/x.ts" },
-    herdr: { connected: false, version: null, error: "no socket at /tmp/herdr.sock" },
+    herdr: { connected: false, version: null, autoStarted: false, error: "no socket at /tmp/herdr.sock" },
   }));
   expect(out.target.socketPath).toBe("/run/user/1000/herdr.sock");
   expect(out.companion.path).toBe("/opt/Users/bob/x.ts");
@@ -155,7 +165,7 @@ it("buildDiagnostics only abbreviates on a path-segment boundary", () => {
   const out = buildDiagnostics(homeInput({
     target: baseTarget("/Users/bobby/herdr.sock"),
     companion: { state: "missing", path: "/Users/bob.old/x.ts" },
-    herdr: { connected: false, version: null, error: "at /Users/bobby/a and /Users/bob/b" },
+    herdr: { connected: false, version: null, autoStarted: false, error: "at /Users/bobby/a and /Users/bob/b" },
   }));
   expect(out.target.socketPath).toBe("/Users/bobby/herdr.sock");
   expect(out.companion.path).toBe("/Users/bob.old/x.ts");
@@ -165,14 +175,14 @@ it("buildDiagnostics only abbreviates on a path-segment boundary", () => {
 it("buildDiagnostics abbreviates the home directory before cutting the error text, and a trailing-slash home still matches", () => {
   const out = buildDiagnostics(homeInput({
     home: "/Users/bob/",
-    herdr: { connected: false, version: null, error: `${"x".repeat(290)} /Users/bob/.config/herdr.sock` },
+    herdr: { connected: false, version: null, autoStarted: false, error: `${"x".repeat(290)} /Users/bob/.config/herdr.sock` },
   }));
   expect(out.herdr.error).not.toContain("/Users");
   expect(out.herdr.error).toBe(`${"x".repeat(290)} ~/.config`);
 });
 
 it("diagnosticsText is pretty-printed JSON that round-trips", () => {
-  const d = buildDiagnostics({ pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: "0.9.3", error: null }, companion: { state: "current" }, agents: [] });
+  const d = buildDiagnostics({ pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: "0.9.3", autoStarted: true, error: null }, companion: { state: "current" }, agents: [] });
   const text = diagnosticsText(d);
   expect(text).toContain("\n  \"pluginVersion\": \"1\"");
   expect(JSON.parse(text)).toEqual(d);

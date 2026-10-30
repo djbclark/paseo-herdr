@@ -395,11 +395,11 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     const { target, ompEnabled, enabled: enabledFor } = await deps.readTarget();
     const enabled = (adapterId: string) => enabledFor?.(adapterId) ?? true;
     const companion = await readCompanion();
-    let herdr: DiagnosticsInput["herdr"] = { connected: false, version: null, error: null };
+    let herdr: DiagnosticsInput["herdr"] = { connected: false, version: null, autoStarted: false, error: null };
     let agents: DiagnosticsInput["agents"] = [];
     try {
       const ready = await deps.ensureReady(target);
-      herdr = { connected: true, version: ready.version, error: null };
+      herdr = { connected: true, version: ready.version, autoStarted: ready.autoStarted, error: null };
       const socket = target.socketPath;
       const listed = await listPaneTargets(targets(socket));
       const chats = await herdrChats(paseo, deps.harnesses).catch((): HerdrChat[] => []);

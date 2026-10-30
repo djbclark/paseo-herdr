@@ -7,7 +7,7 @@ export interface DiagnosticsInput {
   pluginVersion: string;
   target: HerdrTarget;
   ompEnabled: boolean;
-  herdr: { connected: boolean; version: string | null; error: string | null };
+  herdr: { connected: boolean; version: string | null; autoStarted: boolean; error: string | null };
   companion: CompanionStatus;
   agents: readonly { paneId: string; inputReady: boolean | null }[];
   /** The home directory to abbreviate to `~`; defaults to the real one. Injected by tests. */
@@ -45,6 +45,7 @@ export function buildDiagnostics(input: DiagnosticsInput): Diagnostics {
     herdr: {
       connected: input.herdr.connected,
       version: input.herdr.version,
+      autoStarted: input.herdr.autoStarted,
       error: input.herdr.error === null ? null : short(input.herdr.error).slice(0, MAX_ERROR_CHARS),
     },
     companion: input.companion.path === undefined ? { state: input.companion.state } : { state: input.companion.state, path: short(input.companion.path) },
