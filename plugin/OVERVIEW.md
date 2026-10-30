@@ -22,7 +22,7 @@ This is an alpha release.
 
 ## What installation changes
 
-Installing or updating this plugin writes one file, `paseo-herdr-input.ts`, into OMP's extensions directory (`$PI_CODING_AGENT_DIR/extensions`, otherwise `~/.omp/agent/extensions`). This input companion lets Paseo send prompts and answers to a running OMP agent. The install step prints the path before it writes.
+Installing or updating this plugin writes one file, `paseo4herdr-input.ts`, into OMP's extensions directory (`$PI_CODING_AGENT_DIR/extensions`, otherwise `~/.omp/agent/extensions`). This input companion lets Paseo send prompts and answers to a running OMP agent. The install step prints the path before it writes.
 
 - It fails, and installs nothing, when OMP's agent directory doesn't exist. Run `omp` once, then install again.
 - It never replaces a file it didn't write.

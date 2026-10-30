@@ -118,8 +118,8 @@ export const ompAdapter: HarnessAdapter = {
   inputCompanionStatus: async () => {
     const status = await companionInstallStatus();
     if (status.state === "current") return { ok: true };
-    if (status.state === "missing") return { ok: false, diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents." };
-    if (status.state === "outdated") return { ok: false, diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents." };
+    if (status.state === "missing") return { ok: false, diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents." };
+    if (status.state === "outdated") return { ok: false, diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents." };
     return { ok: false, diagnostic: `A different file exists at ${status.path}. Rerun the installer with --force to replace it.` };
   },
 };

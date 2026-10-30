@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 // @ts-expect-error plain ESM installer script has no type declarations
 import * as installerModule from "../scripts/install-omp-companion.mjs";
-import { COMPANION_INSTALL_NAME, companionInstallStatus, ompExtensionDir } from "../server/harness/omp/companion-install.js";
+import { COMPANION_INSTALL_NAME, LEGACY_COMPANION_NAME, companionInstallStatus, ompExtensionDir } from "../server/harness/omp/companion-install.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { COMPANION_SHA256 } from "../server/harness/omp/companion-hash.js";
 import { createHash } from "node:crypto";
@@ -18,7 +18,9 @@ interface Installer {
 }
 const installer = installerModule as unknown as Installer;
 
-const MARKER = "// paseo-herdr OMP input companion.";
+const MARKER = "// paseo4herdr OMP input companion.";
+const LEGACY_MARKER = "// paseo-herdr OMP input companion.";
+const LEGACY_SOURCE = `${LEGACY_MARKER} Installed by the pre-rename plugin.\nexport default function legacy() {}\n`;
 const SOURCE = readFileSync(fileURLToPath(new URL("../harness-extension/omp.ts", import.meta.url)), "utf8");
 const FOREIGN = "export default function other() {}\n";
 
@@ -95,7 +97,7 @@ describe("installer main", () => {
     await mkdir(agentDir, { recursive: true });
     const first = run([]);
     expect(first.code).toBe(0);
-    expect(first.out).toContain(`Writing the paseo-herdr OMP input companion ${COMPANION_INSTALL_NAME} to ${extDir}`);
+    expect(first.out).toContain(`Writing the paseo4herdr OMP input companion ${COMPANION_INSTALL_NAME} to ${extDir}`);
     expect(first.out).toContain(`installed: ${target}`);
     expect(first.out).toContain("Restart running OMP agents: OMP loads extensions only at startup. Do not also pass this file with -e.");
     expect(await readFile(target, "utf8")).toBe(SOURCE);
@@ -152,6 +154,81 @@ describe("installer main", () => {
     expect(result.out).toContain("not installed");
   });
 
+  describe("pre-rename companion migration", () => {
+    let legacyTarget: string;
+    beforeEach(async () => {
+      legacyTarget = path.join(extDir, LEGACY_COMPANION_NAME);
+      await mkdir(extDir, { recursive: true });
+    });
+
+    it("install removes a legacy companion we wrote and reports it", async () => {
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = run([]);
+      expect(result.code).toBe(0);
+      expect(result.out).toContain(`installed: ${target}`);
+      expect(result.out).toContain(`removed legacy: ${legacyTarget}`);
+      expect(await readdir(extDir)).toEqual([COMPANION_INSTALL_NAME]);
+    });
+
+    it("install leaves a legacy-named file that lacks the legacy marker alone", async () => {
+      await writeFile(legacyTarget, FOREIGN);
+      const result = run([]);
+      expect(result.code).toBe(0);
+      expect(result.out).not.toContain("removed legacy");
+      expect(await readFile(legacyTarget, "utf8")).toBe(FOREIGN);
+      expect(await readFile(target, "utf8")).toBe(SOURCE);
+    });
+
+    it("install cleans the legacy file even when the new one is already current", async () => {
+      await writeFile(target, SOURCE);
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = run([]);
+      expect(result.code).toBe(0);
+      expect(result.out).toContain("already current");
+      expect(result.out).toContain(`removed legacy: ${legacyTarget}`);
+      expect(existsSync(legacyTarget)).toBe(false);
+      expect(await readFile(target, "utf8")).toBe(SOURCE);
+    });
+
+    it("a refused install (foreign file at the new path) does not touch the legacy file", async () => {
+      await writeFile(target, FOREIGN);
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      expect(run([]).code).toBe(1);
+      expect(await readFile(legacyTarget, "utf8")).toBe(LEGACY_SOURCE);
+    });
+
+    it("uninstall removes both the new and the legacy companion", async () => {
+      await writeFile(target, SOURCE);
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = run(["--uninstall"]);
+      expect(result.code).toBe(0);
+      expect(result.out).toContain(`removed: ${target}`);
+      expect(result.out).toContain(`removed legacy: ${legacyTarget}`);
+      expect(await readdir(extDir)).toEqual([]);
+    });
+
+    it("uninstall removes a lone legacy companion instead of reporting not installed", async () => {
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = run(["--uninstall"]);
+      expect(result.code).toBe(0);
+      expect(result.out).not.toContain("not installed");
+      expect(existsSync(legacyTarget)).toBe(false);
+    });
+
+    it("uninstall refuses a foreign file at the legacy path and keeps it", async () => {
+      await writeFile(legacyTarget, FOREIGN);
+      const result = run(["--uninstall"]);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain(legacyTarget);
+      expect(await readFile(legacyTarget, "utf8")).toBe(FOREIGN);
+    });
+
+    it("--print-path still prints the new path when a legacy file exists", async () => {
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      expect(run(["--print-path"]).out).toBe(target);
+    });
+  });
+
   it("honours PI_CODING_AGENT_DIR for the target directory", async () => {
     const custom = path.join(root, "custom-agent");
     await mkdir(custom);
@@ -179,6 +256,26 @@ describe("companionInstallStatus", () => {
     expect((await companionInstallStatus(env, home)).state).toBe("foreign");
   });
 
+  it("reports a legacy-only companion as outdated at the legacy path, so the installer is rerun", async () => {
+    const legacyPath = path.join(extDir, LEGACY_COMPANION_NAME);
+    await mkdir(extDir, { recursive: true });
+    await writeFile(legacyPath, LEGACY_SOURCE);
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "outdated", path: legacyPath });
+  });
+
+  it("ignores a foreign legacy-named file", async () => {
+    await mkdir(extDir, { recursive: true });
+    await writeFile(path.join(extDir, LEGACY_COMPANION_NAME), FOREIGN);
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "missing", path: target });
+  });
+
+  it("lets the new file govern when both exist", async () => {
+    await mkdir(extDir, { recursive: true });
+    await writeFile(path.join(extDir, LEGACY_COMPANION_NAME), LEGACY_SOURCE);
+    await writeFile(target, SOURCE);
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "current", path: target });
+  });
+
   it("uses PI_CODING_AGENT_DIR when set", async () => {
     const custom = path.join(root, "custom-agent");
     await mkdir(path.join(custom, "extensions"), { recursive: true });
@@ -201,7 +298,7 @@ describe("OMP adapter inputCompanionStatus", () => {
   it("reports a missing companion with the install instruction", async () => {
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({
       ok: false,
-      diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents.",
+      diagnostic: "OMP input companion is not installed; imported agents are read-only. Run `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents.",
     });
   });
 
@@ -216,7 +313,7 @@ describe("OMP adapter inputCompanionStatus", () => {
     await writeFile(target, `${SOURCE}\n// stale\n`);
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({
       ok: false,
-      diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo-herdr/plugin, then restart OMP agents.",
+      diagnostic: "OMP input companion is outdated. Rerun `npm run install:omp-companion` in paseo4herdr/plugin, then restart OMP agents.",
     });
     await writeFile(target, FOREIGN);
     expect(await ompAdapter.inputCompanionStatus?.()).toEqual({

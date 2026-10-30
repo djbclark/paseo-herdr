@@ -1,10 +1,12 @@
-# paseo-herdr
+# paseo4herdr
+
+Forked from https://github.com/sdananjay/paseo-herdr
 
 A [Paseo](https://paseo.sh) plugin for chatting with [OMP](https://github.com/can1357/oh-my-pi) agents that run in [Herdr](https://herdr.dev) terminal sessions.
 
 The agent keeps running in its Herdr pane. Paseo shows the same conversation on your desktop or phone, and you can type in Paseo or in the terminal. It adds a **Herdr** screen that lists your live agents, an **OMP (Herdr)** provider for importing and starting agents, and Paseo cards for OMP's tool approvals and questions.
 
-> **Alpha.** Expect rough edges. Please [open an issue](https://github.com/sdananjay/paseo-herdr/issues) with the output of `paseo plugin logs herdr-harness` when something breaks.
+> **Alpha.** Expect rough edges. Please [open an issue](https://github.com/djbclark/paseo4herdr/issues) with the output of `paseo plugin logs herdr-harness` when something breaks.
 
 See [`plugin/OVERVIEW.md`](plugin/OVERVIEW.md) for what it does and its current limits.
 
@@ -25,17 +27,17 @@ Run `omp` once before installing, so OMP's agent directory exists.
 2. Install from GitHub:
 
    ```bash
-   paseo plugin install git:sdananjay/paseo-herdr:plugin --ref v0.1.0-alpha.1
+   paseo plugin install git:djbclark/paseo4herdr:plugin
    ```
 
-   You can also paste `git:sdananjay/paseo-herdr:plugin` into **Settings → Plugins → Plugin source**.
+   You can also paste `git:djbclark/paseo4herdr:plugin` into **Settings → Plugins → Plugin source**.
 
 3. Restart OMP agents that were already running. The install writes an input companion into OMP's extensions directory, and OMP loads extensions only at startup. Until restarted, those agents are read-only in Paseo. On the **Herdr** screen, **Restart to enable input** restarts an idle agent in place.
 4. Open **Herdr** in Paseo's sidebar and tap an agent.
 
 ### What the install writes
 
-Paseo runs `node scripts/install-omp-companion.mjs` on install and on every update. It writes `paseo-herdr-input.ts` into `$PI_CODING_AGENT_DIR/extensions`, otherwise `~/.omp/agent/extensions`, and prints the path first. It fails without writing anything if OMP's agent directory is missing, and it never replaces a file it didn't write. Install logs are in `$PASEO_HOME/daemon.log`.
+Paseo runs `node scripts/install-omp-companion.mjs` on install and on every update. It writes `paseo4herdr-input.ts` into `$PI_CODING_AGENT_DIR/extensions`, otherwise `~/.omp/agent/extensions`, and prints the path first. It also removes the pre-rename companion `paseo-herdr-input.ts` from that directory when it is one this project wrote, so OMP does not load two. It fails without writing anything if OMP's agent directory is missing, and it never replaces a file it didn't write. Install logs are in `$PASEO_HOME/daemon.log`.
 
 To remove the companion, run this from a clone of this repository:
 

@@ -1,15 +1,15 @@
 {
-  "name": "paseo-herdr",
+  "name": "paseo4herdr",
   "version": "0.1.0-alpha.1",
   "description": "Paseo plugin: chat with OMP agents running in Herdr terminal sessions",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sdananjay/paseo-herdr.git",
+    "url": "git+https://github.com/djbclark/paseo4herdr.git",
     "directory": "plugin"
   },
-  "homepage": "https://github.com/sdananjay/paseo-herdr#readme",
-  "bugs": "https://github.com/sdananjay/paseo-herdr/issues",
+  "homepage": "https://github.com/djbclark/paseo4herdr#readme",
+  "bugs": "https://github.com/djbclark/paseo4herdr/issues",
   "private": true,
   "type": "module",
   "files": [

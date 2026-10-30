@@ -139,7 +139,7 @@ describe("OMP input client delivery classification", () => {
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     try {
       await mkdir(path.join(agentDir, "extensions"));
-      await writeFile(path.join(agentDir, "extensions", "paseo-herdr-input.ts"), await readFile(new URL("../harness-extension/omp.ts", import.meta.url)));
+      await writeFile(path.join(agentDir, "extensions", "paseo4herdr-input.ts"), await readFile(new URL("../harness-extension/omp.ts", import.meta.url)));
       await expect(inspectOmpInput(PID, REF)).rejects.toThrow(new RegExp(`started before the input companion was installed.*omp --resume ${REF.value}`));
     } finally {
       vi.unstubAllEnvs();
