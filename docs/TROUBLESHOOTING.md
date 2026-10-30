@@ -221,7 +221,9 @@ Herdr agents keep running; they only lose the Paseo side.
 
 ## What to put in a bug report
 
-Open an issue at <https://github.com/djbclark/paseo4herdr/issues> with:
+Open an issue at <https://github.com/djbclark/paseo4herdr/issues>.
+
+Start with **Settings → Herdr → Diagnostics → Copy diagnostics** and paste the result. It holds the plugin version, the resolved Herdr target (socket, session, source, auto-start), Herdr's version or why it couldn't be reached, the input companion state and path, and, for each Herdr agent, its pane id and whether input is ready, with counts. It never holds prompts, titles, working folders, transcript text, environment values or file contents. If the client has no clipboard access, the same JSON is shown in a selectable block instead. It covers the plugin version, the Herdr version and the Effective target below; the rest still has to come from you. Include:
 
 1. What you did, what you expected and what happened, including the exact message or notice text.
 2. The output of `paseo plugin logs herdr-harness`, and the relevant part of `$PASEO_HOME/daemon.log`.

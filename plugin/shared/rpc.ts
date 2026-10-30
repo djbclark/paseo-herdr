@@ -131,6 +131,47 @@ export const herdrOverviewRpc = defineRpc({
   }),
 });
 
+/**
+ * Everything a bug report needs from the daemon side, and nothing else: no prompts, titles, folders,
+ * transcript text, environment values or file contents. The server builds it from an allowlist
+ * (`server/diagnostics.ts`), and the schema strips any other key.
+ */
+export const diagnosticsSchema = z.object({
+  /** `version` in the plugin's package.json. */
+  pluginVersion: z.string(),
+  /** The resolved Herdr target, as the settings screen shows it. */
+  target: z.object({
+    socketPath: z.string(),
+    herdrSession: z.string().nullable(),
+    source: targetSourceSchema,
+    autoStart: z.boolean(),
+  }),
+  ompEnabled: z.boolean(),
+  herdr: z.object({
+    connected: z.boolean(),
+    /** Herdr's version from its ping; null when it couldn't be reached. */
+    version: z.string().nullable(),
+    /** Why Herdr was unreachable or couldn't be listed (cut to 300 characters); null when fine. */
+    error: z.string().nullable(),
+  }),
+  companion: companionStatusSchema,
+  agents: z.array(z.object({ paneId: z.string(), inputReady: z.boolean().nullable() })),
+  counts: z.object({
+    agents: z.number().int(),
+    inputReady: z.number().int(),
+    readOnly: z.number().int(),
+    /** Agents whose input readiness isn't known (not an OMP agent, or the check failed). */
+    unknown: z.number().int(),
+  }),
+});
+export type Diagnostics = z.infer<typeof diagnosticsSchema>;
+
+export const herdrDiagnosticsRpc = defineRpc({
+  name: "herdr.diagnostics",
+  input: z.object({}),
+  output: diagnosticsSchema,
+});
+
 /** Restart an idle agent in place (same pane and session) so it loads its input companion (R35). */
 export const herdrAgentRestartRpc = defineRpc({
   name: "herdr.agent.restart",

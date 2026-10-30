@@ -1,6 +1,6 @@
 import { COMPANION_INSTALL_NAME, COMPANION_INSTALL_STEP, LEGACY_COMPANION_NAME } from "../shared/companion.js";
 import { cleanTitle } from "../shared/labels.js";
-import type { CompanionStatus, HerdrAgentStatus, HerdrTarget } from "../shared/rpc.js";
+import type { CompanionStatus, Diagnostics, HerdrAgentStatus, HerdrTarget } from "../shared/rpc.js";
 
 /** Pure helpers for the Herdr client UI (no React, no React Native). */
 
@@ -119,4 +119,9 @@ export function companionBanner(companion: CompanionStatus, ompEnabled: boolean)
     case "unknown":
       return "Couldn't check the OMP input companion (for example OMP's extensions directory is unreadable). See Troubleshooting: Companion missing, outdated or foreign.";
   }
+}
+
+/** The text "Copy diagnostics" puts on the clipboard (and shows when the clipboard isn't available). */
+export function diagnosticsText(diagnostics: Diagnostics): string {
+  return JSON.stringify(diagnostics, null, 2);
 }

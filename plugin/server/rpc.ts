@@ -5,10 +5,12 @@ import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin
 
 // Derived from the SDK: Paseo's compiler can't resolve @getpaseo/client in an install without node_modules.
 type PaseoApi = PluginHandlerContext["paseo"];
-import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type CompanionStatus, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrDiagnosticsRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type CompanionStatus, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
 import { expandHome, suggestFolders } from "./folders.js";
 import { restartAgent } from "./restart.js";
+import { buildDiagnostics, type DiagnosticsInput } from "./diagnostics.js";
+import { PLUGIN_VERSION } from "./plugin-version.js";
 import type { BoundSessions } from "./bound-sessions.js";
 import { attachArgs, attachCommand } from "./herdr-commands.js";
 import { resolveSocketPath } from "./herdr/socket-path.js";
@@ -265,6 +267,26 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     }
   };
 
+  /** Read-only detection: does each harness process have its input endpoint? (one process_info per agent) */
+  const readInputReady = async (
+    socket: string,
+    agents: readonly AgentInfo[],
+    reconciled: Map<string, ReconciledTerminal>,
+    target: HerdrTarget,
+    enabled: (adapterId: string) => boolean,
+  ): Promise<Map<string, boolean | null>> =>
+    new Map(await Promise.all(agents.map(async (agent): Promise<[string, boolean | null]> => {
+      const adapter = ownerAdapter(reconciled, agent, target, resolver);
+      if (!adapter?.inputReachable || !enabled(adapter.id)) return [agent.terminal_id, null];
+      try {
+        const process = PaneProcessInfoResultSchema.parse(await request(socket, "pane.process_info", { pane_id: agent.pane_id })).process_info;
+        const pid = process.foreground_process_group_id;
+        return [agent.terminal_id, pid && adapter.isOccupant(process) ? await adapter.inputReachable(pid) : null];
+      } catch {
+        return [agent.terminal_id, null];
+      }
+    })));
+
   /** A failing check is reported as `unknown` rather than failing the overview. */
   const readCompanion = (): Promise<CompanionStatus> =>
     deps.companionStatus().then((status): CompanionStatus => ({ state: status.state, path: status.path }), (): CompanionStatus => ({ state: "unknown" }));
@@ -313,18 +335,7 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
       ]);
       const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
       const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
-      // Read-only detection: does each harness process have its input endpoint? (one process_info per agent)
-      const inputReady = new Map(await Promise.all(agents.map(async (agent): Promise<[string, boolean | null]> => {
-        const adapter = ownerAdapter(reconciled, agent, target, resolver);
-        if (!adapter?.inputReachable || !enabled(adapter.id)) return [agent.terminal_id, null];
-        try {
-          const process = PaneProcessInfoResultSchema.parse(await request(socket, "pane.process_info", { pane_id: agent.pane_id })).process_info;
-          const pid = process.foreground_process_group_id;
-          return [agent.terminal_id, pid && adapter.isOccupant(process) ? await adapter.inputReachable(pid) : null];
-        } catch {
-          return [agent.terminal_id, null];
-        }
-      })));
+      const inputReady = await readInputReady(socket, agents, reconciled, target, enabled);
       const tabNumber = new Map(tabs.map((tab) => [tab.tab_id, tab.number]));
       const out: OverviewWorkspace[] = [...workspaces].sort((a, b) => a.number - b.number).map((workspace) => {
         const firstPane = panes
@@ -378,6 +389,28 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     } catch (error) {
       return unavailable(error);
     }
+  });
+
+  server.handle(herdrDiagnosticsRpc, async (_input, { paseo }) => {
+    const { target, ompEnabled, enabled: enabledFor } = await deps.readTarget();
+    const enabled = (adapterId: string) => enabledFor?.(adapterId) ?? true;
+    const companion = await readCompanion();
+    let herdr: DiagnosticsInput["herdr"] = { connected: false, version: null, error: null };
+    let agents: DiagnosticsInput["agents"] = [];
+    try {
+      const ready = await deps.ensureReady(target);
+      herdr = { connected: true, version: ready.version, error: null };
+      const socket = target.socketPath;
+      const listed = await listPaneTargets(targets(socket));
+      const chats = await herdrChats(paseo, deps.harnesses).catch((): HerdrChat[] => []);
+      const live = new Map(listed.map((agent): [string, AgentInfo] => [agent.terminal_id, agent]));
+      const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
+      const inputReady = await readInputReady(socket, listed, reconciled, target, enabled);
+      agents = listed.map((agent) => ({ paneId: agent.pane_id, inputReady: inputReady.get(agent.terminal_id) ?? null }));
+    } catch (error) {
+      herdr = { ...herdr, error: errorMessage(error) };
+    }
+    return buildDiagnostics({ pluginVersion: PLUGIN_VERSION, target, ompEnabled, herdr, companion, agents });
   });
 
   server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }, { paseo }) => {
