@@ -14,7 +14,9 @@ import {
 } from "../shared/rpc.js";
 import {
   agentLabel,
+  archiveDuplicatesLabel,
   describeTarget,
+  duplicateChatsToArchive,
   errorMessage,
   OVERVIEW_QUERY_KEY,
   OVERVIEW_REFETCH_MS,
@@ -279,6 +281,18 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
       toast.error(`Restarted, but couldn't reopen the chat: ${errorMessage(error)}`);
     }
   }, [onChanged, paseoAgentId, navigation, paseo, ready, agent, label, toast]);
+  // Extra chats bound to this terminal make "tap an agent" ambiguous; the row's own chat is never archived.
+  const duplicates = duplicateChatsToArchive(agent);
+  const archiveDuplicates = useMutation({
+    mutationFn: async () => {
+      const results = await Promise.allSettled(duplicates.map((id) => paseo.agents.ref(id).archive()));
+      return results.filter((result) => result.status === "rejected").length;
+    },
+    onSuccess: (failed) => {
+      onChanged();
+      if (failed > 0) toast.error(`Couldn't archive ${failed} of ${duplicates.length} duplicate chats`);
+    },
+  });
   const canOpen = Boolean(navigation && (paseoAgentId || (agent.provider && cwd)));
   return (
     <View style={styles.agent}>
@@ -307,6 +321,12 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
           <Text style={styles.warning}>Read-only: it started before the input companion was installed.</Text>
           {agent.canRestart && idle ? <Button label="Restart to enable input" onPress={() => setRestarting(true)} styles={styles} /> : null}
           {agent.canRestart && !idle ? <Text style={styles.muted}>Restart is available once it's idle.</Text> : null}
+        </View>
+      ) : null}
+      {duplicates.length > 0 ? (
+        <View style={styles.row}>
+          <Text style={styles.muted}>More than one chat is bound to this agent.</Text>
+          <Button label={archiveDuplicatesLabel(duplicates.length)} secondary disabled={archiveDuplicates.isPending} onPress={() => archiveDuplicates.mutate()} styles={styles} />
         </View>
       ) : null}
       {link.error ? (

@@ -82,3 +82,18 @@ export function needsHomeExpansion(folder: string): boolean {
 export const FOLDER_SOURCE_LABELS = { herdr: "Herdr", paseo: "Paseo", filesystem: "" } as const;
 export const FOLDER_SUGGEST_DEBOUNCE_MS = 150;
 export const folderSuggestKey = (query: string) => ["herdr", "folders", query] as const;
+
+/**
+ * Chats to archive for a row's "Archive duplicate chats" action: the server's duplicate list
+ * without the row's primary chat (the one the row opens), de-duplicated, in order.
+ */
+export function duplicateChatsToArchive(agent: { paseoAgentId: string | null; duplicateChatIds: readonly string[] }): string[] {
+  const ids = new Set<string>();
+  for (const id of agent.duplicateChatIds) if (id && id !== agent.paseoAgentId) ids.add(id);
+  return [...ids];
+}
+
+/** Button text for archiving `count` duplicate chats. */
+export function archiveDuplicatesLabel(count: number): string {
+  return `Archive ${count} duplicate ${count === 1 ? "chat" : "chats"}`;
+}

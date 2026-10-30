@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
+import { archiveDuplicatesLabel, duplicateChatsToArchive, folderFieldValue, needsHomeExpansion, agentLabel, describeTarget, pathTail, statusLabel, statusTone, validateFolder } from "../client/helpers.js";
 
 describe("client helpers", () => {
   it("labels and tones statuses", () => {
@@ -42,5 +42,14 @@ describe("agentLabel", () => {
     expect(agentLabel({ ...base, title: "π > ", name: "paseo-abc123" })).toBe("paseo-abc123");
     expect(agentLabel(base)).toBe("omp");
     expect(agentLabel({ ...base, kind: null })).toBe("term_1");
+  });
+  it("archives only the duplicates, never the row's primary chat", () => {
+    expect(duplicateChatsToArchive({ paseoAgentId: "new", duplicateChatIds: ["old1", "old2"] })).toEqual(["old1", "old2"]);
+    expect(duplicateChatsToArchive({ paseoAgentId: "new", duplicateChatIds: ["old1", "new", "old1", ""] })).toEqual(["old1"]);
+    expect(duplicateChatsToArchive({ paseoAgentId: null, duplicateChatIds: [] })).toEqual([]);
+  });
+  it("words the archive-duplicates action by count", () => {
+    expect(archiveDuplicatesLabel(1)).toBe("Archive 1 duplicate chat");
+    expect(archiveDuplicatesLabel(3)).toBe("Archive 3 duplicate chats");
   });
 });
