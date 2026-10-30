@@ -88,7 +88,7 @@ function CopyDiagnostics({ theme }: { theme: PluginSurfaceProps["theme"] }) {
         />
       </SettingsCard>
       <Text style={muted}>
-        Plugin version, Herdr target and version, input companion state and, per agent, its pane and whether input is ready. No prompts, transcripts, folders or environment values.
+        Plugin version, Herdr target and version, input companion state and, per agent, its pane and whether input is ready. No prompts, transcripts, working folders or environment values; your home directory shows as ~ in paths.
       </Text>
       {state.status === "copied" ? <Text style={fg}>Copied to the clipboard.</Text> : null}
       {state.status === "failed" ? (

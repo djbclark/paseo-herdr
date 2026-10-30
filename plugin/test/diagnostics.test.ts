@@ -115,6 +115,62 @@ it("buildDiagnostics copies allowlisted fields only, counts readiness and bounds
   expect(JSON.stringify(out)).not.toMatch(/secret/);
 });
 
+const homeInput = (over: Partial<DiagnosticsInput>): DiagnosticsInput => ({
+  pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: null, error: null }, companion: { state: "current" }, agents: [], home: "/Users/bob", ...over,
+});
+
+it("buildDiagnostics shows a path under the home directory as ~/..., in the socket, companion path and error text", () => {
+  const out = buildDiagnostics(homeInput({
+    target: baseTarget("/Users/bob/.config/herdr/herdr.sock"),
+    companion: { state: "missing", path: "/Users/bob/.omp/agent/extensions/paseo4herdr-input.ts" },
+    herdr: { connected: false, version: null, error: "Herdr is not running at /Users/bob/.config/herdr/herdr.sock (ENOENT /Users/bob/.config/herdr/herdr.sock)" },
+  }));
+  expect(out.target.socketPath).toBe("~/.config/herdr/herdr.sock");
+  expect(out.companion.path).toBe("~/.omp/agent/extensions/paseo4herdr-input.ts");
+  expect(out.herdr.error).toBe("Herdr is not running at ~/.config/herdr/herdr.sock (ENOENT ~/.config/herdr/herdr.sock)");
+  expect(JSON.stringify(out)).not.toContain("bob");
+});
+
+it("buildDiagnostics also abbreviates the home directory itself and one that ends the text or is quoted", () => {
+  const out = buildDiagnostics(homeInput({
+    target: baseTarget("/Users/bob"),
+    herdr: { connected: false, version: null, error: "cannot read '/Users/bob': denied; tried /Users/bob" },
+  }));
+  expect(out.target.socketPath).toBe("~");
+  expect(out.herdr.error).toBe("cannot read '~': denied; tried ~");
+});
+
+it("buildDiagnostics leaves paths outside the home directory alone", () => {
+  const out = buildDiagnostics(homeInput({
+    target: baseTarget("/run/user/1000/herdr.sock"),
+    companion: { state: "missing", path: "/opt/Users/bob/x.ts" },
+    herdr: { connected: false, version: null, error: "no socket at /tmp/herdr.sock" },
+  }));
+  expect(out.target.socketPath).toBe("/run/user/1000/herdr.sock");
+  expect(out.companion.path).toBe("/opt/Users/bob/x.ts");
+  expect(out.herdr.error).toBe("no socket at /tmp/herdr.sock");
+});
+
+it("buildDiagnostics only abbreviates on a path-segment boundary", () => {
+  const out = buildDiagnostics(homeInput({
+    target: baseTarget("/Users/bobby/herdr.sock"),
+    companion: { state: "missing", path: "/Users/bob.old/x.ts" },
+    herdr: { connected: false, version: null, error: "at /Users/bobby/a and /Users/bob/b" },
+  }));
+  expect(out.target.socketPath).toBe("/Users/bobby/herdr.sock");
+  expect(out.companion.path).toBe("/Users/bob.old/x.ts");
+  expect(out.herdr.error).toBe("at /Users/bobby/a and ~/b");
+});
+
+it("buildDiagnostics abbreviates the home directory before cutting the error text, and a trailing-slash home still matches", () => {
+  const out = buildDiagnostics(homeInput({
+    home: "/Users/bob/",
+    herdr: { connected: false, version: null, error: `${"x".repeat(290)} /Users/bob/.config/herdr.sock` },
+  }));
+  expect(out.herdr.error).not.toContain("/Users");
+  expect(out.herdr.error).toBe(`${"x".repeat(290)} ~/.config`);
+});
+
 it("diagnosticsText is pretty-printed JSON that round-trips", () => {
   const d = buildDiagnostics({ pluginVersion: "1", target: baseTarget("/s"), ompEnabled: true, herdr: { connected: true, version: "0.9.3", error: null }, companion: { state: "current" }, agents: [] });
   const text = diagnosticsText(d);
