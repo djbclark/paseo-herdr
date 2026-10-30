@@ -33,6 +33,27 @@ function readIfExists(file) {
   catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") return null; throw error; }
 }
 
+/** Legacy path read that never throws: any error means "not ours, ignore" (a directory or unreadable file must not block the new companion). */
+function readLegacy(file) {
+  try { return readIfExists(file); }
+  catch (error) {
+    console.error(`ignoring legacy path ${file}: ${error.code ?? error.message}`);
+    return null;
+  }
+}
+
+/** Removes the legacy companion; returns false (after telling the operator) when it cannot be removed. */
+function removeLegacyFile(file) {
+  try {
+    fs.rmSync(file);
+    console.log(`removed legacy: ${file}`);
+    return true;
+  } catch (error) {
+    console.error(`could not remove legacy companion ${file}: ${error.code ?? error.message}; remove it by hand, OMP will load both`);
+    return false;
+  }
+}
+
 /** Write to a temp file in the same directory, then rename over the target. */
 function writeAtomic(target, content) {
   const temp = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -60,7 +81,7 @@ export function main(argv, env, home) {
     return 0;
   }
   const current = readIfExists(target);
-  const legacy = readIfExists(legacyTarget);
+  const legacy = readLegacy(legacyTarget);
   const legacyOurs = legacy !== null && legacy.startsWith(LEGACY_MARKER);
   if (argv.includes("--uninstall")) {
     if (current === null && legacy === null) {
@@ -79,8 +100,7 @@ export function main(argv, env, home) {
     }
     if (legacy !== null) {
       if (legacyOurs) {
-        fs.rmSync(legacyTarget);
-        console.log(`removed legacy: ${legacyTarget}`);
+        if (!removeLegacyFile(legacyTarget)) code = 1;
       } else {
         console.error(`Refusing to remove ${legacyTarget}: it is not a paseo-herdr companion.`);
         code = 1;
@@ -94,15 +114,15 @@ export function main(argv, env, home) {
     return 1;
   }
   const source = fs.readFileSync(SOURCE, "utf8");
+  let legacyFailed = false;
   const removeLegacy = () => {
-    if (!legacyOurs) return;
-    fs.rmSync(legacyTarget);
-    console.log(`removed legacy: ${legacyTarget}`);
+    if (legacy !== null && !legacyOurs) console.log(`left ${legacyTarget}: not a paseo-herdr companion`);
+    if (legacyOurs && !removeLegacyFile(legacyTarget)) legacyFailed = true;
   };
   if (current === source) {
     console.log(`already current: ${target}`);
     removeLegacy();
-    return 0;
+    return legacyFailed ? 1 : 0;
   }
   let label = "installed";
   if (current !== null) {
@@ -120,7 +140,7 @@ export function main(argv, env, home) {
   removeLegacy();
   console.log("Restart running OMP agents: OMP loads extensions only at startup. Do not also pass this file with -e.");
   console.log("On Paseo's Herdr screen, Restart to enable input restarts an idle agent in place.");
-  return 0;
+  return legacyFailed ? 1 : 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

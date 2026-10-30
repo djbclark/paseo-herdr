@@ -38,13 +38,19 @@ export async function companionInstallStatus(
   const dir = ompExtensionDir(env, home);
   const target = path.join(dir, COMPANION_INSTALL_NAME);
   const installed = await readIfExists(target);
+  const legacyPath = path.join(dir, LEGACY_COMPANION_NAME);
+  // Any legacy read error (EISDIR, EACCES, ...) counts as no legacy file.
+  const legacy = await readIfExists(legacyPath).catch(() => null);
+  const legacyOurs = legacy !== null && legacy.startsWith(LEGACY_MARKER);
   if (installed === null) {
     // Only the pre-rename companion is installed: report it outdated so the diagnostic points at the installer, which migrates it.
-    const legacyPath = path.join(dir, LEGACY_COMPANION_NAME);
-    const legacy = await readIfExists(legacyPath);
-    if (legacy !== null && legacy.startsWith(LEGACY_MARKER)) return { state: "outdated", path: legacyPath };
+    if (legacyOurs) return { state: "outdated", path: legacyPath };
     return { state: "missing", path: target };
   }
-  if (createHash("sha256").update(installed).digest("hex") === COMPANION_SHA256) return { state: "current", path: target };
+  if (createHash("sha256").update(installed).digest("hex") === COMPANION_SHA256) {
+    // OMP loads every file in the extensions directory: a leftover legacy companion means two are active, so not current.
+    if (legacyOurs) return { state: "outdated", path: legacyPath };
+    return { state: "current", path: target };
+  }
   return { state: installed.startsWith(COMPANION_MARKER) ? "outdated" : "foreign", path: target };
 }

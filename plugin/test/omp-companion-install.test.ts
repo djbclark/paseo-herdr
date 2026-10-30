@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import fs, { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -175,6 +175,7 @@ describe("installer main", () => {
       const result = run([]);
       expect(result.code).toBe(0);
       expect(result.out).not.toContain("removed legacy");
+      expect(result.out).toContain(`left ${legacyTarget}: not a paseo-herdr companion`);
       expect(await readFile(legacyTarget, "utf8")).toBe(FOREIGN);
       expect(await readFile(target, "utf8")).toBe(SOURCE);
     });
@@ -227,6 +228,66 @@ describe("installer main", () => {
       await writeFile(legacyTarget, LEGACY_SOURCE);
       expect(run(["--print-path"]).out).toBe(target);
     });
+
+    it("install ignores an unreadable legacy path (a directory) with a warning and still writes the new companion", async () => {
+      await mkdir(legacyTarget);
+      const result = run([]);
+      expect(result.code).toBe(0);
+      expect(result.out).toContain(`installed: ${target}`);
+      expect(result.err).toContain(`ignoring legacy path ${legacyTarget}: EISDIR`);
+      expect(await readFile(target, "utf8")).toBe(SOURCE);
+    });
+
+    it("uninstall ignores an unreadable legacy path and still removes the new companion", async () => {
+      await writeFile(target, SOURCE);
+      await mkdir(legacyTarget);
+      const result = run(["--uninstall"]);
+      expect(result.code).toBe(0);
+      expect(result.out).toContain(`removed: ${target}`);
+      expect(existsSync(target)).toBe(false);
+      expect(existsSync(legacyTarget)).toBe(true);
+    });
+
+    // Removing a file as a non-root user cannot be made to fail portably, so the failure is injected by stubbing fs.rmSync for the legacy path only.
+    const hint = `could not remove legacy companion ${"LEGACY"}: EACCES; remove it by hand, OMP will load both`;
+    function failLegacyRemoval<T>(body: () => T): T {
+      const real = fs.rmSync;
+      const spy = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+        if (String(file).endsWith(LEGACY_COMPANION_NAME)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return real(file, options);
+      });
+      try { return body(); } finally { spy.mockRestore(); }
+    }
+
+    it("install keeps going when the legacy file cannot be removed: success lines and restart hint, then exit 1", async () => {
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = failLegacyRemoval(() => run([]));
+      expect(result.code).toBe(1);
+      expect(result.out).toContain(`installed: ${target}`);
+      expect(result.out).toContain("Restart running OMP agents");
+      expect(result.err).toContain(hint.replace("LEGACY", legacyTarget));
+      expect(await readFile(target, "utf8")).toBe(SOURCE);
+      expect(existsSync(legacyTarget)).toBe(true);
+    });
+
+    it("install exits 1 when the new file is already current but the legacy file cannot be removed", async () => {
+      await writeFile(target, SOURCE);
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = failLegacyRemoval(() => run([]));
+      expect(result.code).toBe(1);
+      expect(result.out).toContain("already current");
+      expect(result.err).toContain(hint.replace("LEGACY", legacyTarget));
+    });
+
+    it("uninstall removes the new companion, reports an unremovable legacy file and exits 1", async () => {
+      await writeFile(target, SOURCE);
+      await writeFile(legacyTarget, LEGACY_SOURCE);
+      const result = failLegacyRemoval(() => run(["--uninstall"]));
+      expect(result.code).toBe(1);
+      expect(result.out).toContain(`removed: ${target}`);
+      expect(result.err).toContain(hint.replace("LEGACY", legacyTarget));
+      expect(existsSync(target)).toBe(false);
+    });
   });
 
   it("honours PI_CODING_AGENT_DIR for the target directory", async () => {
@@ -269,9 +330,24 @@ describe("companionInstallStatus", () => {
     expect(await companionInstallStatus(env, home)).toEqual({ state: "missing", path: target });
   });
 
-  it("lets the new file govern when both exist", async () => {
+  it("downgrades a current new file to outdated at the legacy path while a legacy companion is still present", async () => {
+    await mkdir(extDir, { recursive: true });
+    const legacyPath = path.join(extDir, LEGACY_COMPANION_NAME);
+    await writeFile(legacyPath, LEGACY_SOURCE);
+    await writeFile(target, SOURCE);
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "outdated", path: legacyPath });
+  });
+
+  it("keeps the new file's own state when it is not current and a legacy companion also exists", async () => {
     await mkdir(extDir, { recursive: true });
     await writeFile(path.join(extDir, LEGACY_COMPANION_NAME), LEGACY_SOURCE);
+    await writeFile(target, FOREIGN);
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "foreign", path: target });
+  });
+
+  it("treats an unreadable legacy path (a directory) as no legacy file", async () => {
+    await mkdir(path.join(extDir, LEGACY_COMPANION_NAME), { recursive: true });
+    expect(await companionInstallStatus(env, home)).toEqual({ state: "missing", path: target });
     await writeFile(target, SOURCE);
     expect(await companionInstallStatus(env, home)).toEqual({ state: "current", path: target });
   });
