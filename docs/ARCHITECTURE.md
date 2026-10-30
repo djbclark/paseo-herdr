@@ -44,7 +44,7 @@ Seam 2 is one fresh connection per request (5 s timeout; 15 s for `agent.prompt`
 | `discovery.ts` | Builds the Import session list from `agent.list`. |
 | `launch.ts` | `launchAgent`: workspace or tab creation, `agent.start`, readiness polling, cleanup on failure. |
 | `restart.ts` | `restartAgent`: in-place SIGTERM and resume for "Restart to enable input". |
-| `rpc.ts` | `registerManagementRpcs`: `herdr.target`, `herdr.overview`, `herdr.agent.restart`, `herdr.chat.ready`, `herdr.workspace.create`, `herdr.folders.suggest`; chat reconciliation per terminal. |
+| `rpc.ts` | `registerManagementRpcs`: `herdr.target`, `herdr.overview`, `herdr.diagnostics`, `herdr.agent.restart`, `herdr.chat.ready`, `herdr.workspace.create`, `herdr.folders.suggest`; chat reconciliation per terminal. |
 | `folders.ts` | Folder suggestion and `~` expansion. |
 | `timeline.ts` | Stable-id diffing of transcript snapshots into `timeline.item` rows. |
 | `file-tail.ts` | `FileTail`: incremental, torn-line-tolerant reads of a growing file. |

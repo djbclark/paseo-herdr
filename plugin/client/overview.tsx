@@ -14,8 +14,14 @@ import {
 } from "../shared/rpc.js";
 import {
   agentLabel,
+  archiveDuplicatesLabel,
+  archiveFailureMessage,
+  companionBanner,
   describeTarget,
+  duplicateArchiveSkippedMessage,
+  duplicateChatsToArchive,
   errorMessage,
+  freshDuplicatesToArchive,
   OVERVIEW_QUERY_KEY,
   OVERVIEW_REFETCH_MS,
   statusLabel,
@@ -242,6 +248,7 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
   const readOnly = agent.inputReady === false;
   const idle = agent.status === "idle" || agent.status === "done";
   const ready = useRpc(herdrChatReadyRpc);
+  const fetchOverview = useRpc(herdrOverviewRpc);
   // Not linked yet: create a chat bound to this running agent (no new process) and open it.
   const link = useMutation({
     mutationFn: () => bindHerdrChat(paseo, ready, agent, label),
@@ -279,6 +286,23 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
       toast.error(`Restarted, but couldn't reopen the chat: ${errorMessage(error)}`);
     }
   }, [onChanged, paseoAgentId, navigation, paseo, ready, agent, label, toast]);
+  // Extra chats bound to this terminal make "tap an agent" ambiguous; the row's own chat is never archived.
+  const duplicates = duplicateChatsToArchive(agent);
+  const archiveDuplicates = useMutation({
+    // The row is up to one refetch old: archive only what a fresh overview still lists as duplicates of the same owner.
+    mutationFn: async () => {
+      const plan = freshDuplicatesToArchive(agent, (await fetchOverview({})).workspaces);
+      if (plan.skip) return { skip: plan.skip, failure: null };
+      const results = await Promise.allSettled(plan.archive.map((id) => paseo.agents.ref(id).archive()));
+      return { skip: null, failure: archiveFailureMessage(results) };
+    },
+    onSuccess: ({ skip, failure }) => {
+      onChanged();
+      if (skip) toast.show(duplicateArchiveSkippedMessage(skip), { variant: "info" });
+      else if (failure) toast.error(failure);
+    },
+    onError: (error) => toast.error(`Couldn't check the chats before archiving: ${errorMessage(error)}`),
+  });
   const canOpen = Boolean(navigation && (paseoAgentId || (agent.provider && cwd)));
   return (
     <View style={styles.agent}>
@@ -307,6 +331,12 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
           <Text style={styles.warning}>Read-only: it started before the input companion was installed.</Text>
           {agent.canRestart && idle ? <Button label="Restart to enable input" onPress={() => setRestarting(true)} styles={styles} /> : null}
           {agent.canRestart && !idle ? <Text style={styles.muted}>Restart is available once it's idle.</Text> : null}
+        </View>
+      ) : null}
+      {duplicates.length > 0 ? (
+        <View style={styles.row}>
+          <Text style={styles.muted}>More than one chat is bound to this agent.</Text>
+          <Button label={archiveDuplicatesLabel(duplicates.length)} secondary disabled={archiveDuplicates.isPending} onPress={() => archiveDuplicates.mutate()} styles={styles} />
         </View>
       ) : null}
       {link.error ? (
@@ -475,6 +505,7 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
     void queryClient.invalidateQueries({ queryKey: OVERVIEW_QUERY_KEY });
   }, [queryClient]);
   const data = query.data;
+  const companionNotice = data ? companionBanner(data.companion, data.ompEnabled) : null;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.root}>
@@ -490,6 +521,7 @@ export function HerdrOverviewScreen({ theme, layout, navigation }: PluginScreenP
       {!data && !query.error ? <Text style={styles.muted}>Loading…</Text> : null}
       {data ? (
         <>
+          {companionNotice ? <Text accessibilityRole="alert" style={styles.warning}>{companionNotice}</Text> : null}
           {data.connection.status !== "connected" ? (
             <Text accessibilityRole="alert" style={styles.danger}>
               Herdr unavailable: {data.connection.error}

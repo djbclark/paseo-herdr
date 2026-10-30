@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { Text } from "react-native";
+import { copyText } from "@getpaseo/plugin/client/react-native";
 import { useRpc, useSettings, type PluginSurfaceProps, type SettingsState } from "@getpaseo/plugin/client";
 import {
   SettingsAction,
@@ -10,9 +11,9 @@ import {
   SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { herdrTargetRpc } from "../shared/rpc.js";
+import { herdrDiagnosticsRpc, herdrTargetRpc } from "../shared/rpc.js";
 import { herdrSettings } from "../shared/settings.js";
-import { describeTarget, errorMessage, OVERVIEW_QUERY_KEY, TARGET_QUERY_KEY } from "./helpers.js";
+import { describeTarget, diagnosticsText, errorMessage, OVERVIEW_QUERY_KEY, TARGET_QUERY_KEY } from "./helpers.js";
 
 type Ready = Extract<SettingsState<typeof herdrSettings.schema>, { status: "ready" }>;
 
@@ -48,6 +49,58 @@ function EffectiveTarget({ theme, version }: { theme: PluginSurfaceProps["theme"
           )}
         </SettingsRow>
       </SettingsCard>
+    </SettingsSection>
+  );
+}
+
+/** Bug-report data in one tap: fetched from the daemon on press, never polled. */
+function CopyDiagnostics({ theme }: { theme: PluginSurfaceProps["theme"] }) {
+  const fetchDiagnostics = useRpc(herdrDiagnosticsRpc);
+  const [state, setState] = useState<{ status: "idle" | "busy" | "copied" } | { status: "failed"; error: string; text?: string }>({ status: "idle" });
+  const muted = useMemo(() => ({ color: theme.colors.foregroundMuted }), [theme]);
+  const fg = useMemo(() => ({ color: theme.colors.foreground }), [theme]);
+  const danger = useMemo(() => ({ color: theme.colors.statusDanger }), [theme]);
+  const copy = useCallback(async () => {
+    setState({ status: "busy" });
+    let text: string;
+    try {
+      text = diagnosticsText(await fetchDiagnostics({}));
+    } catch (error) {
+      setState({ status: "failed", error: errorMessage(error) });
+      return;
+    }
+    try {
+      await copyText(text);
+      setState({ status: "copied" });
+    } catch (error) {
+      // No clipboard on this client: show the text so it can be selected by hand.
+      setState({ status: "failed", error: `Couldn't copy (${errorMessage(error)}). Select the text below and copy it.`, text });
+    }
+  }, [fetchDiagnostics]);
+  return (
+    <SettingsSection title="Diagnostics">
+      <SettingsCard>
+        <SettingsAction
+          label="Bug report info"
+          actionLabel={state.status === "busy" ? "Collecting…" : "Copy diagnostics"}
+          disabled={state.status === "busy"}
+          onPress={copy}
+        />
+      </SettingsCard>
+      <Text style={muted}>
+        Plugin version, Herdr target and version, input companion state and, per agent, its pane and whether input is ready. No prompts, transcripts, working folders or environment values; your home directory shows as ~ in paths.
+      </Text>
+      {state.status === "copied" ? <Text style={fg}>Copied to the clipboard.</Text> : null}
+      {state.status === "failed" ? (
+        <Text accessibilityRole="alert" style={danger}>
+          {state.error}
+        </Text>
+      ) : null}
+      {state.status === "failed" && state.text ? (
+        <Text selectable style={fg}>
+          {state.text}
+        </Text>
+      ) : null}
     </SettingsSection>
   );
 }
@@ -130,6 +183,7 @@ function HerdrSettingsForm({ settings, theme }: { settings: Ready; theme: Plugin
         ) : null}
       </SettingsSection>
       <EffectiveTarget theme={theme} version={String(saves)} />
+      <CopyDiagnostics theme={theme} />
     </>
   );
 }

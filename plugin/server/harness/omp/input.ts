@@ -8,6 +8,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSessionRef } from "../../herdr/schema.js";
 import { companionInstallStatus } from "./companion-install.js";
+import { COMPANION_INSTALL_STEP } from "../../../shared/companion.js";
 import type {
   ApprovalSnapshot, ConfigTarget, ConfigureResult, Decision, DecisionRecord, HarnessConfig, HarnessModel, PendingDecision,
   ResolveResult, RestoredPromptOutcome,
@@ -122,7 +123,7 @@ async function companionUnavailableMessage(ref: AgentSessionRef, detail: string)
   const resume = `omp --resume ${ref.value.includes(" ") ? JSON.stringify(ref.value) : ref.value}`;
   return installed
     ? `This OMP process started before the input companion was installed (OMP loads extensions only at startup), so this session is read-only. To type here, quit OMP in its Herdr pane and run \`${resume}\` in the same pane, then reopen this chat. Paseo never restarts agents itself. (${detail})`
-    : `The required OMP input companion is unavailable; this session is read-only. Install it with npm run install:omp-companion in paseo4herdr/plugin, then quit OMP in its Herdr pane and run \`${resume}\` in the same pane (OMP loads extensions only at startup). Paseo never restarts agents itself. (${detail})`;
+    : `The required OMP input companion is unavailable; this session is read-only. To install it, ${COMPANION_INSTALL_STEP}, then quit OMP in its Herdr pane and run \`${resume}\` in the same pane (OMP loads extensions only at startup). Paseo never restarts agents itself. (${detail})`;
 }
 
 /** Establish input identity without requiring the editor to be empty or idle. */

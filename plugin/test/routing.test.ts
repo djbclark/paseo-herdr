@@ -122,6 +122,7 @@ it("enableOmp=false hides only herdr-omp from the overview", async () => {
     readTarget: async () => ({ target, ompEnabled: false, enabled: (adapterId: string) => adapterId !== "omp" }),
     ensureReady: async (t) => ({ target: t, version: "0.9.3", autoStarted: false }),
     harnesses: [ompAdapter, fakeKind],
+    companionStatus: async () => ({ state: "current", path: "/fake/ext/paseo4herdr-input.ts" }),
     resolver: createResolver([ompAdapter, fakeKind]),
     env: { PATH: "/nonexistent" },
     findHerdr: async () => null,

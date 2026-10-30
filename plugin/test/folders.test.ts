@@ -26,6 +26,7 @@ function setup(overrides: Partial<ManagementDeps> = {}) {
     readTarget: async () => ({ target, ompEnabled: true }),
     ensureReady: async (t) => ({ target: t, version: "0.9.3", autoStarted: false }),
     harnesses: [ompAdapter],
+    companionStatus: async () => ({ state: "current", path: "/fake/ext/paseo4herdr-input.ts" }),
     homedir: () => home,
     ...overrides,
   });
@@ -124,6 +125,7 @@ describe("herdr.workspace.create with ~", () => {
       readTarget: async () => ({ target: { socketPath: fake.socketPath, herdrSession: null, source: "default", autoStart: false, autoStartDisabledReason: null }, ompEnabled: true }),
       ensureReady: async (t) => ({ target: t, version: "0.9.3", autoStarted: false }),
       harnesses: [ompAdapter], homedir: () => home,
+      companionStatus: async () => ({ state: "current", path: "/fake/ext/paseo4herdr-input.ts" }),
     });
     const out = await handlers.get(herdrWorkspaceCreateRpc.name)!({ cwd: "~/docs" }, {});
     expect(out).toMatchObject({ label: "docs" });

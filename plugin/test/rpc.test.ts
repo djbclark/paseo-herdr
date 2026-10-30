@@ -26,6 +26,7 @@ function setup(overrides: Partial<ManagementDeps> = {}) {
     readTarget: async () => ({ target: t, ompEnabled: true }),
     ensureReady: async (x) => ({ target: x, version: "0.9.3", autoStarted: false }),
     harnesses: [ompAdapter],
+    companionStatus: async () => ({ state: "current", path: "/fake/ext/paseo4herdr-input.ts" }),
     ...overrides,
   });
   return { t, call: (rpc: { name: string }, input: unknown, paseo: unknown = {}) => handlers.get(rpc.name)!(input, { paseo }) };
@@ -334,4 +335,36 @@ it("a pane-mode chat that never bound a process stays live and costs no process 
   const row = await paneRow({ pid: 99 })([paneChat("never-validated", null)]);
   expect(row.paseoAgentId).toBe("never-validated");
   expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
+});
+
+it("overview reports the companion state, including when the check fails or Herdr is unavailable", async () => {
+  seed();
+  const states = [
+    { state: "missing", path: "/fake/ext/paseo4herdr-input.ts" },
+    { state: "outdated", path: "/fake/ext/paseo-herdr-input.ts" },
+    { state: "foreign", path: "/fake/ext/paseo4herdr-input.ts" },
+  ] as const;
+  for (const status of states) {
+    const { call } = setup({ companionStatus: async () => status });
+    const result = herdrOverviewRpc.output.parse(await call(herdrOverviewRpc, {}, list([])));
+    expect(result.companion).toEqual(status);
+  }
+  const failing = setup({ companionStatus: async () => { throw new Error("EACCES: /secret/dir"); } });
+  const broken = herdrOverviewRpc.output.parse(await failing.call(herdrOverviewRpc, {}, list([])));
+  expect(broken.companion).toEqual({ state: "unknown" });
+  expect(broken.workspaces).toHaveLength(1);
+  const offline = setup({ ensureReady: async () => { throw new Error("Herdr is not running"); }, companionStatus: async () => states[0] });
+  expect(herdrOverviewRpc.output.parse(await offline.call(herdrOverviewRpc, {}, list([]))).companion).toEqual(states[0]);
+});
+
+it("overview schema requires a known companion state when one is sent, and accepts a response from a daemon that sends none", () => {
+  const base = { target: target("/s"), ompEnabled: true, connection: { status: "unavailable", error: "x" }, workspaces: [], chatError: null };
+  expect(herdrOverviewRpc.output.safeParse({ ...base, companion: { state: "current" } }).success).toBe(true);
+  expect(herdrOverviewRpc.output.safeParse({ ...base, companion: { state: "broken" } }).success).toBe(false);
+  expect(herdrOverviewRpc.output.safeParse(base).success).toBe(true);
+});
+
+it("the server always sends the companion state in the overview", async () => {
+  const { call } = setup();
+  expect(herdrOverviewRpc.output.parse(await call(herdrOverviewRpc, {}, list([]))).companion).toBeDefined();
 });

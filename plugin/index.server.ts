@@ -4,6 +4,7 @@ import { createResolver } from "./server/harness/resolve.js";
 import { ompAdapter } from "./server/harness/omp/adapter.js";
 import { createHerdrProvider } from "./server/provider.js";
 import { registerManagementRpcs } from "./server/rpc.js";
+import { companionInstallStatus } from "./server/harness/omp/companion-install.js";
 import { BoundSessions } from "./server/bound-sessions.js";
 import { TargetReadiness, defaultTargetReadinessDeps, resolveTarget } from "./server/herdr/target.js";
 import { PaseoHost } from "./server/host.js";
@@ -51,6 +52,6 @@ export default function contribute(server: PluginServerContext) {
       getPaseo: () => host.get(),
     }));
   }
-  registerManagementRpcs(server, { readTarget, ensureReady: (target) => readiness.ensureReady(target), harnesses, boundSessions, resolver });
+  registerManagementRpcs(server, { readTarget, ensureReady: (target) => readiness.ensureReady(target), harnesses, boundSessions, resolver, companionStatus: () => companionInstallStatus() });
   return () => {};
 }

@@ -73,10 +73,10 @@ Run `omp` once before installing, so OMP's agent directory exists.
 
 Paseo runs `node scripts/install-omp-companion.mjs` on install and on every update. It writes `paseo4herdr-input.ts` into `$PI_CODING_AGENT_DIR/extensions`, otherwise `~/.omp/agent/extensions`, and prints the path first. It also removes the pre-rename companion `paseo-herdr-input.ts` from that directory when it is one this project wrote, so OMP does not load two. It fails without writing anything if OMP's agent directory is missing, and it never replaces a file it didn't write. Install logs are in `$PASEO_HOME/daemon.log`.
 
-To remove the companion, run this from a clone of this repository:
+To remove the companion, run this from the installed plugin directory (from a clone, `plugin/`):
 
 ```bash
-node plugin/scripts/install-omp-companion.mjs --uninstall
+node scripts/install-omp-companion.mjs --uninstall
 ```
 
 ## Update
@@ -86,6 +86,8 @@ paseo plugin update herdr-harness
 ```
 
 Updates follow this repository's default branch. After an update, restart your OMP agents so they load the new companion.
+
+If Paseo reports the input companion as missing or outdated, `paseo plugin update herdr-harness` reruns the install step. To run it directly, use `node scripts/install-omp-companion.mjs` from the installed plugin directory; a Git install has no `npm run` script. See [Companion missing, outdated or foreign](docs/TROUBLESHOOTING.md#companion-missing-outdated-or-foreign).
 
 ## Configure
 

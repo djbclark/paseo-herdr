@@ -35,27 +35,33 @@ Paseo never restarts an agent unless you confirm it.
 
 ## Companion missing, outdated or foreign
 
-The `OMP (Herdr)` provider reports one of these. The provider stays available and imported agents are read-only until it is fixed.
+The `OMP (Herdr)` provider reports one of these. The provider stays available and imported agents are read-only until it is fixed. The Herdr screen shows the same state as a warning at the top (it names the command to run, and appears whenever the companion isn't current and OMP is enabled in settings); the screen never installs anything itself.
 
 | Status text | Meaning | Fix |
 |---|---|---|
-| "OMP input companion is not installed; imported agents are read-only." | `paseo4herdr-input.ts` isn't in OMP's extensions directory. | Run the installer ([below](#run-the-installer-by-hand)), then restart OMP agents. |
-| "OMP input companion is outdated." | The installed file differs from this plugin's, or an old `paseo-herdr-input.ts` is still present next to a current one (OMP would load both). | Rerun the installer. It updates the file and removes the old companion. |
-| "A different file exists at …. Rerun the installer with --force to replace it." | A file named `paseo4herdr-input.ts` exists that this project didn't write (it doesn't start with the marker line). | Inspect it. If it is safe to lose, run the installer with `--force`. |
+| "OMP input companion is not installed; imported agents are read-only." | `paseo4herdr-input.ts` isn't in OMP's extensions directory. | Run `paseo plugin update herdr-harness`, or the installer directly ([below](#run-the-installer-by-hand)), then restart OMP agents. |
+| "OMP input companion is outdated." | The installed file differs from this plugin's, or an old `paseo-herdr-input.ts` is still present next to a current one (OMP would load both). | Run `paseo plugin update herdr-harness`, or rerun the installer. It updates the file and removes the old companion. |
+| "A different file exists at …. To replace it, run `node scripts/install-omp-companion.mjs --force` from the installed plugin directory." | A file named `paseo4herdr-input.ts` exists that this project didn't write (it doesn't start with the marker line). | Inspect it. If it is safe to lose, run the installer with `--force`. |
 | "Input companion check failed: …" | The check itself threw, for example an unreadable directory. | Fix the error shown (permissions on OMP's extensions directory). |
 
 ### Run the installer by hand
 
-Paseo runs the installer on `paseo plugin install` and `paseo plugin update`. A plugin installed from a directory doesn't run it. Run it yourself from a clone of this repository:
+Paseo runs the installer (`node scripts/install-omp-companion.mjs`) on `paseo plugin install` and `paseo plugin update`, so for a Git install the usual repair is:
 
 ```bash
-node plugin/scripts/install-omp-companion.mjs            # install or update
-node plugin/scripts/install-omp-companion.mjs --force    # replace a file it didn't write
-node plugin/scripts/install-omp-companion.mjs --uninstall
-node plugin/scripts/install-omp-companion.mjs --print-path
+paseo plugin update herdr-harness
 ```
 
-(`npm run install:omp-companion` in `plugin/` is the same as the first line.) The installer prints where it writes, and prints one of `installed`, `updated`, `replaced` or `already current`. Output of a Paseo-run install is in `$PASEO_HOME/daemon.log`.
+To run it directly, use the installed plugin directory as the working directory; there is no `npm run` script to look for outside a clone. For a Git install that directory is `$PASEO_HOME/plugins/herdr-harness/<id>/checkout/plugin` (`~/.paseo/plugins/herdr-harness/<id>/checkout/plugin` by default); `<id>` is a generated folder name, so `ls "${PASEO_HOME:-$HOME/.paseo}/plugins/herdr-harness"` to find it, then `cd` into `<id>/checkout/plugin`. This is the layout Paseo created when this was written, not a documented contract: if the path isn't there, look for `install-omp-companion.mjs` under `$PASEO_HOME/plugins`. A plugin installed from a directory doesn't run the install step at all, so developers run it from a clone's `plugin/` directory (or `node plugin/scripts/install-omp-companion.mjs` from the repository root):
+
+```bash
+node scripts/install-omp-companion.mjs            # install or update
+node scripts/install-omp-companion.mjs --force    # replace a file it didn't write
+node scripts/install-omp-companion.mjs --uninstall
+node scripts/install-omp-companion.mjs --print-path
+```
+
+(In a clone, `npm run install:omp-companion` in `plugin/` is the same as the first line.) The installer prints where it writes, and prints one of `installed`, `updated`, `replaced` or `already current`. Output of a Paseo-run install is in `$PASEO_HOME/daemon.log`.
 
 ## OMP agent directory missing
 
@@ -215,7 +221,9 @@ Herdr agents keep running; they only lose the Paseo side.
 
 ## What to put in a bug report
 
-Open an issue at <https://github.com/djbclark/paseo4herdr/issues> with:
+Open an issue at <https://github.com/djbclark/paseo4herdr/issues>.
+
+Start with **Settings → Herdr → Diagnostics → Copy diagnostics** and paste the result. It holds the plugin version, the resolved Herdr target (socket, session, source, auto-start), Herdr's version (and `autoStarted`: whether this plugin started Herdr, possibly because of this very report) or why it couldn't be reached, the input companion state and path, and, for each Herdr agent, its pane id and whether input is ready, with counts. It never holds prompts, titles, working folders, transcript text, environment values or file contents. Your home directory shows as `~` in the socket and companion paths and in the error text, so the report doesn't carry your user name; paths elsewhere on the machine are shown as they are. If the client has no clipboard access, the same JSON is shown in a selectable block instead. It covers the plugin version, the Herdr version and the Effective target below; the rest still has to come from you. Include:
 
 1. What you did, what you expected and what happened, including the exact message or notice text.
 2. The output of `paseo plugin logs herdr-harness`, and the relevant part of `$PASEO_HOME/daemon.log`.
