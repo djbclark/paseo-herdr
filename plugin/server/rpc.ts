@@ -13,16 +13,24 @@ import type { BoundSessions } from "./bound-sessions.js";
 import { attachArgs, attachCommand } from "./herdr-commands.js";
 import { resolveSocketPath } from "./herdr/socket-path.js";
 import { HerdrClient } from "./herdr/client.js";
-import { type AgentInfo, AgentListResultSchema, PaneProcessInfoResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
+import { listPaneTargets } from "./herdr/targets.js";
+import { type AgentInfo, type PaneProcessInfo, PaneProcessInfoResultSchema, PaneListResultSchema, TabListResultSchema, WorkspaceCreatedResultSchema, WorkspaceListResultSchema } from "./herdr/schema.js";
 import type { ReadyTarget } from "./herdr/target.js";
 import type { HarnessAdapter } from "./harness/types.js";
+import { adapterAcceptsKind, createResolver, type AdapterResolver } from "./harness/resolve.js";
 
 export interface ManagementDeps {
-  readTarget(): Promise<{ target: HerdrTarget; ompEnabled: boolean }>;
+  /**
+   * `enabled` gates an adapter's overview presence (defaults to true; `enableOmp` keeps gating
+   * only `omp` until per-adapter settings exist). `ompEnabled` still feeds the client toggle.
+   */
+  readTarget(): Promise<{ target: HerdrTarget; ompEnabled: boolean; enabled?(adapterId: string): boolean }>;
   ensureReady(target: HerdrTarget): Promise<ReadyTarget>;
   /** Defaults to a fresh `HerdrClient(socketPath).request(...)`. */
   request?(socketPath: string, method: string, params?: object): Promise<unknown>;
   harnesses: readonly HarnessAdapter[];
+  /** Adapter routing for new work (overview rows without a chat, restart); defaults to a resolver over `harnesses`. */
+  resolver?: AdapterResolver;
   /** Tests: replaces the stat/realpath check; resolves the canonical directory or throws a user-facing Error. */
   checkDirectory?(path: string): Promise<string>;
   /** Tests: the daemon user's home directory for `~` expansion; defaults to `os.homedir()`. */
@@ -84,6 +92,8 @@ export interface HerdrChat {
   cwd: string;
   /** Latest user message or chat update; the newest chat wins when several are bound to one agent. */
   lastActivityAt: string;
+  /** The foreground process the chat was bound to, when the session had validated one (pane-mode liveness). */
+  occupant?: { pid: number; tty: string | null };
 }
 
 /** Every unarchived Paseo chat owned by one of the registered harness providers. */
@@ -104,6 +114,7 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
           harnessId: adapter.id, sessionRef: binding.sessionRef,
           title: agent.title ?? null, cwd: agent.cwd,
           lastActivityAt: activityTime(agent.lastUserMessageAt, agent.updatedAt),
+          ...(binding.occupant ? { occupant: { pid: binding.occupant.pid, tty: binding.occupant.tty } } : {}),
         });
       } catch {
         // Foreign or corrupt persistence: ignore.
@@ -124,30 +135,117 @@ function activityTime(userMessageAt: string | null | undefined, updatedAt: strin
   return userMessageAt && timestamp(userMessageAt) > timestamp(updatedAt) ? userMessageAt : updatedAt;
 }
 
-/** A terminal can host a new native conversation after /new; keep its older chats separate. */
-function liveChat(chat: HerdrChat, agents: ReadonlyMap<string, AgentInfo>, target: HerdrTarget): AgentInfo | undefined {
-  if (chat.herdrSession !== target.herdrSession) return undefined;
-  const agent = agents.get(chat.terminalId);
-  return agent?.agent === chat.harnessId && sameRef(chat.sessionRef, sessionRefOf(agent)) ? agent : undefined;
+/** The foreground process of terminals hosting a pane-mode chat that bound a process; `null` when Herdr could not say. */
+type PaneProcesses = ReadonlyMap<string, PaneProcessInfo | null>;
+
+/**
+ * Pane-mode bindings carry no native session ref, so the persisted occupant is the only evidence that the
+ * agent in the terminal is still the one the chat was bound to. Reads one `pane.process_info` per such
+ * terminal; a terminal nobody bound a process to costs nothing.
+ */
+async function paneProcesses(
+  chats: readonly HerdrChat[],
+  agents: ReadonlyMap<string, AgentInfo>,
+  target: HerdrTarget,
+  resolver: AdapterResolver,
+  read: (method: string, params: Record<string, unknown>) => Promise<unknown>,
+): Promise<PaneProcesses> {
+  const panes = new Map<string, AgentInfo>();
+  for (const chat of chats) {
+    const agent = agents.get(chat.terminalId);
+    if (chat.herdrSession === target.herdrSession && agent && chat.occupant && resolver.byId(chat.harnessId)?.binding === "pane") panes.set(chat.terminalId, agent);
+  }
+  return new Map(await Promise.all([...panes].map(async ([terminalId, agent]): Promise<[string, PaneProcessInfo | null]> => {
+    try {
+      const { process_info: info } = PaneProcessInfoResultSchema.parse(await read("pane.process_info", { pane_id: agent.pane_id }));
+      // An alias answer (Herdr resolved a moved pane id) is not evidence about this terminal.
+      return [terminalId, info.pane_id === agent.pane_id ? info : null];
+    } catch {
+      return [terminalId, null];
+    }
+  })));
 }
 
-/** Paseo agent id by (Herdr session, terminal id). */
-export async function boundAgents(paseo: PaseoApi, harnesses: readonly HarnessAdapter[]): Promise<Map<string, string>> {
-  // Set newest last, so a duplicate binding chooses the newest chat deterministically.
-  return new Map((await herdrChats(paseo, harnesses)).sort(newestFirst).reverse().map((chat) => [chatKey(chat.herdrSession, chat.terminalId), chat.agentId]));
+/** The same replacement test the session applies on validation: not the harness, another pid, or another tty. */
+function occupantReplaced(adapter: HarnessAdapter, occupant: NonNullable<HerdrChat["occupant"]>, info: PaneProcessInfo): boolean {
+  const pid = info.foreground_process_group_id;
+  return !pid || !adapter.isOccupant(info) || pid !== occupant.pid || (info.tty ?? null) !== occupant.tty;
+}
+
+/** A terminal can host a new native conversation after /new; keep its older chats separate. */
+function liveChat(chat: HerdrChat, agents: ReadonlyMap<string, AgentInfo>, target: HerdrTarget, resolver: AdapterResolver, processes?: PaneProcesses): AgentInfo | undefined {
+  if (chat.herdrSession !== target.herdrSession) return undefined;
+  const agent = agents.get(chat.terminalId);
+  if (!agent) return undefined;
+  // An existing binding keeps its adapter even after the pane is later detected as another
+  // kind; a pane-mode binding additionally does not pin a native session ref.
+  const adapter = resolver.byId(chat.harnessId);
+  if (!adapter || !adapterAcceptsKind(adapter, agent.agent)) return undefined;
+  if (adapter.binding === "native-ref" && !sameRef(chat.sessionRef, sessionRefOf(agent))) return undefined;
+  // A pane-mode chat whose agent was replaced in the terminal is frozen history, not the pane's live chat.
+  // An unreadable pane (no entry, or null) keeps the chat live rather than guessing.
+  const info = adapter.binding === "pane" && chat.occupant ? processes?.get(chat.terminalId) : null;
+  if (info && chat.occupant && occupantReplaced(adapter, chat.occupant, info)) return undefined;
+  return agent;
+}
+
+/** One terminal's live chats: the newest owns the row, the others are duplicates the client may archive. */
+export interface ReconciledTerminal {
+  owner: HerdrChat;
+  duplicates: HerdrChat[];
+}
+
+/**
+ * F4: reconcile the chats bound to each live Herdr agent. The owner is the newest live chat
+ * (deterministic; ties by agent id); the other live chats on the same terminal are reported as
+ * `duplicates` so the client can archive them — the server never archives from a read RPC.
+ * Chats that are no longer live (an older native conversation after /new) stay separate.
+ */
+export function reconcileChats(
+  chats: HerdrChat[],
+  live: ReadonlyMap<string, AgentInfo>,
+  target: HerdrTarget,
+  resolver: AdapterResolver,
+  processes?: PaneProcesses,
+): Map<string, ReconciledTerminal> {
+  const out = new Map<string, ReconciledTerminal>();
+  for (const chat of chats.filter((chat) => liveChat(chat, live, target, resolver, processes)).sort(newestFirst)) {
+    const key = chatKey(chat.herdrSession, chat.terminalId);
+    const entry = out.get(key);
+    if (entry) entry.duplicates.push(chat);
+    else out.set(key, { owner: chat, duplicates: [] });
+  }
+  return out;
+}
+
+/**
+ * The adapter a Herdr pane's overview row belongs to: the terminal's owner chat keeps the
+ * adapter it was bound with (a saved fallback chat survives the pane being detected as a
+ * specific kind); a chat-less pane routes to the adapter for new work.
+ */
+function ownerAdapter(
+  reconciled: Map<string, ReconciledTerminal>,
+  agent: AgentInfo,
+  target: HerdrTarget,
+  resolver: AdapterResolver,
+): HarnessAdapter | undefined {
+  const owner = reconciled.get(chatKey(target.herdrSession, agent.terminal_id))?.owner;
+  return ((owner && resolver.byId(owner.harnessId)) ?? resolver.select(agent.agent)) ?? undefined;
 }
 
 export function registerManagementRpcs(server: Pick<PluginServerContext, "handle">, deps: ManagementDeps): void {
   const request = deps.request ?? ((socketPath, method, params) => new HerdrClient(socketPath).request(method, params));
   const check = deps.checkDirectory ?? checkDirectory;
   const home = () => (deps.homedir ?? homedir)();
+  const resolver = deps.resolver ?? createResolver(deps.harnesses);
+  const targets = (socketPath: string) => (method: string, params?: Record<string, unknown>) => request(socketPath, method, params);
 
   /** Folders Herdr's workspaces and agents are in on the configured target; empty when Herdr is unavailable. */
   const herdrFolders = async (): Promise<string[]> => {
     try {
       const { target } = await deps.readTarget();
       const [agents, panes] = await Promise.all([
-        request(target.socketPath, "agent.list", {}).then((r) => AgentListResultSchema.parse(r).agents.map((a) => a.cwd ?? a.foreground_cwd)),
+        listPaneTargets(targets(target.socketPath)).then((listed) => listed.map((a) => a.cwd ?? a.foreground_cwd)),
         request(target.socketPath, "pane.list", {}).then((r) => PaneListResultSchema.parse(r).panes.map((p) => p.cwd ?? p.foreground_cwd)),
       ]);
       return [...agents, ...panes].filter((cwd): cwd is string => typeof cwd === "string" && isAbsolute(cwd));
@@ -165,7 +263,10 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     }
   };
 
-  server.handle(herdrTargetRpc, () => deps.readTarget());
+  server.handle(herdrTargetRpc, async () => {
+    const { target, ompEnabled } = await deps.readTarget();
+    return { target, ompEnabled };
+  });
 
   server.handle(herdrFoldersSuggestRpc, async ({ query }, { paseo }) => {
     const [fromHerdr, fromPaseo] = await Promise.all([herdrFolders(), paseoFolders(paseo)]);
@@ -177,7 +278,8 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
   });
 
   server.handle(herdrOverviewRpc, async (_input, { paseo }) => {
-    const { target, ompEnabled } = await deps.readTarget();
+    const { target, ompEnabled, enabled: enabledFor } = await deps.readTarget();
+    const enabled = (adapterId: string) => enabledFor?.(adapterId) ?? true;
     const [chatResult, readyResult] = await Promise.allSettled([
       herdrChats(paseo, deps.harnesses),
       deps.ensureReady(target),
@@ -200,12 +302,14 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
         request(socket, "workspace.list", {}).then((r) => WorkspaceListResultSchema.parse(r).workspaces),
         request(socket, "tab.list", {}).then((r) => TabListResultSchema.parse(r).tabs),
         request(socket, "pane.list", {}).then((r) => PaneListResultSchema.parse(r).panes),
-        request(socket, "agent.list", {}).then((r) => AgentListResultSchema.parse(r).agents),
+        listPaneTargets(targets(socket)),
       ]);
+      const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
+      const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
       // Read-only detection: does each harness process have its input endpoint? (one process_info per agent)
       const inputReady = new Map(await Promise.all(agents.map(async (agent): Promise<[string, boolean | null]> => {
-        const adapter = deps.harnesses.find((candidate) => candidate.id === agent.agent);
-        if (!adapter?.inputReachable) return [agent.terminal_id, null];
+        const adapter = ownerAdapter(reconciled, agent, target, resolver);
+        if (!adapter?.inputReachable || !enabled(adapter.id)) return [agent.terminal_id, null];
         try {
           const process = PaneProcessInfoResultSchema.parse(await request(socket, "pane.process_info", { pane_id: agent.pane_id })).process_info;
           const pid = process.foreground_process_group_id;
@@ -214,10 +318,6 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
           return [agent.terminal_id, null];
         }
       })));
-      const live = new Map(agents.map((agent) => [agent.terminal_id, agent]));
-      const bound = new Map([...chats].sort(newestFirst).reverse()
-        .filter((chat) => liveChat(chat, live, target))
-        .map((chat) => [chatKey(chat.herdrSession, chat.terminalId), chat.agentId]));
       const tabNumber = new Map(tabs.map((tab) => [tab.tab_id, tab.number]));
       const out: OverviewWorkspace[] = [...workspaces].sort((a, b) => a.number - b.number).map((workspace) => {
         const firstPane = panes
@@ -233,7 +333,10 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
             focused: tab.focused,
             status: tab.agent_status,
             agents: agents.filter((agent) => agent.tab_id === tab.tab_id).map((agent): OverviewAgent => {
-              const adapter = deps.harnesses.find((candidate) => candidate.id === agent.agent);
+              // A disabled adapter is hidden (no provider link, no restart); its bound chats stay openable.
+              const resolved = ownerAdapter(reconciled, agent, target, resolver);
+              const adapter = resolved && enabled(resolved.id) ? resolved : undefined;
+              const bound = reconciled.get(chatKey(target.herdrSession, agent.terminal_id));
               return {
                 terminalId: agent.terminal_id,
                 paneId: agent.pane_id,
@@ -244,12 +347,13 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
                 provider: adapter ? `herdr-${adapter.id}` : null,
                 status: agent.agent_status,
                 cwd: agent.cwd ?? agent.foreground_cwd ?? null,
-                paseoAgentId: bound.get(chatKey(target.herdrSession, agent.terminal_id)) ?? null,
+                paseoAgentId: bound?.owner.agentId ?? null,
+                duplicateChatIds: bound?.duplicates.map((chat) => chat.agentId) ?? [],
                 // `herdr agent attach` resolves names and pane ids, not terminal ids.
                 attachCommand: attachCommand(target.herdrSession, agent.name ?? agent.pane_id),
                 attach: herdrPath ? { command: herdrPath, args: attachArgs(target.herdrSession, agent.name ?? agent.pane_id) } : null,
                 inputReady: inputReady.get(agent.terminal_id) ?? null,
-                canRestart: Boolean(adapter?.resumeArgs && agent.agent_session),
+                canRestart: Boolean(adapter?.launch && adapter.resumeArgs && agent.agent_session),
               };
             }),
           }));
@@ -269,13 +373,25 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     }
   });
 
-  server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }) => {
-    const { target } = await deps.readTarget();
+  server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }, { paseo }) => {
+    const { target, enabled: enabledFor } = await deps.readTarget();
     await deps.ensureReady(target);
     const socket = target.socketPath;
-    const agent = AgentListResultSchema.parse(await request(socket, "agent.list", {})).agents.find((candidate) => candidate.terminal_id === terminalId);
-    const adapter = deps.harnesses.find((candidate) => candidate.id === agent?.agent);
-    if (!agent || !adapter) throw new Error("The agent is no longer running in Herdr.");
+    const agents = await listPaneTargets(targets(socket));
+    const agent = agents.find((candidate) => candidate.terminal_id === terminalId);
+    if (!agent) throw new Error("The agent is no longer running in Herdr.");
+    // Same routing as the overview row: the owner chat's adapter if one exists, else new-work routing.
+    // Without the chat list the owner is unknown and `select` could pick a different adapter than the
+    // overview offered, so a failed listing refuses the restart instead of guessing.
+    let chats: HerdrChat[];
+    try { chats = await herdrChats(paseo, deps.harnesses); }
+    catch (error) { throw new Error(`Can't restart this agent: Paseo's chat list is unavailable (${errorMessage(error)}), so the adapter that owns it is unknown. Try again.`); }
+    const live = new Map(agents.map((candidate): [string, AgentInfo] => [candidate.terminal_id, candidate]));
+    const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
+    const adapter = ownerAdapter(reconciled, agent, target, resolver);
+    if (!adapter) throw new Error("The agent is no longer running in Herdr.");
+    // The overview hides a disabled adapter's restart; a stale row or a direct call must not bypass that.
+    if (!(enabledFor?.(adapter.id) ?? true)) throw new Error(`${adapter.label} is turned off in the Herdr plugin settings`);
     // An open chat on this agent stays read-only; the client binds a fresh chat and archives the old one.
     return (deps.restart ?? restartAgent)({ request: (method, params) => request(socket, method, params) }, adapter, { terminalId, paneId });
   });

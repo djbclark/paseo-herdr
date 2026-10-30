@@ -267,6 +267,19 @@ describe("OMP companion tool approvals", () => {
     expect(c.askDialogs[0]?.signal).toBeUndefined();
   });
 
+  it("replaces a wrapper left by the pre-rename (paseo-herdr) companion instead of stacking on it", async () => {
+    const c = await startCompanion();
+    const legacyWrapper = vi.fn((...args: unknown[]) => c.originalSelect(...args));
+    Object.defineProperty(legacyWrapper, Symbol.for("paseo-herdr.approvals"), { value: { owner: "legacy-instance", original: c.originalSelect }, enumerable: false });
+    c.ui.select = legacyWrapper;
+    c.emit("session_switch", { reason: "new" });
+    expect(c.ui.select).not.toBe(legacyWrapper);
+    expect(c.ui.select).not.toBe(c.originalSelect);
+    void c.callSelect("Allow tool: bash");
+    expect(legacyWrapper).not.toHaveBeenCalled();
+    expect(c.originalSelect).toHaveBeenCalledTimes(1);
+  });
+
   it("propagates the caller's own abort signal to the dialog", async () => {
     const c = await startCompanion();
     c.emit("tool_approval_requested", { toolName: "bash", toolCallId: "t1" });

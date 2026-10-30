@@ -33,7 +33,7 @@ export interface SubscriptionDescriptor {
 }
 
 export interface SubscriptionEventEnvelope {
-  /** Native event name, or synthetic observer.connected / observer.disconnected. */
+  /** Native event name, or synthetic observer.connected / observer.disconnected / observer.resync (local drop). */
   event: string;
   data: unknown;
   /** Set when events were dropped server-side (see `ReconnectOptions.onEventsLost`). */
@@ -58,6 +58,11 @@ export interface ReconnectOptions {
 export const DEFAULT_BASE_DELAY_MS = 500;
 export const DEFAULT_MAX_DELAY_MS = 5000;
 export const DEFAULT_MAX_RECONNECT_ATTEMPTS = 20;
+
+/** Bounds on subscription backlog: a longer line, a deeper queue or too many queued characters is dropped and reported as `observer.resync`. */
+const MAX_LINE_CHARS = 256 * 1024;
+const MAX_QUEUED_LINES = 1024;
+const MAX_QUEUED_CHARS = 16 * 1024 * 1024;
 
 /** Error raised when the server replies with an `error` envelope (incl. `events_lost`). */
 export class HerdrError extends Error {
@@ -129,10 +134,12 @@ export interface HerdrStatus {
  * Probe a client's Herdr server and installed integration (IMPLEMENTATION.md §3
  * Phase 1 `status()`): resolve → `ping` → require `version` ≥ 0.9.3 → confirm
  * the integration is installed and current/outdated (`integration.list`).
+ * `integration === null` means the adapter requires no Herdr integration, so
+ * the version probe alone decides and `integration.list` is never sent.
  */
 export async function checkHerdrStatus(
   client: Pick<HerdrClient, "ping" | "integrationList">,
-  integration: string,
+  integration: string | null,
 ): Promise<HerdrStatus> {
   let ping: PingResult;
   try {
@@ -144,6 +151,7 @@ export async function checkHerdrStatus(
   if (!version || !versionAtLeast(version, MIN_HERDR_VERSION)) {
     return { available: false, diagnostic: "Herdr 0.9.3 or newer required" };
   }
+  if (integration === null) return { available: true };
   let list: IntegrationListResult;
   try {
     list = await client.integrationList();
@@ -275,9 +283,10 @@ export class HerdrClient {
       });
     }
 
-    /** Feed complete newline-delimited lines from a socket into the queue. */
+    /** Feed complete newline-delimited lines from a socket into the queue; oversized lines are dropped, not buffered. */
     function attachReader(sock: Socket, lines: AsyncQueue<string>): void {
       let buffer = "";
+      let discarding = false; // inside the tail of a line already dropped for its size
       sock.setEncoding("utf8");
       sock.on("data", (chunk: string) => {
         buffer += chunk;
@@ -285,8 +294,15 @@ export class HerdrClient {
         while (newline !== -1) {
           const line = buffer.slice(0, newline);
           buffer = buffer.slice(newline + 1);
-          lines.push(line);
+          if (discarding) discarding = false;
+          else if (line.length > MAX_LINE_CHARS) lines.noteDropped();
+          else lines.push(line);
           newline = buffer.indexOf("\n");
+        }
+        if (buffer.length > MAX_LINE_CHARS) {
+          buffer = "";
+          if (!discarding) lines.noteDropped();
+          discarding = true;
         }
       });
       sock.on("error", (error) => lines.pushError(error));
@@ -300,7 +316,7 @@ export class HerdrClient {
       let lostSignaled = false;
       try {
         while (!closed) {
-          const lines = new AsyncQueue<string>();
+          const lines = new AsyncQueue<string>(MAX_QUEUED_LINES, MAX_QUEUED_CHARS, (line) => line.length);
           try {
             const sock = await connectSubscription(lines);
             if (closed) return;
@@ -308,6 +324,7 @@ export class HerdrClient {
             const ack = await lines.next();
             if (closed) return;
             if (ack.error) throw ack.error;
+            if (ack.dropped) throw new Error("herdr subscription ack was dropped");
             self.assertAck(ack.value);
             attempt = 0;
             disconnected = false;
@@ -318,6 +335,11 @@ export class HerdrClient {
               const item = await lines.next();
               if (closed) return;
               if (item.error) throw item.error;
+              if (item.dropped) {
+                // Notifications were dropped locally; the consumer resyncs from a fresh snapshot.
+                yield { event: "observer.resync", data: undefined };
+                continue;
+              }
               const line = item.value;
               if (line === undefined) break;
               const envelope = self.parseEnvelope(line);
@@ -491,30 +513,61 @@ export class HerdrClient {
   }
 }
 
-/** Minimal bounded async queue used by the subscription stream. */
+/**
+ * Bounded async queue used by the subscription stream. When it holds too many values, or too much by `sizeOf`, the
+ * oldest values are dropped and the next `next()` reports it once as `dropped`, so a consumer learns that something
+ * was lost without the queue ever growing.
+ */
 class AsyncQueue<T> {
-  private items: Array<{ value: T } | { error: unknown }> = [];
-  private waiting: Array<(item: { value: T } | { error: unknown }) => void> = [];
+  private items: Array<{ value: T; size: number } | { error: unknown }> = [];
+  private waiting: Array<(item: { value?: T; error?: unknown; dropped?: true }) => void> = [];
+  private dropped = false;
+  private queuedSize = 0;
+
+  constructor(private readonly limit: number, private readonly sizeLimit: number, private readonly sizeOf: (value: T) => number) {}
 
   push(value: T): void {
-    this.deliver({ value });
+    const size = this.sizeOf(value);
+    while (!this.waiting.length && (this.items.length >= this.limit || this.queuedSize + size > this.sizeLimit)) {
+      const oldest = this.items.findIndex((item) => "value" in item);
+      if (oldest === -1) break;
+      const [removed] = this.items.splice(oldest, 1);
+      if (removed && "size" in removed) this.queuedSize -= removed.size;
+      this.dropped = true;
+    }
+    this.deliver({ value, size });
   }
 
   pushError(error: unknown): void {
     this.deliver({ error });
   }
 
-  next(): Promise<{ value?: T; error?: unknown }> {
+  /** Record that data was discarded before reaching the queue (e.g. an oversized line). */
+  noteDropped(): void {
+    const waiter = this.waiting.shift();
+    if (waiter) waiter({ dropped: true });
+    else this.dropped = true;
+  }
+
+  next(): Promise<{ value?: T; error?: unknown; dropped?: true }> {
+    if (this.dropped) {
+      this.dropped = false;
+      return Promise.resolve({ dropped: true });
+    }
     const item = this.items.shift();
     if (item) {
+      if ("value" in item) this.queuedSize -= item.size;
       return Promise.resolve("value" in item ? { value: item.value } : { error: item.error });
     }
     return new Promise((resolve) => this.waiting.push(resolve));
   }
 
-  private deliver(item: { value: T } | { error: unknown }): void {
+  private deliver(item: { value: T; size: number } | { error: unknown }): void {
     const waiter = this.waiting.shift();
-    if (waiter) waiter(item);
-    else this.items.push(item);
+    if (waiter) waiter("value" in item ? { value: item.value } : item);
+    else {
+      this.items.push(item);
+      if ("value" in item) this.queuedSize += item.size;
+    }
   }
 }

@@ -75,8 +75,7 @@ it("imports an active OMP chain and sends a prompt only to its bound idle pane",
     inspectInput: async ({ pid }) => ({ pid, instanceId: "test-instance" }),
     submitPrompt: async (target, text, ctx) => {
       const result = await ctx.request("agent.prompt", { target: target.paneId, text }, { signal: ctx.signal });
-      return classifyHerdrPrompt(result, undefined, { harness: "omp", terminalId: target.terminalId, sessionRef: target.ref,
-        agentName: "demo", herdrSession: null, cwd: "/work", submittedMessages: {} });
+      return classifyHerdrPrompt(result, undefined, { terminalId: target.terminalId, sessionRef: target.ref, accepts: (kind) => kind === "omp" });
     },
   }, async () => socket);
   expect(await provider.status?.({})).toEqual({ available: true });
@@ -312,9 +311,9 @@ it("close during launch aborts the launch and emits no session events afterwards
 });
 
 it("OMP launch args pass model and thinking and never disable extensions (the companion must load)", () => {
-  expect(ompAdapter.launchArgs({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
-  expect(ompAdapter.launchArgs(config)).toEqual([]);
-  expect(ompAdapter.launchArgs({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
+  expect(ompAdapter.launch!.args({ ...config, model: "m-1", thinkingOption: "high" })).toEqual(["--model", "m-1", "--thinking", "high"]);
+  expect(ompAdapter.launch!.args(config)).toEqual([]);
+  expect(ompAdapter.launch!.args({ ...config, model: "m-1" }).join(" ")).not.toContain("--no-extensions");
 });
 
 // --- P3.5A: configure capability, catalog and dispatch ---------------------------------------

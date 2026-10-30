@@ -1,23 +1,31 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderPrompt } from "@getpaseo/plugin/server/provider";
 import type { PromptDelivery } from "./harness/types.js";
-import { AgentPromptedResultSchema } from "./herdr/schema.js";
+import { AgentPromptedResultSchema, type AgentSessionRef } from "./herdr/schema.js";
 import { HerdrError } from "./herdr/client.js";
-import { sameRef, sessionRefOf, type Binding } from "./binding.js";
+import { sameRef, sessionRefOf } from "./binding.js";
 import type { HerdrHarnessSession } from "./session.js";
 
 const DEFINITE_HERDR_REJECTIONS = new Set(["empty_agent_prompt", "agent_not_found", "agent_not_ready", "agent_blocked", "invalid_params", "ambiguous_agent_target"]);
 
+export interface PromptExpectation {
+  terminalId: string;
+  /** The bound native session the reply must name; null (pane-bound sessions) accepts whatever ref the agent reports. */
+  sessionRef: AgentSessionRef | null;
+  /** Whether the reply's Herdr `agent` kind belongs to the bound adapter. */
+  accepts(kind: string | null | undefined): boolean;
+}
+
 /** Only server errors proven to occur before input submission are definite rejection. */
-export function classifyHerdrPrompt(result: unknown, error: unknown, binding: Binding): PromptDelivery {
+export function classifyHerdrPrompt(result: unknown, error: unknown, expect: PromptExpectation): PromptDelivery {
   if (error !== undefined) {
     return error instanceof HerdrError && DEFINITE_HERDR_REJECTIONS.has(error.code)
       ? { type: "rejected", message: error.message }
       : { type: "uncertain", message: error instanceof Error ? error.message : String(error) };
   }
   const parsed = AgentPromptedResultSchema.safeParse(result);
-  if (!parsed.success || parsed.data.agent.terminal_id !== binding.terminalId ||
-      parsed.data.agent.agent !== binding.harness || !sameRef(sessionRefOf(parsed.data.agent), binding.sessionRef)) {
+  if (!parsed.success || parsed.data.agent.terminal_id !== expect.terminalId || !expect.accepts(parsed.data.agent.agent) ||
+      (expect.sessionRef !== null && !sameRef(sessionRefOf(parsed.data.agent), expect.sessionRef))) {
     return { type: "uncertain", message: "The prompt response did not confirm the bound native agent" };
   }
   return { type: "accepted" };
@@ -67,32 +75,42 @@ export class PromptController {
       }
       const snapshot = state.snapshot;
       const baselineUserIds = new Set(snapshot?.items.filter((item) => item.type === "user_message").map((item) => item.id) ?? []);
-      if (state.tracker.activeTurn || (agent.agent_status !== "idle" && agent.agent_status !== "done") || (snapshot && snapshot.turnState !== "idle")) {
+      // Status evidence: the pane's screen is not a native turn state, so only Herdr's own idle/done gates input.
+      const nativeBusy = session.adapter.turnEvidence === "transcript" && snapshot !== null && snapshot.turnState !== "idle";
+      if (state.tracker.activeTurn || (agent.agent_status !== "idle" && agent.agent_status !== "done") || nativeBusy) {
         return fail("The active conversation has an unfinished or unknown turn; finish it in the terminal");
       }
       const occupant = state.binding.occupant;
       const ref = state.binding.sessionRef;
-      if (!occupant || !ref) return fail("The native process identity could not be validated");
+      const processInfo = state.process;
+      if (!occupant || !processInfo || (session.adapter.binding === "native-ref" && !ref)) return fail("The native process identity could not be validated");
       state.pending = { clientMessageId: prompt.clientMessageId, text,
         previousUserIds: baselineUserIds };
       state.turnBaselineEndId = snapshot?.lastTurnEndId ?? null;
-      state.tracker.reservePending({ turnId: randomUUID(), clientMessageId: prompt.clientMessageId });
+      // No turn is active here (checked above): a `working` flag left by an earlier uncertain or cancelled delivery is stale.
+      state.workingSeen = false;
+      state.tracker.reservePending({ turnId: randomUUID(), clientMessageId: prompt.clientMessageId,
+        baseline: { stateChangeSeq: agent.state_change_seq, completionSeq: agent.completion_seq ?? null } });
       reserved = true;
       const outcome = await session.adapter.submitPrompt({ pid: occupant.pid, ref, instanceId: occupant.instanceId,
-        paneId: agent.pane_id, terminalId: agent.terminal_id }, text, { signal: session.signal, request: session.deps.request });
+        paneId: agent.pane_id, terminalId: agent.terminal_id,
+        pane: { paneId: agent.pane_id, terminalId: agent.terminal_id, process: processInfo } }, text, { signal: session.signal, request: session.deps.request });
       if (!session.current(generation)) return;
       if (outcome.type === "rejected") {
-        state.tracker.rejectPending(outcome.message);
+        // A definite rejection starts no terminal turn here: the tracker cannot see the stale-`working` echo guard, so
+        // the reconcile below lets Herdr's real status decide whether the pane is busy with someone else's work.
+        state.tracker.rejectPending(outcome.message, { startTerminalTurn: false });
+        state.workingSeen = false;
         state.pending = null;
-      } else if (outcome.type === "uncertain") {
-        state.tracker.pendingUncertain();
+        await session.live.reconcile();
       } else {
-        state.tracker.acceptPending();
+        if (outcome.type === "uncertain") state.tracker.pendingUncertain(outcome.message);
+        else state.tracker.acceptPending();
+        void session.live.reconcile();
       }
-      if (outcome.type !== "rejected") void session.live.reconcile();
     } catch (error) {
       if (session.isAborted) return;
-      if (reserved) state.tracker.pendingUncertain();
+      if (reserved) state.tracker.pendingUncertain(error instanceof Error ? error.message : String(error));
       else fail(error instanceof Error ? error.message : String(error));
     } finally {
       state.admitting = false;
@@ -105,14 +123,27 @@ export class PromptController {
     const done = () => session.emit({ type: "request.completed", requestId });
     if (session.isAborted) return;
     // A Stop pressed while the prompt is still being delivered applies to that turn once it starts;
-    // a rejected or uncertain delivery has no turn to stop.
+    // a rejected delivery has no turn to stop, an uncertain one is handled below.
     if (this.inFlight) await this.inFlight.catch(() => undefined);
     if (session.isAborted) return;
-    if (state.outcome !== "active" || !state.connected || !state.tracker.isActive) { done(); return; }
+    const stoppable = () => state.tracker.isActive || state.tracker.isUncertain;
+    if (state.outcome !== "active" || !state.connected || !stoppable()) { done(); return; }
     const generation = state.generation;
     try {
       const agent = await session.validateAgent();
-      if (!session.current(generation) || !agent || !state.connected || !state.tracker.isActive) { done(); return; }
+      if (!session.current(generation) || !agent || !state.connected || !stoppable()) { done(); return; }
+      if (state.tracker.isUncertain && agent.agent_status !== "working" && agent.agent_status !== "blocked") {
+        // Paseo never learned whether the prompt arrived, and Herdr shows the pane idle: send no key (a bare ctrl+c
+        // can exit some harnesses), never resubmit, and release the reservation so the next prompt is admitted.
+        if (agent.agent_status === "idle" || agent.agent_status === "done") {
+          if (state.tracker.cancelUncertain("Stopped. Paseo could not confirm delivery; nothing was resent.")) {
+            state.pending = null;
+            state.workingSeen = false;
+          }
+        }
+        done();
+        return;
+      }
       await session.deps.request("pane.send_keys", { pane_id: agent.pane_id, keys: [...session.adapter.interruptKeys] }, { signal: session.signal });
       if (!session.current(generation)) return;
       state.tracker.interruptRequested();

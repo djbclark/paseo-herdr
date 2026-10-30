@@ -20,7 +20,7 @@ import {
 /**
  * Create path (P3): launch a harness agent in Herdr and wait until it is ready.
  * Contract frozen from spike 5 (IMPLEMENTATION.md R25-R30). Harness-neutral:
- * only `adapter.id` (agent.start kind) and `adapter.launchArgs` are used.
+ * only `adapter.launch` (the agent.start kind and args) is used.
  */
 
 export interface LaunchDeps {
@@ -116,6 +116,9 @@ export async function launchAgent(
   config: ProviderSessionConfig,
   signal: AbortSignal,
 ): Promise<LaunchResult> {
+  const launch = adapter.launch;
+  if (!launch) throw new LaunchError(`${adapter.label} agents can't be created from Paseo.`, "start_rejected");
+  const kind = launch.kind;
   const now = deps.now ?? Date.now;
   const sleepFn = deps.sleep ?? defaultSleep;
   const makeName = deps.makeName ?? (() => `paseo-${randomBytes(3).toString("hex")}`);
@@ -290,9 +293,9 @@ export async function launchAgent(
         AgentStartedResultSchema.parse(
           await call("agent.start", {
             name,
-            kind: adapter.id,
+            kind,
             pane_id: target.paneId,
-            args: adapter.launchArgs(config),
+            args: launch.args(config),
             timeout_ms: START_TIMEOUT_MS,
           }),
         );
@@ -333,7 +336,7 @@ export async function launchAgent(
     let ghostSince: number | null = null;
 
     const readyOf = (info: AgentInfo): boolean =>
-      info.agent === adapter.id && info.interactive_ready && (info.agent_status === "idle" || info.agent_status === "done");
+      info.agent === kind && info.interactive_ready && (info.agent_status === "idle" || info.agent_status === "done");
     const resultOf = (info: AgentInfo): LaunchResult => ({
       agentName: name,
       terminalId: target.terminalId,
@@ -377,8 +380,8 @@ export async function launchAgent(
           throw fail("not_ready", `Herdr agent ${name} no longer matches the launched terminal`);
         }
         if (byName.agent) agentEverSet = true;
-        if (byName.agent && byName.agent !== adapter.id) {
-          throw fail("not_ready", `Herdr detected agent "${byName.agent}" in the pane instead of "${adapter.id}"`);
+        if (byName.agent && byName.agent !== kind) {
+          throw fail("not_ready", `Herdr detected agent "${byName.agent}" in the pane instead of "${kind}"`);
         }
         if (byName.agent_status === "blocked") {
           throw fail("not_ready", `Agent ${name} is blocked waiting for input before it is ready`);
@@ -398,7 +401,7 @@ export async function launchAgent(
           else {
             ghostSince ??= tick;
             if (now() - ghostSince >= GHOST_MS) {
-              throw await exitedError(`${adapter.id} exited right after starting`);
+              throw await exitedError(`${kind} exited right after starting`);
             }
           }
         } else {
@@ -414,22 +417,22 @@ export async function launchAgent(
           byPane = undefined;
         }
         if (byPane === null && registered) {
-          throw await exitedError(`${adapter.id} exited before it became ready`);
+          throw await exitedError(`${kind} exited before it became ready`);
         }
         if (byPane) {
           if (byPane.terminal_id !== target.terminalId || (byPane.name != null && byPane.name !== name)) {
             throw fail("not_ready", `The pane now hosts a different agent than the one launched`);
           }
-          if (byPane.agent && byPane.agent !== adapter.id) {
-            throw fail("not_ready", `Herdr detected agent "${byPane.agent}" in the pane instead of "${adapter.id}"`);
+          if (byPane.agent && byPane.agent !== kind) {
+            throw fail("not_ready", `Herdr detected agent "${byPane.agent}" in the pane instead of "${kind}"`);
           }
-          if (byPane.agent === adapter.id) {
+          if (byPane.agent === kind) {
             // TIMEOUT ORPHAN (or unnamed after a lost start reply): re-attach our name.
             try {
               await call("agent.rename", { target: target.paneId, name });
             } catch (error) {
               if (signal.aborted) throw abortedError();
-              throw fail("timeout", `${adapter.id} is running but Herdr would not re-attach the name ${name}: ${describe(error)}`);
+              throw fail("timeout", `${kind} is running but Herdr would not re-attach the name ${name}: ${describe(error)}`);
             }
             registered = true;
             agentEverSet = true;
@@ -444,7 +447,7 @@ export async function launchAgent(
       if (now() >= deadline) {
         throw fail(
           "timeout",
-          `Agent ${name} was not ready within ${Math.round((START_TIMEOUT_MS + DEADLINE_SLACK_MS) / 1000)}s; ${adapter.id} may still be starting`,
+          `Agent ${name} was not ready within ${Math.round((START_TIMEOUT_MS + DEADLINE_SLACK_MS) / 1000)}s; ${kind} may still be starting`,
         );
       }
       await sleep(POLL_MS);

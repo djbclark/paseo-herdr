@@ -31,6 +31,9 @@ const READY_TIMEOUT_MS = 30_000;
 const POLL_MS = 150;
 
 export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, target: { terminalId: string; paneId: string }): Promise<{ pid: number }> {
+  const launch = adapter.launch;
+  if (!launch) throw new RestartError(`${adapter.label} agents can't be restarted from Paseo.`);
+  const kind = launch.kind;
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const kill = deps.signal ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
@@ -39,7 +42,7 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
 
   const agent = (await agents()).find((candidate) => candidate.terminal_id === target.terminalId);
   if (!agent) throw new RestartError("The agent is no longer running in Herdr.");
-  if (agent.agent !== adapter.id) throw new RestartError(`This pane no longer runs ${adapter.label}.`);
+  if (agent.agent !== kind) throw new RestartError(`This pane no longer runs ${adapter.label}.`);
   if (agent.pane_id !== target.paneId) throw new RestartError("The agent moved to another pane; refresh and try again.");
   if (agent.agent_status !== "idle" && agent.agent_status !== "done") {
     throw new RestartError(`Only an idle or finished agent can be restarted; this one is ${agent.agent_status}.`);
@@ -61,7 +64,7 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
 
   // The pane is back at its shell; Herdr may still report the old agent for a moment (agent_pane_busy).
   // Manually started agents can be unnamed, but Herdr's agent.start requires a name.
-  const params = { kind: adapter.id, pane_id: target.paneId, timeout_ms: READY_TIMEOUT_MS, args,
+  const params = { kind, pane_id: target.paneId, timeout_ms: READY_TIMEOUT_MS, args,
     name: agent.name ?? `paseo-${randomBytes(6).toString("hex")}` };
   let startError: unknown;
   for (const deadline = now() + BUSY_WINDOW_MS; ;) {
@@ -76,7 +79,7 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
         break;
       }
       if (!(error instanceof HerdrError && error.code === "agent_pane_busy") || now() >= deadline) {
-        throw new RestartError(`${adapter.label} stopped, but starting it again failed: ${error instanceof Error ? error.message : String(error)}. Run \`${[adapter.id, ...args].join(" ")}\` in the pane.`);
+        throw new RestartError(`${adapter.label} stopped, but starting it again failed: ${error instanceof Error ? error.message : String(error)}. Run \`${[kind, ...args].join(" ")}\` in the pane.`);
       }
       await sleep(POLL_MS);
     }
@@ -85,7 +88,7 @@ export async function restartAgent(deps: RestartDeps, adapter: HarnessAdapter, t
   for (const deadline = now() + READY_TIMEOUT_MS; ;) {
     await sleep(POLL_MS);
     const restarted: AgentInfo | undefined = (await agents()).find((candidate) => candidate.pane_id === target.paneId);
-    if (restarted?.terminal_id === target.terminalId && restarted.agent === adapter.id &&
+    if (restarted?.terminal_id === target.terminalId && restarted.agent === kind &&
         restarted.agent_session?.kind === ref.kind && restarted.agent_session.value === ref.value &&
         (restarted.agent_status === "idle" || restarted.agent_status === "done")) {
       const after = await foreground();

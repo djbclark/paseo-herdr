@@ -1,4 +1,4 @@
-// paseo-herdr OMP input companion. Installed into OMP's extensions directory by paseo-herdr/plugin (npm run install:omp-companion); do not edit the installed copy.
+// paseo4herdr OMP input companion. Installed into OMP's extensions directory by paseo4herdr/plugin (npm run install:omp-companion); do not edit the installed copy.
 // All identity, readiness and draft checks, and the public sendUserMessage
 // handoff, run synchronously in the TUI process. Draft bytes never leave it.
 import net from "node:net";
@@ -55,7 +55,10 @@ interface InputState {
   hasDraft: boolean | null;
 }
 
-const APPROVAL_MARK = Symbol.for("paseo-herdr.approvals");
+const APPROVAL_MARK = Symbol.for("paseo4herdr.approvals");
+// Migration from the paseo-herdr rename: wrappers installed by a pre-rename companion carry this key. It is only read, never written,
+// so a new instance unwraps a legacy wrapper instead of stacking on it.
+const LEGACY_APPROVAL_MARK = Symbol.for("paseo-herdr.approvals");
 const OUTCOME_RING = 64;
 const MAX_ARGS_JSON = 16 * 1024;
 const MAX_TITLE = 2048;
@@ -394,7 +397,8 @@ export default function ompInputCompanion(pi: CompanionApi): void {
       for (const [name, wrap] of [["select", wrapSelect], ["askDialog", wrapAskDialog]] as const) {
         const value = Object.getOwnPropertyDescriptor(ui, name)?.value as ((...args: any[]) => unknown) | undefined;
         if (typeof value !== "function") continue;
-        const mark = (value as unknown as Record<symbol, unknown>)[APPROVAL_MARK];
+        const marks = value as unknown as Record<symbol, unknown>;
+        const mark = marks[APPROVAL_MARK] ?? marks[LEGACY_APPROVAL_MARK];
         if (isRecord(mark) && mark.owner === instanceId) continue;
         // A wrapper left by a previous instance of this extension is replaced, never stacked.
         const original = isRecord(mark) && typeof mark.original === "function" ? mark.original as (...args: any[]) => unknown : value;

@@ -3,7 +3,7 @@ import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/prov
 import { HerdrHarnessSession, type SessionDeps } from "../server/session.js";
 import { bindingOf, persistenceOf } from "../server/binding.js";
 import { HerdrError, type SubscriptionEventEnvelope } from "../server/herdr/client.js";
-import { classifyHerdrPrompt } from "../server/prompt.js";
+import { classifyHerdrPrompt, type PromptExpectation } from "../server/prompt.js";
 import type { AgentInfo } from "../server/herdr/schema.js";
 import { FakeTranscript, makeFakeAdapter } from "./fake-harness.js";
 
@@ -151,6 +151,56 @@ it("keeps the independent harness interrupt key and waits for native abort", asy
   expect(turns(events).map((event) => event.state)).toEqual(["started", "canceled"]);
 });
 
+/** `listAgents` that parks every call until the test resolves it, so overlapping validations finish in a chosen order. */
+function gatedList(agent: AgentInfo) {
+  const gates: Array<() => void> = [];
+  let gated = false;
+  const listAgents = async () => {
+    if (!gated) return [agent];
+    const parked = Promise.withResolvers<void>();
+    gates.push(parked.resolve);
+    await parked.promise;
+    return [agent];
+  };
+  return { listAgents, gates, gate: () => { gated = true; }, ungate: () => { gated = false; } };
+}
+
+it("an overlapping reconcile that commits first does not fail the prompt of the older validation", async () => {
+  const agent = makeAgent();
+  const list = gatedList(agent);
+  const { session, delivered, events } = await setup({ listAgents: list.listAgents });
+  list.gate();
+  const sending = session.prompt(prompt("one"));
+  await vi.waitFor(() => expect(list.gates).toHaveLength(1));
+  const polling = session.live.reconcile();
+  await vi.waitFor(() => expect(list.gates).toHaveLength(2));
+  list.gates[1]!();
+  await polling;
+  list.ungate();
+  list.gates[0]!();
+  await sending;
+  expect(delivered.map((request) => request.method)).toEqual(["agent.prompt"]);
+  expect(events.filter((event) => event.type === "session.prompt_result")).toMatchObject([{ result: { type: "turn" } }]);
+});
+
+it("an overlapping reconcile that commits first does not drop the Stop key of the older validation", async () => {
+  const agent = makeAgent();
+  const list = gatedList(agent);
+  const { session, delivered } = await setup({ listAgents: list.listAgents });
+  await session.prompt(prompt("first"));
+  list.gate();
+  const stopping = session.interrupt("stop");
+  await vi.waitFor(() => expect(list.gates).toHaveLength(1));
+  const polling = session.live.reconcile();
+  await vi.waitFor(() => expect(list.gates).toHaveLength(2));
+  list.gates[1]!();
+  await polling;
+  list.ungate();
+  list.gates[0]!();
+  await stopping;
+  expect(delivered.at(-1)).toEqual({ method: "pane.send_keys", params: { pane_id: "pane", keys: ["ctrl+c"] } });
+});
+
 it("rebinds the moved pane only when retained native and occupant identity match", async () => {
   const { session, agent, delivered } = await setup();
   agent.pane_id = "moved-pane";
@@ -226,7 +276,12 @@ it("settles an uncertain prompt once native idle holds past the window, then adm
   expect(events.filter((event) => event.type === "session.prompt_result" && event.clientMessageId === "refused"))
     .toMatchObject([{ result: { type: "failed", error: { message: "Agent is already working" } } }]);
   expect(turns(events)).toEqual([]);
+  // F6: the settle clock starts at the first idle evidence (+10 s), not at the uncertainty, so
+  // 16 s after the report is not enough; 15 s of continuous idle is.
   vi.setSystemTime(Date.now() + 6_000);
+  await session.live.reconcile();
+  expect(turns(events)).toEqual([]);
+  vi.setSystemTime(Date.now() + 9_000);
   await session.live.reconcile();
   expect(turns(events).map((event) => event.state)).toEqual(["started", "failed"]);
   expect(session.state.tracker.activeTurn).toBeNull();
@@ -255,9 +310,17 @@ it("settles an uncertain prompt on a foreign terminal entry and starts an autono
 });
 
 it("classifies definite Herdr rejection separately from potentially delivered errors and mismatched replies", () => {
-  const binding = bindingOf(makeAgent(), makeFakeAdapter(), null);
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_blocked", "blocked"), binding)).toEqual({ type: "rejected", message: "blocked" });
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_stalled", "stall"), binding)).toEqual({ type: "uncertain", message: "stall" });
-  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_failed", "write may be partial"), binding)).toEqual({ type: "uncertain", message: "write may be partial" });
-  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), terminal_id: "other" } }, undefined, binding).type).toBe("uncertain");
+  const expectation: PromptExpectation = { terminalId: "terminal", sessionRef: { kind: "id", value: "fake-session-1" }, accepts: (kind) => kind === "fake" };
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_blocked", "blocked"), expectation)).toEqual({ type: "rejected", message: "blocked" });
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_stalled", "stall"), expectation)).toEqual({ type: "uncertain", message: "stall" });
+  expect(classifyHerdrPrompt(undefined, new HerdrError("agent_prompt_failed", "write may be partial"), expectation)).toEqual({ type: "uncertain", message: "write may be partial" });
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), terminal_id: "other" } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: makeAgent() }, undefined, expectation)).toEqual({ type: "accepted" });
+  // The adapter decides which Herdr kinds are its own; a reply naming another kind is not confirmation.
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent: "other" } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent: null } }, undefined, { ...expectation, accepts: () => true })).toEqual({ type: "accepted" });
+  // A native-ref binding requires the same ref; a pane binding (null ref) takes whatever ref the agent reports.
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent_session: null } }, undefined, expectation).type).toBe("uncertain");
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: makeAgent() }, undefined, { ...expectation, sessionRef: null })).toEqual({ type: "accepted" });
+  expect(classifyHerdrPrompt({ type: "agent_prompted", agent: { ...makeAgent(), agent_session: null } }, undefined, { ...expectation, sessionRef: null })).toEqual({ type: "accepted" });
 });

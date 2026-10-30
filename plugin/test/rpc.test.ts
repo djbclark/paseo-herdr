@@ -2,9 +2,11 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { boundAgents, decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
+import { decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
 import { persistenceOf } from "../server/binding.js";
+import { createResolver } from "../server/harness/resolve.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
+import { makeFakeAdapter } from "./fake-harness.js";
 import { herdrAgentRestartRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HerdrClient } from "../server/herdr/client.js";
@@ -93,13 +95,13 @@ it("overview reports unavailable instead of throwing", async () => {
   expect(fake.requests).toHaveLength(0);
 });
 
-it("boundAgents skips archived, foreign providers, bad persistence; follows pages; reads sessionId fallback", async () => {
+it("herdrChats skips archived, foreign providers, bad persistence; follows pages; reads sessionId fallback", async () => {
   const p = persistenceOf({ harness: "omp", herdrSession: null, terminalId: "tx", agentName: null, sessionRef: null, cwd: "", submittedMessages: {} });
-  const result = await boundAgents(list([], [
+  const chats = await herdrChats(list([], [
     [paseoAgent("a", "herdr-omp", "t1", "work", { archivedAt: "2026-01-01" }), paseoAgent("b", "claude", "t2", "work"), { id: "c", provider: "herdr-omp", persistence: { provider: "herdr-omp", sessionId: "junk" } }],
     [{ id: "d", provider: "herdr-omp", archivedAt: null, persistence: { provider: "herdr-omp", sessionId: `plugin:${JSON.stringify(p)}` } }],
   ]) as never, [ompAdapter]);
-  expect([...result]).toEqual([["\0tx", "d"]]);
+  expect(chats.map((chat) => [chat.agentId, chat.terminalId, chat.harnessId])).toEqual([["d", "tx", "omp"]]);
 });
 
 it("decodePluginPersistence handles metadata, sessionId and garbage", () => {
@@ -208,6 +210,128 @@ it("flags agents without an input endpoint and offers an in-place restart", asyn
 it("restarts through the injected routine and refuses an agent that is gone", async () => {
   seed();
   const { call } = setup({ restart: async (_deps, adapter) => { expect(adapter.id).toBe("omp"); return { pid: 99 }; } });
-  expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" })).toEqual({ pid: 99 });
-  await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" })).rejects.toThrow(/no longer running/);
+  expect(await call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).toEqual({ pid: 99 });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-gone", paneId: "p9" }, list([]))).rejects.toThrow(/no longer running/);
+});
+
+// --- F3 routing + F4 duplicates -----------------------------------------------------------------------------
+const chatWith = (id: string, harnessId: string, terminalId: string, extra: object = {}) => ({
+  id, provider: `herdr-${harnessId}`, archivedAt: null,
+  title: id, cwd: "/a", status: "idle", updatedAt: "2026-10-13T10:00:00Z", lastUserMessageAt: null,
+  persistence: { provider: `herdr-${harnessId}`, sessionId: "x", metadata: { pluginProviderPersistence: persistenceOf({ harness: harnessId, herdrSession: "work", terminalId, agentName: null, sessionRef: null, cwd: "/a", submittedMessages: {} }) } },
+  ...extra,
+});
+
+it("two live chats on one terminal keep the newest as paseoAgentId and report the older as duplicate", async () => {
+  seed();
+  const { call } = setup();
+  const result = await call(herdrOverviewRpc, {}, list([
+    chatWith("older", "omp", "t-p1", { updatedAt: "2026-10-13T09:00:00Z" }),
+    chatWith("newer", "omp", "t-p1", { updatedAt: "2026-10-13T10:00:00Z" }),
+  ]));
+  const [row] = result.workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("newer");
+  expect(row.duplicateChatIds).toEqual(["older"]);
+  expect(herdrOverviewRpc.output.safeParse(result).success).toBe(true);
+});
+
+it("a saved fallback chat keeps its provider after the pane is detected as a specific kind", async () => {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [agent("p1", "tab1", "fake", null)] });
+  const generic = makeFakeAdapter(undefined, { id: "generic", nativeKinds: "any" });
+  const specific = makeFakeAdapter(undefined, { id: "fake", nativeKinds: ["fake"] });
+  const { call } = setup({ harnesses: [generic, specific], resolver: createResolver([generic, specific]) });
+  const [row] = (await call(herdrOverviewRpc, {}, list([chatWith("saved", "generic", "t-p1")]))).workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("saved");
+  expect(row.provider).toBe("herdr-generic");
+});
+
+it("a pane-mode chat with a null session ref still counts as live", async () => {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [{ ...agent("p1", "tab1", "panefake", null), agent_session: { source: "herdr:panefake", agent: "panefake", kind: "id", value: "s-1" } }] });
+  const paneAdapter = makeFakeAdapter(undefined, { id: "panefake", nativeKinds: ["panefake"], binding: "pane" });
+  const { call } = setup({ harnesses: [paneAdapter], resolver: createResolver([paneAdapter]) });
+  const [row] = (await call(herdrOverviewRpc, {}, list([chatWith("pane-chat", "panefake", "t-p1")]))).workspaces[0].tabs[0].agents;
+  expect(row.paseoAgentId).toBe("pane-chat");
+});
+
+it("the restart RPC refuses an adapter that cannot launch, before touching the pane", async () => {
+  seed();
+  const generic = makeFakeAdapter(undefined, { id: "generic", nativeKinds: "any", launch: null });
+  const { call } = setup({ harnesses: [generic], resolver: createResolver([generic]) });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).rejects.toThrow(/can't be restarted from Paseo/);
+  expect(fake.requestsFor("agent.start")).toHaveLength(0);
+  expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
+});
+
+it("the restart RPC refuses a disabled adapter before restarting anything", async () => {
+  seed();
+  let restarted = false;
+  const { call } = setup({
+    readTarget: async () => ({ target: target(fake.socketPath), ompEnabled: false, enabled: (adapterId: string) => adapterId !== "omp" }),
+    restart: async () => { restarted = true; return { pid: 1 }; },
+  });
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, list([]))).rejects.toThrow(/turned off in the Herdr plugin settings/);
+  expect(restarted).toBe(false);
+});
+
+it("the restart RPC refuses to guess the owner adapter when the chat list fails", async () => {
+  seed();
+  let restarted = false;
+  const { call } = setup({ restart: async () => { restarted = true; return { pid: 1 }; } });
+  const failing = { agents: { list: async () => { throw new Error("paseo offline"); } } };
+  await expect(call(herdrAgentRestartRpc, { terminalId: "t-p1", paneId: "p1" }, failing)).rejects.toThrow(/chat list is unavailable \(paseo offline\)/);
+  expect(restarted).toBe(false);
+});
+
+// --- B6: pane-mode liveness follows the process, not just the terminal ---------------------------------------
+const paneChat = (id: string, occupant: { pid: number; tty: string | null } | null, extra: object = {}) => ({
+  id, provider: "herdr-panefake", archivedAt: null,
+  title: id, cwd: "/a", status: "idle", updatedAt: "2026-10-13T10:00:00Z", lastUserMessageAt: null,
+  persistence: { provider: "herdr-panefake", sessionId: "x", metadata: { pluginProviderPersistence: persistenceOf({
+    harness: "panefake", herdrSession: "work", terminalId: "t-p1", agentName: null, sessionRef: null, cwd: "/a", submittedMessages: {},
+    ...(occupant ? { occupant: { ...occupant, instanceId: "fake-instance" } } : {}),
+  }) } },
+  ...extra,
+});
+function paneRow(foreground: { pid: number; tty?: string } | "unreadable") {
+  seed();
+  fake.reply("agent.list", { type: "agent_list", agents: [agent("p1", "tab1", "panefake", null)] });
+  if (foreground === "unreadable") fake.replyError("pane.process_info", "pane_not_found");
+  else fake.reply("pane.process_info", { type: "pane_process_info", process_info: { pane_id: "p1", foreground_process_group_id: foreground.pid, tty: foreground.tty ?? "/dev/pts/1", foreground_processes: [{ pid: foreground.pid, name: "panefake" }] } });
+  const paneAdapter = makeFakeAdapter(undefined, { id: "panefake", nativeKinds: ["panefake"], binding: "pane" });
+  const { call } = setup({ harnesses: [paneAdapter], resolver: createResolver([paneAdapter]) });
+  return async (chats: unknown[]) => (await call(herdrOverviewRpc, {}, list(chats))).workspaces[0].tabs[0].agents[0];
+}
+
+it("a pane-mode chat whose agent was replaced in the terminal no longer owns the row, nor is reported as a duplicate", async () => {
+  const row = await paneRow({ pid: 99 })([
+    paneChat("replaced", { pid: 41, tty: "/dev/pts/1" }, { updatedAt: "2026-10-13T11:00:00Z" }),
+    paneChat("current", { pid: 99, tty: "/dev/pts/1" }, { updatedAt: "2026-10-13T09:00:00Z" }),
+  ]);
+  // The newest chat is the frozen one: it must neither win "Open chat" nor push the live chat into duplicates.
+  expect(row.paseoAgentId).toBe("current");
+  expect(row.duplicateChatIds).toEqual([]);
+});
+
+it("a terminal whose pane-mode chats were all replaced offers a fresh bind instead of a frozen chat", async () => {
+  const row = await paneRow({ pid: 99 })([paneChat("replaced", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBeNull();
+  expect(row.provider).toBe("herdr-panefake");
+});
+
+it("a pane-mode chat is replaced by a different tty even at the same pid", async () => {
+  const row = await paneRow({ pid: 41, tty: "/dev/pts/9" })([paneChat("old", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBeNull();
+});
+
+it("a pane-mode chat stays live when the process cannot be read", async () => {
+  const row = await paneRow("unreadable")([paneChat("bound", { pid: 41, tty: "/dev/pts/1" })]);
+  expect(row.paseoAgentId).toBe("bound");
+});
+
+it("a pane-mode chat that never bound a process stays live and costs no process read", async () => {
+  const row = await paneRow({ pid: 99 })([paneChat("never-validated", null)]);
+  expect(row.paseoAgentId).toBe("never-validated");
+  expect(fake.requestsFor("pane.process_info")).toHaveLength(0);
 });

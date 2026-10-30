@@ -3,6 +3,12 @@ import { diffTimeline, hashItem } from "./timeline.js";
 import type { HerdrHarnessSession } from "./session.js";
 import { ForkWatcher } from "./forks.js";
 
+/**
+ * Minimum gap between notification-driven reconciles. A burst collapses into one trailing refresh, so a fast-output
+ * pane cannot outrun validation plus transcript reads; the first notification after a quiet spell still runs at once.
+ */
+const NOTIFY_MIN_INTERVAL_MS = 250;
+
 /** Scheduling only: binding, turn, connectivity and transcript state live in SessionState. */
 export class LiveSession {
   private running = false;
@@ -11,13 +17,26 @@ export class LiveSession {
   private streamController: AbortController | null = null;
   private streamEpoch = 0;
   private queue: Promise<void> = Promise.resolve();
+  /** The one reconcile that is queued behind the running work and has not started yet. */
+  private queuedReconcile: Promise<void> | null = null;
+  private notifyTimer: NodeJS.Timeout | undefined;
+  private lastNotifyAt = 0;
+  /** Status-evidence mode: one reconcile timer armed for the tracker's next deadline. */
+  private deadlineTimer: NodeJS.Timeout | undefined;
   private readonly forks: ForkWatcher;
+  /** The adapter's `turnEvidence`: status mode drives turn ends from Herdr counters, not the transcript. */
+  private readonly statusEvidence: boolean;
 
-  constructor(private readonly session: HerdrHarnessSession) { this.forks = new ForkWatcher(session); }
+  constructor(private readonly session: HerdrHarnessSession) {
+    this.forks = new ForkWatcher(session);
+    this.statusEvidence = session.adapter.turnEvidence === "status";
+    // The session constructs the tracker before it is wired here; pin the adapter's evidence mode onto it.
+    if (this.statusEvidence) session.state.tracker.adoptEvidenceMode("status");
+  }
   start(): void {
     if (this.running || this.session.isAborted) return;
     this.running = true;
-    this.readerUnsubscribe = this.session.state.reader?.subscribe(() => { void this.reconcile(); }) ?? null;
+    this.readerUnsubscribe = this.session.state.reader?.subscribe(() => { this.notify(); }) ?? null;
     this.subscribePane();
     this.timer = setInterval(() => { void this.reconcile(); }, 2000);
     this.forks.start();
@@ -32,6 +51,10 @@ export class LiveSession {
     this.readerUnsubscribe = null;
     clearInterval(this.timer);
     this.timer = undefined;
+    clearTimeout(this.notifyTimer);
+    this.notifyTimer = undefined;
+    clearTimeout(this.deadlineTimer);
+    this.deadlineTimer = undefined;
     clearTimeout(this.earlyAbortTimer);
     this.forks.stop();
   }
@@ -79,8 +102,9 @@ export class LiveSession {
       this.disconnected();
       return;
     }
-    // Even a valid socket acknowledgement is not a validated native session.
-    if (event.event === "observer.connected") { await this.reconcile(); return; }
+    // Even a valid socket acknowledgement is not a validated native session. A resync marker means notifications were
+    // dropped locally (see the client's queue bounds): one fresh snapshot recovers whatever they carried.
+    if (event.event === "observer.connected" || event.event === "observer.resync") { await this.reconcile(); return; }
     const data = event.data as Record<string, unknown> | undefined;
     if (event.event === "pane.agent_status_changed" || event.event === "pane_agent_status_changed") {
       const paneId = typeof data?.pane_id === "string" ? data.pane_id : subscribedPane;
@@ -88,7 +112,7 @@ export class LiveSession {
     }
     // Lifecycle events are deliberately re-resolved by terminal identity. Never
     // mutate our native ref from a global event for another pane.
-    await this.reconcile();
+    this.notify();
   }
 
   private serialize(work: () => Promise<void>): Promise<void> {
@@ -97,8 +121,30 @@ export class LiveSession {
     return next;
   }
   readTranscript(): Promise<void> { return this.serialize(() => this.doReadTranscript()); }
+
+  /** Ask for a refresh without waiting for it; bursts are spaced by NOTIFY_MIN_INTERVAL_MS. */
+  private notify(): void {
+    if (!this.running || this.notifyTimer) return;
+    const now = Date.now();
+    const wait = Math.min(NOTIFY_MIN_INTERVAL_MS, this.lastNotifyAt + NOTIFY_MIN_INTERVAL_MS - now);
+    const run = () => {
+      this.notifyTimer = undefined;
+      if (!this.running) return;
+      this.lastNotifyAt = Date.now();
+      void this.reconcile();
+    };
+    if (wait <= 0) run();
+    else this.notifyTimer = setTimeout(run, wait);
+  }
+
+  /**
+   * At most one reconcile waits behind the running work. It reads the state when it starts, so a caller that joins it
+   * observes state at least as new as its own call: the latest state wins and a burst never grows the queue.
+   */
   reconcile(): Promise<void> {
-    return this.serialize(async () => {
+    if (this.queuedReconcile) return this.queuedReconcile;
+    const next = this.serialize(async () => {
+      this.queuedReconcile = null;
       const session = this.session;
       if (session.isAborted || session.state.outcome !== "active") return;
       const generation = session.state.generation;
@@ -107,19 +153,27 @@ export class LiveSession {
         const agent = await session.validateAgent();
         if (!agent || !session.current(generation)) return;
         const state = session.state;
-        if (!state.tracker.activeTurn && (agent.agent_status === "working" || agent.agent_status === "blocked")) {
-          state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
-        }
-        const working = agent.agent_status === "working";
-        const echo = state.staleWorking;
-        if (!state.tracker.activeTurn && echo && working && state.snapshot?.lastTurnEndId === echo.endId) {
-          // Late `working` for a turn the transcript already ended: no news, so no phantom turn.
-          echo.echoed = true;
-          state.tracker.observeStatus("idle");
+        if (this.statusEvidence) {
+          // Status evidence: the tracker owns turn starts and ends from Herdr's counters alone; the transcript
+          // echo bookkeeping (turn baseline, staleWorking, workingSeen) below is transcript-mode machinery.
+          state.tracker.observeStatusEvidence({ status: agent.agent_status, stateChangeSeq: agent.state_change_seq, completionSeq: agent.completion_seq ?? null });
+          // A reservation the tracker resolved by itself (settled, failed or canceled) frees the pending slot.
+          if (state.pending && !state.tracker.activeTurn) state.pending = null;
         } else {
-          if (echo?.echoed && !working) state.staleWorking = null;
-          state.tracker.observeStatus(agent.agent_status);
-          if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
+          if (!state.tracker.activeTurn && (agent.agent_status === "working" || agent.agent_status === "blocked")) {
+            state.turnBaselineEndId = state.snapshot?.lastTurnEndId ?? null;
+          }
+          const working = agent.agent_status === "working";
+          const echo = state.staleWorking;
+          if (!state.tracker.activeTurn && echo && working && state.snapshot?.lastTurnEndId === echo.endId) {
+            // Late `working` for a turn the transcript already ended: no news, so no phantom turn.
+            echo.echoed = true;
+            state.tracker.observeStatus("idle");
+          } else {
+            if (echo?.echoed && !working) state.staleWorking = null;
+            state.tracker.observeStatus(agent.agent_status);
+            if (state.tracker.activeTurn && (working || agent.agent_status === "blocked")) state.workingSeen = true;
+          }
         }
         session.approvals.observeStatus(agent.agent_status);
         await this.doReadTranscript();
@@ -127,14 +181,37 @@ export class LiveSession {
         state.connected = true;
         state.tracker.observeConnectivityRestored();
         if (!wasConnected) session.approvals.connectivityRestored();
-        this.checkEarlyAbort(generation);
+        // Early abort is a transcript-evidence heuristic; in status mode the tracker's own end rules apply.
+        if (this.statusEvidence) this.armDeadline();
+        else this.checkEarlyAbort(generation);
       } catch {
         if (session.current(generation)) this.disconnected();
       }
     });
+    this.queuedReconcile = next;
+    return next;
   }
 
   private earlyAbortTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * Status-evidence mode: arm one reconcile timer for the tracker's next deadline (an idle-settle or
+   * uncertain-settle boundary), so the deciding observation happens on the boundary instead of waiting for
+   * the poll interval. Re-armed on every reconcile; cleared in stop().
+   */
+  private armDeadline(): void {
+    if (this.deadlineTimer) {
+      clearTimeout(this.deadlineTimer);
+      this.deadlineTimer = undefined;
+    }
+    if (!this.running) return;
+    const deadline = this.session.state.tracker.nextDeadline;
+    if (deadline === null) return;
+    this.deadlineTimer = setTimeout(() => {
+      this.deadlineTimer = undefined;
+      void this.reconcile();
+    }, Math.max(deadline - Date.now(), 0));
+  }
 
   /**
    * A Stop that lands before the harness records the prompt leaves no transcript trace, so only Herdr's idle status plus
@@ -178,7 +255,9 @@ export class LiveSession {
     const oldUserIds = new Set(previous?.items.filter((item) => item.type === "user_message").map((item) => item.id) ?? []);
     const newUsers = snapshot.items.filter((item) => item.type === "user_message" && !oldUserIds.has(item.id));
     const pending = state.pending;
-    if (pending) {
+    // Status evidence: rows are still diffed and emitted below, but turn ownership never comes from the
+    // transcript — no user-row matching, no terminal-turn synthesis from new user rows.
+    if (!this.statusEvidence && pending) {
       const user = snapshot.items.find((item) => item.type === "user_message" && !pending.previousUserIds.has(item.id) && item.text === pending.text);
       if (user) {
         if (state.binding.submittedMessages[user.id] !== pending.clientMessageId) {
@@ -199,7 +278,7 @@ export class LiveSession {
           }
         }
       }
-    } else if (newUsers.length && !state.tracker.activeTurn) {
+    } else if (!this.statusEvidence && newUsers.length && !state.tracker.activeTurn) {
       state.turnBaselineEndId = previous?.lastTurnEndId ?? null;
       state.tracker.observeStatus("working");
       state.tracker.observeStatus(state.status);
@@ -214,9 +293,10 @@ export class LiveSession {
     }
     state.timeline = nextTimeline;
     state.snapshot = snapshot;
-    if (state.staleWorking && snapshot.lastTurnEndId !== state.staleWorking.endId) state.staleWorking = null;
+    if (!this.statusEvidence && state.staleWorking && snapshot.lastTurnEndId !== state.staleWorking.endId) state.staleWorking = null;
     session.onSnapshot(previous, snapshot);
-    if (state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
+    // The native-end block is transcript evidence; status-mode turns end inside observeStatusEvidence instead.
+    if (!this.statusEvidence && state.tracker.isActive && (state.status === "idle" || state.status === "done") &&
         snapshot.turnState === "idle" && snapshot.lastTurnEndId && snapshot.lastTurnEndId !== state.turnBaselineEndId &&
         snapshot.lastTurnEnd && snapshot.lastTurnEnd !== "unknown") {
       state.tracker.observeNativeTurnEnd(snapshot.lastTurnEnd);

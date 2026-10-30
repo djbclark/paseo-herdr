@@ -5,8 +5,11 @@ import path from "node:path";
 import { COMPANION_SHA256 } from "./companion-hash.js";
 
 // Mirrors scripts/install-omp-companion.mjs; keep the two in sync.
-export const COMPANION_INSTALL_NAME = "paseo-herdr-input.ts";
-const COMPANION_MARKER = "// paseo-herdr OMP input companion.";
+export const COMPANION_INSTALL_NAME = "paseo4herdr-input.ts";
+const COMPANION_MARKER = "// paseo4herdr OMP input companion.";
+// Pre-rename (paseo-herdr) companion; the installer migrates it away.
+export const LEGACY_COMPANION_NAME = "paseo-herdr-input.ts";
+const LEGACY_MARKER = "// paseo-herdr OMP input companion.";
 
 function expandTilde(value: string, home: string): string {
   if (value === "~") return home;
@@ -21,16 +24,33 @@ export function ompExtensionDir(env: NodeJS.ProcessEnv, home: string): string {
   return path.join(home, env.PI_CONFIG_DIR || ".omp", "agent", "extensions");
 }
 
+async function readIfExists(file: string): Promise<string | null> {
+  return fs.readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+    throw error;
+  });
+}
+
 export async function companionInstallStatus(
   env: NodeJS.ProcessEnv = process.env,
   home: string = os.homedir(),
 ): Promise<{ state: "current" | "outdated" | "missing" | "foreign"; path: string }> {
-  const target = path.join(ompExtensionDir(env, home), COMPANION_INSTALL_NAME);
-  const installed = await fs.readFile(target, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
-    throw error;
-  });
-  if (installed === null) return { state: "missing", path: target };
-  if (createHash("sha256").update(installed).digest("hex") === COMPANION_SHA256) return { state: "current", path: target };
+  const dir = ompExtensionDir(env, home);
+  const target = path.join(dir, COMPANION_INSTALL_NAME);
+  const installed = await readIfExists(target);
+  const legacyPath = path.join(dir, LEGACY_COMPANION_NAME);
+  // Any legacy read error (EISDIR, EACCES, ...) counts as no legacy file.
+  const legacy = await readIfExists(legacyPath).catch(() => null);
+  const legacyOurs = legacy !== null && legacy.startsWith(LEGACY_MARKER);
+  if (installed === null) {
+    // Only the pre-rename companion is installed: report it outdated so the diagnostic points at the installer, which migrates it.
+    if (legacyOurs) return { state: "outdated", path: legacyPath };
+    return { state: "missing", path: target };
+  }
+  if (createHash("sha256").update(installed).digest("hex") === COMPANION_SHA256) {
+    // OMP loads every file in the extensions directory: a leftover legacy companion means two are active, so not current.
+    if (legacyOurs) return { state: "outdated", path: legacyPath };
+    return { state: "current", path: target };
+  }
   return { state: installed.startsWith(COMPANION_MARKER) ? "outdated" : "foreign", path: target };
 }

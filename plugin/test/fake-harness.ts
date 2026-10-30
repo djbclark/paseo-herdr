@@ -1,10 +1,13 @@
 import type {
   ApprovalSnapshot,
+  BindingMode,
   ConfigureResult,
   Decision,
   DecisionOutcome,
   DecisionRecord,
   DecisionSource,
+  LaunchSpec,
+  PaneObservation,
   PendingDecision,
   QuestionAnswer,
   ResolveResult,
@@ -14,6 +17,7 @@ import type {
   TranscriptLocator,
   TranscriptReader,
   TranscriptSnapshot,
+  TurnEvidence,
 } from "../server/harness/types.js";
 import type { AgentSessionRef } from "../server/herdr/schema.js";
 import { classifyHerdrPrompt } from "../server/prompt.js";
@@ -122,8 +126,31 @@ export class FakeApprovals {
   }
 }
 
+export interface FakeAdapterOptions {
+  config?: FakeConfig;
+  approvals?: FakeApprovals;
+  id?: string;
+  /** Herdr `agent` kinds the fake claims for new work (default: its own id); "any" makes it the fallback adapter. */
+  nativeKinds?: readonly string[] | "any";
+  /** Default "native-ref"; "pane" builds a pane-bound fake. */
+  binding?: BindingMode;
+  /** Default "transcript". */
+  turnEvidence?: TurnEvidence;
+  /** Default `{ kind: id, args: () => [] }`; `null` = an import/bind-only fake. */
+  launch?: LaunchSpec | null;
+  /** Default "fake"; `null` = no Herdr integration required. */
+  herdrIntegration?: string | null;
+  /**
+   * Pane-mode transcript seam: when set, `resolveTranscript` needs `ctx.pane` and returns a pane-backed
+   * locator; every `snapshot()` re-reads the pane through this function (non-empty lines become
+   * alternating user/assistant items, first line a user message). `subscribe` is a no-op — the test
+   * drives freshness through Herdr events or repeated snapshots.
+   */
+  paneReader?: (observation: PaneObservation) => string;
+}
+
 /** `config` makes the adapter implement the optional P3.5A readConfig/configure pair. */
-export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?: FakeConfig; approvals?: FakeApprovals } = {}): HarnessAdapter {
+export function makeFakeAdapter(transcript?: FakeTranscript, options: FakeAdapterOptions = {}): HarnessAdapter {
   const store = transcript ?? new FakeTranscript();
   const live = options.config;
   const configSupport: Pick<HarnessAdapter, "readConfig" | "configure"> = live ? {
@@ -169,50 +196,97 @@ export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?:
       return { type: "resolved", outcome: approvals.decide(id, outcome, "paseo", decision.type === "answer" ? decision.answers : undefined) };
     },
   } : {};
+  const id = options.id ?? FAKE_HARNESS_ID;
+  const paneReader = options.paneReader;
+  const launch: LaunchSpec | undefined =
+    options.launch === undefined ? { kind: id, args: (): string[] => [] } : options.launch ?? undefined;
+  const storeReader = (locator: TranscriptLocator): TranscriptReader & { notify(): void } => {
+    const listeners = store.listeners;
+    return {
+      async snapshot(): Promise<TranscriptSnapshot> {
+        const items = store.items;
+        const timestamps: Record<string, string> = {};
+        for (const item of items) timestamps[item.id] = "";
+        return {
+          items,
+          timestamps,
+          ...(store.model !== undefined ? { model: store.model } : {}),
+          ...(store.thinkingLevel !== undefined ? { thinkingLevel: store.thinkingLevel } : {}),
+          turnState: !store.lastEntry || store.lastEntry.kind === "assistant" ? "idle" : "working",
+          ...(store.lastEntry?.kind === "assistant" ? { lastTurnEnd: store.lastEntry.end ?? "completed", lastTurnEndId: store.lastEntry.id } : {}),
+          chainHead: items.at(-1)?.id ?? null,
+          chainIds: items.map((item) => item.id),
+          extendsPrevious: (previous: TranscriptSnapshot) =>
+            previous.chainIds.length === 0 ||
+            previous.chainIds.every((previousId, index) => items[index]?.id === previousId),
+        };
+      },
+      subscribe(listener: () => void): () => void {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      notify(): void {
+        for (const listener of listeners) listener();
+      },
+      close() {},
+    };
+  };
   return {
     ...configSupport,
     ...approvalSupport,
-    id: FAKE_HARNESS_ID,
+    id,
     label: "Fake",
-    herdrIntegration: "fake",
-    resolveTranscript: async (ref) =>
-      ref?.kind === "id" ? { path: `memory://${ref.value}`, nativeSessionKey: ref.value } : null,
+    nativeKinds: options.nativeKinds ?? [id],
+    herdrIntegration: options.herdrIntegration === undefined ? "fake" : options.herdrIntegration,
+    binding: options.binding ?? "native-ref",
+    turnEvidence: options.turnEvidence ?? "transcript",
+    ...(launch ? { launch } : {}),
+    resolveTranscript: paneReader
+      ? async (_ref, ctx) =>
+          ctx.pane
+            ? { path: `pane://${ctx.pane.terminalId}`, nativeSessionKey: `pane:${ctx.pane.terminalId}`, pane: ctx.pane }
+            : null
+      : async (ref) =>
+          ref?.kind === "id" ? { path: `memory://${ref.value}`, nativeSessionKey: ref.value } : null,
     nativeSessionKey: (ref) => ref.value,
-    openTranscript: (locator: TranscriptLocator): TranscriptReader & { notify(): void } => {
-      const listeners = store.listeners;
+    openTranscript: (locator: TranscriptLocator): TranscriptReader => {
+      if (!paneReader || !locator.pane) {
+        return storeReader(locator);
+      }
+      const observation = locator.pane;
+      const key = locator.nativeSessionKey;
       return {
         async snapshot(): Promise<TranscriptSnapshot> {
-          const items = store.items;
+          const lines = paneReader(observation).split("\n").filter((line) => line.trim() !== "");
+          const items = lines.map((line, index) => ({
+            id: `fake:${key}:${index}:${index % 2 === 0 ? "user_message" : "assistant_message"}:0`,
+            type: index % 2 === 0 ? "user_message" as const : "assistant_message" as const,
+            text: line.trimEnd(),
+          }));
           const timestamps: Record<string, string> = {};
           for (const item of items) timestamps[item.id] = "";
           return {
             items,
             timestamps,
-            ...(store.model !== undefined ? { model: store.model } : {}),
-            ...(store.thinkingLevel !== undefined ? { thinkingLevel: store.thinkingLevel } : {}),
-            turnState: !store.lastEntry || store.lastEntry.kind === "assistant" ? "idle" : "working",
-            ...(store.lastEntry?.kind === "assistant" ? { lastTurnEnd: store.lastEntry.end ?? "completed", lastTurnEndId: store.lastEntry.id } : {}),
+            turnState: !items.length || items.at(-1)?.type === "assistant_message" ? "idle" : "working",
             chainHead: items.at(-1)?.id ?? null,
             chainIds: items.map((item) => item.id),
             extendsPrevious: (previous: TranscriptSnapshot) =>
               previous.chainIds.length === 0 ||
-              previous.chainIds.every((id, i) => items[i]?.id === id),
+              previous.chainIds.every((previousId, index) => items[index]?.id === previousId),
           };
         },
-        subscribe(listener: () => void): () => void {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
-        notify(): void {
-          for (const listener of listeners) listener();
+        subscribe(_listener: () => void): () => void {
+          return () => {};
         },
         close() {},
       };
     },
     inspectInput: async ({ pid }) => ({ pid, instanceId: "fake-instance" }),
     submitPrompt: async (target, text, ctx) => {
-      const binding = { harness: FAKE_HARNESS_ID, terminalId: target.terminalId, sessionRef: target.ref,
-        herdrSession: null, agentName: null, cwd: "/work", submittedMessages: {} };
+      const kinds = options.nativeKinds ?? [id];
+      const binding = { terminalId: target.terminalId, sessionRef: target.ref,
+        accepts: (kind: string | null | undefined) => kinds === "any" || (kind != null && kinds.includes(kind)) };
       try {
         const result = await ctx.request("agent.prompt", { target: target.paneId, text }, { signal: ctx.signal });
         return classifyHerdrPrompt(result, undefined, binding);
@@ -220,7 +294,6 @@ export function makeFakeAdapter(transcript?: FakeTranscript, options: { config?:
     },
     interruptKeys: ["ctrl+c"],
     promptWhileWorking: "reject",
-    launchArgs: () => [],
     isOccupant: () => true,
     blockedHint: "fake hint",
   };

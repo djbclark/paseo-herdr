@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderSessionConfig } from "@getpaseo/plugin/server/provider";
 import { FakeHerdr } from "./fake-herdr.js";
 import { makeFakeAdapter, FAKE_HARNESS_ID } from "./fake-harness.js";
+import type { HarnessAdapter } from "../server/harness/types.js";
 import { HerdrClient, HerdrError } from "../server/herdr/client.js";
 import { LaunchError, launchAgent, type LaunchDeps } from "../server/launch.js";
 
 const CWD = "/work/project";
 const KIND = FAKE_HARNESS_ID;
-const adapter = { ...makeFakeAdapter(), launchArgs: () => ["--flag", "value with space"] };
+const adapter: HarnessAdapter = { ...makeFakeAdapter(), launch: { kind: KIND, args: () => ["--flag", "value with space"] } };
 
 function config(cwd = CWD): ProviderSessionConfig {
   return { cwd, env: {}, mcpServers: {}, settings: {}, persist: false };
@@ -153,8 +154,8 @@ class Sim {
   }
 }
 
-async function run(sim: Sim, signal = new AbortController().signal, cwd = CWD, deps: Partial<LaunchDeps> = {}) {
-  return launchAgent(sim.deps(deps), adapter, config(cwd), signal);
+async function run(sim: Sim, signal = new AbortController().signal, cwd = CWD, deps: Partial<LaunchDeps> = {}, launchAdapter: HarnessAdapter = adapter) {
+  return launchAgent(sim.deps(deps), launchAdapter, config(cwd), signal);
 }
 
 async function failure(promise: Promise<unknown>): Promise<LaunchError> {
@@ -202,6 +203,27 @@ describe("launchAgent", () => {
     await run(sim);
     const detectedAt = sim.startedAt! + 500;
     expect(sim.of("pane.process_info").every((c) => c.at < detectedAt + 100)).toBe(true);
+  });
+
+  it("refuses an adapter that cannot launch before any Herdr request", async () => {
+    const sim = new Sim();
+    const bindOnly = makeFakeAdapter(undefined, { launch: null });
+    const error = await failure(run(sim, undefined, undefined, {}, bindOnly));
+    expect(error.code).toBe("start_rejected");
+    expect(error.message).toMatch(/can't be created/);
+    expect(sim.calls).toEqual([]);
+  });
+
+  it("starts the agent with launch.kind when it differs from the adapter id", async () => {
+    const sim = new Sim().on("agent.get", (p, s) => {
+      const base = s.defaultGet(String(p.target), s) as { type: string; agent: Record<string, unknown> };
+      return base.type === "agent_info" && base.agent.agent === KIND
+        ? { type: "agent_info", agent: { ...base.agent, agent: "claude-tui" } }
+        : base;
+    });
+    const claudeShaped = makeFakeAdapter(undefined, { launch: { kind: "claude-tui", args: () => [] } });
+    await run(sim, undefined, undefined, {}, claudeShaped);
+    expect(sim.of("agent.start")[0].params).toMatchObject({ kind: "claude-tui", args: [] });
   });
 
   it("reuses a workspace whose pane cwd matches (normalized) by creating a tab", async () => {
