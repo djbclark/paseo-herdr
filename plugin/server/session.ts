@@ -309,11 +309,12 @@ export class HerdrHarnessSession {
     } catch { /* the adapter could not tell: same as unsupported */ }
     if (outcome === "cleared" || !this.current(generation)) return;
     if (!this.adapter.discardRestoredPrompt) {
-      // This harness has no way to discard text, so nothing was typed for it to restore.
+      // This harness cannot discard text, and it submits by typing into the terminal: the message was typed and may
+      // still sit in the input box, or the harness may have recorded it late. Deny nothing.
       this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
         id: "restored-prompt", severity: "info",
-        title: `${label} did not receive your message`,
-        description: "Your message was not delivered and nothing was typed into the terminal.",
+        title: `${label} may not have received your message`,
+        description: "The message was typed into the terminal and may still be in the input box. Check the terminal before sending it again.",
       } });
       return;
     }
