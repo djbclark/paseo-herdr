@@ -308,6 +308,15 @@ export class HerdrHarnessSession {
       }
     } catch { /* the adapter could not tell: same as unsupported */ }
     if (outcome === "cleared" || !this.current(generation)) return;
+    if (!this.adapter.discardRestoredPrompt) {
+      // This harness has no way to discard text, so nothing was typed for it to restore.
+      this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
+        id: "restored-prompt", severity: "info",
+        title: `${label} did not receive your message`,
+        description: "Your message was not delivered and nothing was typed into the terminal.",
+      } });
+      return;
+    }
     // "kept" is a companion's authenticated answer that the input box still holds text, which need not be ours;
     // anything else (unknown, unsupported, a throw) says nothing about the input box.
     const kept = outcome === "kept";
