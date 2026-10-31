@@ -94,13 +94,11 @@ describe("agentLabel", () => {
       expect(duplicateArchiveSkippedMessage({ skip: "none-left", archive: [] })).toContain("already gone");
     });
   });
-  it("names the first rejection in a partial archive failure and says nothing when all worked", () => {
-    const ok = { status: "fulfilled", value: undefined } as const;
-    const bad = (reason: unknown) => ({ status: "rejected", reason }) as const;
-    expect(archiveFailureMessage([ok, bad(new Error("agent is busy")), bad("second")])).toBe("Couldn't archive 2 of 3 duplicate chats: agent is busy");
-    expect(archiveFailureMessage([bad(undefined)])).toBe("Couldn't archive 1 of 1 duplicate chats: Something went wrong");
-    expect(archiveFailureMessage([ok, ok])).toBeNull();
-    expect(archiveFailureMessage([])).toBeNull();
+  it("names the first failure in a partial archive and says nothing when all worked", () => {
+    expect(archiveFailureMessage(3, [{ error: "agent is busy" }, { error: "second" }])).toBe("Couldn't archive 2 of 3 duplicate chats: agent is busy");
+    expect(archiveFailureMessage(1, [{ error: "Something went wrong" }])).toBe("Couldn't archive 1 of 1 duplicate chats: Something went wrong");
+    expect(archiveFailureMessage(2, [])).toBeNull();
+    expect(archiveFailureMessage(0, [])).toBeNull();
   });
   it("words the archive-duplicates action by count", () => {
     expect(archiveDuplicatesLabel(1)).toBe("Archive 1 duplicate chat");

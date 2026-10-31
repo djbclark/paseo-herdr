@@ -203,6 +203,24 @@ export const herdrChatReadyRpc = defineRpc({
   output: z.object({ flushed: z.number().int() }),
 });
 
+/**
+ * Archive the duplicate chats the user was shown for one terminal, after the server re-reads the owner chat
+ * (compare-and-archive): nothing is archived unless `ownerId` is still the terminal's owner, and only ids that are
+ * still its live duplicates are. Never starts Herdr. Archived chats stay restorable from Paseo's archive.
+ * The server's check and its archive calls are separate steps, so a reply that lands between them still wins.
+ */
+export const herdrDuplicatesArchiveRpc = defineRpc({
+  name: "herdr.duplicates.archive",
+  input: z.object({ terminalId: z.string(), paneId: z.string(), ownerId: z.string(), ids: z.array(z.string()) }),
+  output: z.object({
+    /** Why nothing was archived; null when the check passed (individual archives may still have failed). */
+    skip: z.enum(["agent-gone", "owner-changed", "none-left"]).nullable(),
+    archived: z.array(z.string()),
+    /** Reasons for the ids whose archive call rejected. */
+    failures: z.array(z.object({ id: z.string(), error: z.string() })),
+  }),
+});
+
 export const herdrWorkspaceCreateRpc = defineRpc({
   name: "herdr.workspace.create",
   input: z.object({

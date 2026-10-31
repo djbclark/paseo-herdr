@@ -151,13 +151,12 @@ export function duplicateArchiveSkippedMessage(plan: Exclude<DuplicateArchivePla
 }
 
 /**
- * Toast text for a partly failed archive, with the first rejection's reason; null when every archive
- * worked (or none was tried).
+ * Toast text for a partly failed archive, with the first failure's reason; null when every archive
+ * worked (or none was tried). `total` is the number of chats the server tried to archive.
  */
-export function archiveFailureMessage(results: readonly PromiseSettledResult<unknown>[]): string | null {
-  const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-  if (rejected.length === 0) return null;
-  return `Couldn't archive ${rejected.length} of ${results.length} duplicate chats: ${errorMessage(rejected[0]!.reason)}`;
+export function archiveFailureMessage(total: number, failures: readonly { error: string }[]): string | null {
+  if (failures.length === 0) return null;
+  return `Couldn't archive ${failures.length} of ${total} duplicate chats: ${failures[0]!.error}`;
 }
 
 /** Button text for archiving `count` duplicate chats. */
