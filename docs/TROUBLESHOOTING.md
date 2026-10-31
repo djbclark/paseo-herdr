@@ -139,6 +139,7 @@ A warning notice appears in the chat and input is disabled. The conversation sta
 | Interrupt could not be delivered (notice) | The stop key couldn't be sent to the pane. | Press Esc in the terminal. |
 | Interrupt has not ended the turn (notice) | Esc was sent, but OMP is still working after 10 seconds. | Press Esc in the terminal. |
 | OMP kept text in its input box / may have kept your message in its input box (notice) | You stopped before OMP recorded the message and OMP restored it into its input box. | Clear the input box in the terminal (**⋯ → Open in terminal**). |
+| The agent may not have received your message (notice) | You stopped right after sending. This agent cannot discard restored text, and Herdr had already typed the message into the terminal, so it may be in the input box or recorded late. | Check the terminal before sending anything again. |
 
 ## Restart to enable input fails
 

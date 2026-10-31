@@ -236,12 +236,15 @@ describe("restored-prompt notice (F10)", () => {
   const restoredNotices = (all: ProviderEvent[]) => all.flatMap((e) => e.type === "session.notice" && e.notice.id === "restored-prompt" ? [e.notice] : []);
   const claimed = (n: { title: string; description?: string }) => /put your message back/.test(n.title) || /^The message was not sent\./.test(n.description ?? "");
 
-  it("an adapter without discardRestoredPrompt gets a conditional notice, not a claim", async () => {
+  it("an adapter without discardRestoredPrompt neither claims delivery nor denies delivery or typing", async () => {
     const notices = await abortEarly();
     expect(notices).toHaveLength(1);
     expect(claimed(notices[0]!)).toBe(false);
-    expect(notices[0]!.title).toMatch(/may have kept your message/);
-    expect(notices[0]!.description).toMatch(/^If the message was not sent.*clear the input box.*Open in terminal/);
+    const text = `${notices[0]!.title} ${notices[0]!.description}`;
+    expect(text).not.toMatch(/nothing was typed|not delivered|did not receive|was not sent|not typed/i);
+    expect(text).not.toMatch(/was (delivered|received|sent)\b/i);
+    expect(notices[0]!.title).toBe("Fake may not have received your message");
+    expect(notices[0]!.description).toBe("The message was typed into the terminal and may still be in the input box. Check the terminal before sending it again.");
   });
 
   it("an adapter that cannot tell, or fails, gets the conditional notice", async () => {
