@@ -313,6 +313,26 @@ describe("herdr.duplicates.archive (server compare-and-archive)", () => {
     expect(paseo.archived).toEqual(["older"]);
   });
 
+  it("never archives the owner even when the client sends its id, and a chat listed twice across pages is one chat", async () => {
+    seed();
+    const { call } = setup();
+    // `newer` appears on both pages, as when the list order shifts while paging; the older copy has a stale timestamp.
+    const pages = [[...chats().slice(0, 2), chatWith("newer", "omp", "t-p1", { updatedAt: "2026-10-13T07:00:00Z" })], [chats()[2]!]];
+    const archived: string[] = [];
+    const api = { agents: {
+      list: async (q: { page?: { cursor?: string } }) => {
+        const index = q.page?.cursor ? 1 : 0;
+        return { entries: pages[index]!.map((agent) => ({ agent })), pageInfo: { hasMore: index === 0, nextCursor: index === 0 ? "c1" : null, prevCursor: null } };
+      },
+      ref: (id: string) => ({ archive: async () => { archived.push(id); } }),
+    } };
+    expect(await call(herdrDuplicatesArchiveRpc, input({ ids: ["newer", "older", "oldest"] }), api)).toEqual({ skip: null, archived: ["older", "oldest"], failures: [] });
+    expect(archived).toEqual(["older", "oldest"]);
+    const deduped = await herdrChats({ agents: { ...api.agents, list: api.agents.list } } as never, [ompAdapter]);
+    expect(deduped.filter((chat) => chat.agentId === "newer")).toHaveLength(1);
+    expect(deduped.find((chat) => chat.agentId === "newer")!.lastActivityAt).toBe("2026-10-13T10:00:00Z");
+  });
+
   it("archives nothing when the pane is gone or is a different pane", async () => {
     seed();
     const { call } = setup();

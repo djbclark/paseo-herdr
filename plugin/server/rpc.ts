@@ -102,7 +102,8 @@ export interface HerdrChat {
 
 /** Every unarchived Paseo chat owned by one of the registered harness providers. */
 export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAdapter[]): Promise<HerdrChat[]> {
-  const chats: HerdrChat[] = [];
+  // Keyed by agent id: a list whose order shifts between pages can return one chat twice; the newest copy wins.
+  const chats = new Map<string, HerdrChat>();
   const byProvider = new Map(harnesses.map((adapter) => [`herdr-${adapter.id}`, adapter]));
   let cursor: string | undefined;
   for (let page = 0; page < 50; page++) {
@@ -113,13 +114,15 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
       if (!adapter || !persistence) continue;
       try {
         const binding = parseBinding({ version: persistence.version, data: persistence.data as never }, adapter);
-        chats.push({
+        const chat: HerdrChat = {
           agentId: agent.id, herdrSession: binding.herdrSession, terminalId: binding.terminalId, harness: adapter.label,
           harnessId: adapter.id, sessionRef: binding.sessionRef,
           title: agent.title ?? null, cwd: agent.cwd,
           lastActivityAt: activityTime(agent.lastUserMessageAt, agent.updatedAt),
           ...(binding.occupant ? { occupant: { pid: binding.occupant.pid, tty: binding.occupant.tty } } : {}),
-        });
+        };
+        const seen = chats.get(chat.agentId);
+        if (!seen || timestamp(chat.lastActivityAt) > timestamp(seen.lastActivityAt)) chats.set(chat.agentId, chat);
       } catch {
         // Foreign or corrupt persistence: ignore.
       }
@@ -127,7 +130,7 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
     if (!result.pageInfo.hasMore || !result.pageInfo.nextCursor) break;
     cursor = result.pageInfo.nextCursor;
   }
-  return chats;
+  return [...chats.values()];
 }
 
 const chatKey = (herdrSession: string | null, terminalId: string) => `${herdrSession ?? ""}\0${terminalId}`;
@@ -428,7 +431,8 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     const bound = reconciled.get(chatKey(target.herdrSession, terminalId));
     if (bound?.owner.agentId !== ownerId) return { skip: "owner-changed" as const, archived: [], failures: [] };
     const stillDuplicates = new Set(bound.duplicates.map((chat) => chat.agentId));
-    const wanted = [...new Set(ids)].filter((id) => stillDuplicates.has(id));
+    // Defence in depth: the owner is never a duplicate, whatever the chat list looked like.
+    const wanted = [...new Set(ids)].filter((id) => id !== ownerId && stillDuplicates.has(id));
     if (wanted.length === 0) return { skip: "none-left" as const, archived: [], failures: [] };
     const results = await Promise.allSettled(wanted.map((id) => paseo.agents.ref(id).archive()));
     return {
