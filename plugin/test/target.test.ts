@@ -79,6 +79,18 @@ describe("TargetReadiness", () => {
     await Promise.all([ready.ensureReady(named), ready.ensureReady(named), ready.ensureReady(named)]);
     expect(spawnServer).toHaveBeenCalledOnce();
   });
+  it("keeps a no-start caller and an auto-start caller on the same socket in separate runs, in either order", async () => {
+    const connectOnly = { ...named, autoStart: false, autoStartDisabledReason: "This check never starts Herdr" };
+    for (const order of ["start-first", "check-first"] as const) {
+      const { ready, spawnServer } = rig(async (n) => { if (n < 3) throw errno("ENOENT"); return "0.9.3"; });
+      const calls = order === "start-first" ? [ready.ensureReady(named), ready.ensureReady(connectOnly)] : [ready.ensureReady(connectOnly), ready.ensureReady(named)];
+      const [start, check] = order === "start-first" ? await Promise.allSettled(calls) : (await Promise.allSettled(calls)).reverse();
+      expect(start).toMatchObject({ status: "fulfilled", value: { autoStarted: true } });
+      expect(check).toMatchObject({ status: "rejected" });
+      expect(String((check as PromiseRejectedResult).reason.message)).toContain("This check never starts Herdr");
+      expect(spawnServer).toHaveBeenCalledOnce();
+    }
+  });
   it("never starts on permission, protocol or version errors", async () => {
     for (const error of [errno("EACCES"), new HerdrError("bad_request", "nope"), new Error("herdr request timed out")]) {
       const { ready, spawnServer } = rig(async () => { throw error; });
