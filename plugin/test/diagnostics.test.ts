@@ -172,6 +172,13 @@ it("buildDiagnostics only abbreviates on a path-segment boundary", () => {
   expect(out.herdr.error).toBe("at /Users/bobby/a and ~/b");
 });
 
+it("buildDiagnostics abbreviates the bare home directory before } > | a sentence full stop, and leaves case and file:// forms alone", () => {
+  const out = buildDiagnostics(homeInput({
+    herdr: { connected: false, version: null, autoStarted: false, error: "{path:/Users/bob} <cwd=/Users/bob> a|/Users/bob|b see /Users/bob. next /Users/bob.old /users/bob file:///Users/bob/x" },
+  }));
+  expect(out.herdr.error).toBe("{path:~} <cwd=~> a|~|b see ~. next /Users/bob.old /users/bob file:///Users/bob/x");
+});
+
 it("buildDiagnostics abbreviates the home directory before cutting the error text, and a trailing-slash home still matches", () => {
   const out = buildDiagnostics(homeInput({
     home: "/Users/bob/",
