@@ -24,7 +24,7 @@ describe("processInstanceId", () => {
     await processInstanceId(77, deps);
     expect(execFile).toHaveBeenCalledTimes(1);
     const [file, args, options] = execFile.mock.calls[0]!;
-    expect(file).toBe("ps");
+    expect(file).toBe("/bin/ps");
     expect(args).toEqual(["-o", "lstart=", "-p", "77"]);
     expect(options.timeout).toBe(2000);
     expect(options.env.LC_ALL).toBe("C");
@@ -45,6 +45,20 @@ describe("processInstanceId", () => {
   it("throws on empty or blank ps output", async () => {
     await expect(processInstanceId(9, psDeps("").deps)).rejects.toThrow(/no start time/);
     await expect(processInstanceId(9, psDeps("  \n").deps)).rejects.toThrow(/no start time/);
+  });
+
+  it("accepts a space-padded day of month", async () => {
+    expect(await processInstanceId(9, psDeps("Sat Nov  7 03:04:05 2026\n").deps)).toBe("9@Sat Nov  7 03:04:05 2026");
+  });
+
+  it("throws on ps's `?` placeholder for a process it cannot inspect, so no shared id is returned", async () => {
+    await expect(processInstanceId(1, psDeps("?\n").deps)).rejects.toThrow(/unrecognised start time/);
+  });
+
+  it("throws on any other non-lstart text", async () => {
+    for (const text of ["garbage", "Thu Oct 30 22:13:44", "Thu Oct 30 22:13:44 2026 extra", "Thu Okt 30 22:13:44 2026", "jeu. oct. 30 22:13:44 2026", "ps: no such process"]) {
+      await expect(processInstanceId(9, psDeps(text).deps), text).rejects.toThrow(/unrecognised start time/);
+    }
   });
 
   it("rejects a non-positive or fractional pid without spawning", async () => {

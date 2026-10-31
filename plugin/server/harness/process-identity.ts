@@ -10,6 +10,10 @@ export interface ProcessIdentityDeps {
 }
 
 const PS_TIMEOUT_MS = 2000;
+/** Absolute, not via PATH: exists on macOS and Linux. */
+const PS_PATH = "/bin/ps";
+/** C-locale `ps -o lstart=`: `Thu Oct 30 22:13:44 2026` (day space-padded). Anything else (e.g. `?` for a process ps cannot inspect) is not an identity. */
+const LSTART = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d\d:\d\d:\d\d \d{4}$/;
 const execFileAsync = promisify(execFile);
 
 const defaultDeps: ProcessIdentityDeps = {
@@ -34,7 +38,14 @@ function linuxStartTime(stat: string): string {
 
 /**
  * Identity of one process instance: `"<pid>@<start>"`. A reused pid has a different start time, so the id differs.
- * Throws on any failure or empty answer; an id is never guessed.
+ * Throws on any failure, empty answer or unrecognised start time; an id is never guessed.
+ *
+ * Limits:
+ * - macOS: `lstart` has 1 s resolution (a pid reused within the same second is indistinguishable) and follows
+ *   /etc/localtime, which `TZ` cannot override. A system timezone change makes live agents read as replaced; that fails safe.
+ * - Linux: the id is `pid@starttime-in-ticks-since-boot`, not stable across a reboot or across pid namespaces.
+ * - A `ps` timeout or failure throws. Callers MUST treat a throw as "cannot validate, reject the prompt", never as
+ *   "the process was replaced".
  */
 export async function processInstanceId(pid: number, deps: Partial<ProcessIdentityDeps> = {}): Promise<string> {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`invalid pid: ${pid}`);
@@ -43,9 +54,10 @@ export async function processInstanceId(pid: number, deps: Partial<ProcessIdenti
   if (platform === "linux") {
     start = linuxStartTime(await read(`/proc/${pid}/stat`, "utf8"));
   } else {
-    const { stdout } = await run("ps", ["-o", "lstart=", "-p", String(pid)], { timeout: PS_TIMEOUT_MS, env: { ...process.env, LC_ALL: "C" } });
+    const { stdout } = await run(PS_PATH, ["-o", "lstart=", "-p", String(pid)], { timeout: PS_TIMEOUT_MS, env: { ...process.env, LC_ALL: "C" } });
     start = stdout.trim();
     if (!start) throw new Error(`ps returned no start time for pid ${pid}`);
+    if (!LSTART.test(start)) throw new Error(`ps returned an unrecognised start time for pid ${pid}`);
   }
   return `${pid}@${start}`;
 }
