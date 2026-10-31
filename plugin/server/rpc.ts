@@ -434,7 +434,8 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     // Defence in depth: the owner is never a duplicate, whatever the chat list looked like.
     const wanted = [...new Set(ids)].filter((id) => id !== ownerId && stillDuplicates.has(id));
     if (wanted.length === 0) return { skip: "none-left" as const, archived: [], failures: [] };
-    const results = await Promise.allSettled(wanted.map((id) => paseo.agents.ref(id).archive()));
+    // `async` turns a synchronous throw from ref()/archive() into that id's failure instead of rejecting the whole call.
+    const results = await Promise.allSettled(wanted.map(async (id) => paseo.agents.ref(id).archive()));
     return {
       skip: null,
       archived: wanted.filter((_id, index) => results[index]!.status === "fulfilled"),

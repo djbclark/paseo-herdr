@@ -333,6 +333,18 @@ describe("herdr.duplicates.archive (server compare-and-archive)", () => {
     expect(deduped.find((chat) => chat.agentId === "newer")!.lastActivityAt).toBe("2026-10-13T10:00:00Z");
   });
 
+  it("turns a synchronous throw from ref() for one id into that id's failure while the others are archived", async () => {
+    seed();
+    const { call } = setup();
+    const archived: string[] = [];
+    const api = { agents: {
+      list: async () => ({ entries: chats().map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null, prevCursor: null } }),
+      ref: (id: string) => { if (id === "older") throw new Error("ref rejected older"); return { archive: async () => { archived.push(id); } }; },
+    } };
+    expect(await call(herdrDuplicatesArchiveRpc, input(), api)).toEqual({ skip: null, archived: ["oldest"], failures: [{ id: "older", error: "ref rejected older" }] });
+    expect(archived).toEqual(["oldest"]);
+  });
+
   it("archives nothing when the pane is gone or is a different pane", async () => {
     seed();
     const { call } = setup();
