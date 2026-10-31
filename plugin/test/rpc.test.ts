@@ -170,6 +170,18 @@ it("reports Herdr unavailable without failing the overview", async () => {
   expect(result).toMatchObject({ connection: { status: "unavailable", error: "Herdr is not running" }, workspaces: [], chatError: null });
 });
 
+it("an overview asked not to auto-start hands ensureReady a connect-only target, and a normal one keeps the target's auto-start", async () => {
+  seed();
+  const seen: boolean[] = [];
+  const { call } = setup({
+    readTarget: async () => ({ target: { ...target(fake.socketPath), autoStart: true }, ompEnabled: true }),
+    ensureReady: async (x) => { seen.push(x.autoStart); return { target: x, version: "0.9.3", autoStarted: false }; },
+  });
+  await call(herdrOverviewRpc, {}, list([]));
+  await call(herdrOverviewRpc, { noAutoStart: true }, list([]));
+  expect(seen).toEqual([true, false]);
+});
+
 it("parses an overview row and a diagnostics report from a daemon that lacks duplicateChatIds / autoStarted, filling safe defaults", () => {
   const { duplicateChatIds: _dupes, ...oldRow } = {
     terminalId: "t", paneId: "p", name: null, title: null, kind: null, harness: null, provider: null, status: "idle", cwd: null,

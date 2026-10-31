@@ -117,7 +117,13 @@ export const herdrTargetRpc = defineRpc({
 
 export const herdrOverviewRpc = defineRpc({
   name: "herdr.overview",
-  input: z.object({}),
+  input: z.object({
+    /**
+     * Check readiness without ever starting Herdr, whatever the target's auto-start says. The archive re-check
+     * sets it, so tapping a button can't spawn a server. A daemon that predates it ignores it and may start Herdr.
+     */
+    noAutoStart: z.boolean().optional(),
+  }),
   output: z.object({
     target: herdrTargetSchema,
     ompEnabled: z.boolean(),

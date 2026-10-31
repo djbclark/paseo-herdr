@@ -305,12 +305,12 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     return suggestFolders(query, home(), known);
   });
 
-  server.handle(herdrOverviewRpc, async (_input, { paseo }) => {
+  server.handle(herdrOverviewRpc, async ({ noAutoStart }, { paseo }) => {
     const { target, ompEnabled, enabled: enabledFor } = await deps.readTarget();
     const enabled = (adapterId: string) => enabledFor?.(adapterId) ?? true;
     const [chatResult, readyResult] = await Promise.allSettled([
       herdrChats(paseo, deps.harnesses),
-      deps.ensureReady(target),
+      deps.ensureReady(noAutoStart ? { ...target, autoStart: false, autoStartDisabledReason: "This check never starts Herdr" } : target),
     ]);
     const chats = chatResult.status === "fulfilled" ? chatResult.value : [];
     const chatError = chatResult.status === "rejected" ? errorMessage(chatResult.reason) : null;

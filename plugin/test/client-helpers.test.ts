@@ -52,7 +52,9 @@ describe("agentLabel", () => {
     interface Row { terminalId: string; paneId: string; paseoAgentId: string | null; duplicateChatIds: string[] }
     const row = (over: Partial<Row> = {}): Row =>
       ({ terminalId: "t1", paneId: "p1", paseoAgentId: "owner", duplicateChatIds: ["dupA", "dupB"], ...over });
-    const overview = (...agents: Row[]) => [{ tabs: [{ agents: [row({ terminalId: "other", paneId: "px", duplicateChatIds: ["dupA"] })] }, { agents }] }];
+    const fresh = (workspaces: unknown[], over: Record<string, unknown> = {}) =>
+      ({ connection: { status: "connected" as const }, chatError: null, workspaces, ...over }) as Parameters<typeof freshDuplicatesToArchive>[1];
+    const overview = (...agents: Row[]) => fresh([{ tabs: [{ agents: [row({ terminalId: "other", paneId: "px", duplicateChatIds: ["dupA"] })] }, { agents }] }]);
     it("archives every shown duplicate when the fresh row is unchanged", () => {
       expect(freshDuplicatesToArchive(row(), overview(row()))).toEqual({ skip: null, archive: ["dupA", "dupB"] });
     });
@@ -68,18 +70,28 @@ describe("agentLabel", () => {
       expect(freshDuplicatesToArchive(row(), overview(row({ duplicateChatIds: ["dupNew"] })))).toEqual({ skip: "none-left", archive: [] });
     });
     it("archives nothing when the agent row is gone or the pane is not the same one", () => {
-      expect(freshDuplicatesToArchive(row(), [])).toEqual({ skip: "agent-gone", archive: [] });
+      expect(freshDuplicatesToArchive(row(), fresh([]))).toEqual({ skip: "agent-gone", archive: [] });
       expect(freshDuplicatesToArchive(row(), overview(row({ terminalId: "t2" })))).toEqual({ skip: "agent-gone", archive: [] });
       expect(freshDuplicatesToArchive(row(), overview(row({ paneId: "p2" })))).toEqual({ skip: "agent-gone", archive: [] });
     });
     it("finds the row in any workspace and tab, and never uses another agent's duplicates", () => {
       const workspaces = [{ tabs: [{ agents: [row({ terminalId: "t0", paneId: "p0", duplicateChatIds: ["dupA", "dupB"] })] }] }, { tabs: [{ agents: [] }, { agents: [row({ duplicateChatIds: ["dupB"] })] }] }];
-      expect(freshDuplicatesToArchive(row(), workspaces)).toEqual({ skip: null, archive: ["dupB"] });
+      expect(freshDuplicatesToArchive(row(), fresh(workspaces))).toEqual({ skip: null, archive: ["dupB"] });
+    });
+    it("names the real cause when the fresh overview is degraded, before it looks at any row", () => {
+      const rows = [{ tabs: [{ agents: [row({ paseoAgentId: null, duplicateChatIds: [] })] }] }];
+      const herdrDown = freshDuplicatesToArchive(row(), fresh([], { connection: { status: "unavailable", error: "Herdr is not running" } }));
+      expect(herdrDown).toEqual({ skip: "herdr-unavailable", archive: [], detail: "Herdr is not running" });
+      const noChats = freshDuplicatesToArchive(row(), fresh(rows, { chatError: "agents.list failed" }));
+      expect(noChats).toEqual({ skip: "chats-unavailable", archive: [], detail: "agents.list failed" });
+      if (herdrDown.skip === null || noChats.skip === null) throw new Error("expected a skip");
+      expect(duplicateArchiveSkippedMessage(herdrDown)).toBe("Nothing archived: Herdr couldn't be reached to check the chats (Herdr is not running).");
+      expect(duplicateArchiveSkippedMessage(noChats)).toBe("Nothing archived: Paseo's chat list is unavailable, so the chats can't be checked (agents.list failed).");
     });
     it("words each reason to skip", () => {
-      expect(duplicateArchiveSkippedMessage("owner-changed")).toContain("chat changed");
-      expect(duplicateArchiveSkippedMessage("agent-gone")).toContain("no longer listed");
-      expect(duplicateArchiveSkippedMessage("none-left")).toContain("already gone");
+      expect(duplicateArchiveSkippedMessage({ skip: "owner-changed", archive: [] })).toContain("chat changed");
+      expect(duplicateArchiveSkippedMessage({ skip: "agent-gone", archive: [] })).toContain("no longer listed");
+      expect(duplicateArchiveSkippedMessage({ skip: "none-left", archive: [] })).toContain("already gone");
     });
   });
   it("names the first rejection in a partial archive failure and says nothing when all worked", () => {

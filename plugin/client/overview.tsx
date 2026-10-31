@@ -290,15 +290,16 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
   const duplicates = duplicateChatsToArchive(agent);
   const archiveDuplicates = useMutation({
     // The row is up to one refetch old: archive only what a fresh overview still lists as duplicates of the same owner.
+    // The fresh check never starts Herdr, and a degraded answer (Herdr down, chat list unavailable) archives nothing.
     mutationFn: async () => {
-      const plan = freshDuplicatesToArchive(agent, (await fetchOverview({})).workspaces);
-      if (plan.skip) return { skip: plan.skip, failure: null };
+      const plan = freshDuplicatesToArchive(agent, await fetchOverview({ noAutoStart: true }));
+      if (plan.skip) return { plan, failure: null };
       const results = await Promise.allSettled(plan.archive.map((id) => paseo.agents.ref(id).archive()));
-      return { skip: null, failure: archiveFailureMessage(results) };
+      return { plan: null, failure: archiveFailureMessage(results) };
     },
-    onSuccess: ({ skip, failure }) => {
+    onSuccess: ({ plan, failure }) => {
       onChanged();
-      if (skip) toast.show(duplicateArchiveSkippedMessage(skip), { variant: "info" });
+      if (plan) toast.show(duplicateArchiveSkippedMessage(plan), { variant: "info" });
       else if (failure) toast.error(failure);
     },
     onError: (error) => toast.error(`Couldn't check the chats before archiving: ${errorMessage(error)}`),
