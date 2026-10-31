@@ -7,7 +7,7 @@ import { persistenceOf } from "../server/binding.js";
 import { createResolver } from "../server/harness/resolve.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { makeFakeAdapter } from "./fake-harness.js";
-import { herdrAgentRestartRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrDiagnosticsRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HerdrClient } from "../server/herdr/client.js";
 
@@ -168,6 +168,24 @@ it("reports Herdr unavailable without failing the overview", async () => {
   const { call } = setup({ ensureReady: async () => { throw new Error("Herdr is not running"); } });
   const result = herdrOverviewRpc.output.parse(await call(herdrOverviewRpc, {}, list([paseoAgent("pa1", "herdr-omp", "t-p1", "work")])));
   expect(result).toMatchObject({ connection: { status: "unavailable", error: "Herdr is not running" }, workspaces: [], chatError: null });
+});
+
+it("parses an overview row and a diagnostics report from a daemon that lacks duplicateChatIds / autoStarted, filling safe defaults", () => {
+  const { duplicateChatIds: _dupes, ...oldRow } = {
+    terminalId: "t", paneId: "p", name: null, title: null, kind: null, harness: null, provider: null, status: "idle", cwd: null,
+    paseoAgentId: "a", duplicateChatIds: ["x"], attachCommand: "herdr", attach: null, inputReady: null, canRestart: false,
+  };
+  const overview = herdrOverviewRpc.output.parse({
+    target: { socketPath: "/s", herdrSession: null, source: "default", autoStart: false, autoStartDisabledReason: null }, ompEnabled: true,
+    connection: { status: "connected", version: "0.9.3", autoStarted: false }, chatError: null,
+    workspaces: [{ workspaceId: "w", number: 1, label: "w", focused: true, cwd: null, status: "idle", tabs: [{ tabId: "t", number: 1, label: "t", focused: true, status: "idle", agents: [oldRow] }] }],
+  });
+  expect(overview.workspaces[0]!.tabs[0]!.agents[0]!.duplicateChatIds).toEqual([]);
+  const diagnostics = herdrDiagnosticsRpc.output.parse({
+    pluginVersion: "1", target: { socketPath: "/s", herdrSession: null, source: "default", autoStart: false }, ompEnabled: true,
+    herdr: { connected: true, version: "0.9.3", error: null }, companion: { state: "current" }, agents: [], counts: { agents: 0, inputReady: 0, readOnly: 0, unknown: 0 },
+  });
+  expect(diagnostics.herdr.autoStarted).toBe(false);
 });
 
 it("reports Herdr unavailable if it disconnects after readiness", async () => {
