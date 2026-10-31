@@ -93,7 +93,7 @@ const describe = (error: unknown) => (error instanceof HerdrError ? `${error.cod
  * Makes targets reachable. Ping first; start only when the endpoint is absent/unreachable (never on a
  * protocol/version/permission error) and only when `target.autoStart`. Concurrent calls for the same
  * socket path share one start. Readiness is bounded; failure throws `TargetUnavailableError`.
- * Remembers which socket paths it started so the UI can say so. Never stops Herdr.
+ * Remembers which socket paths it started so the UI can say so, and forgets one when a ping finds the endpoint absent. Never stops Herdr.
  */
 export class TargetReadiness {
   private readonly started = new Set<string>();
@@ -129,6 +129,8 @@ export class TargetReadiness {
     } catch (error) {
       if (error instanceof TargetUnavailableError) throw error;
       if (!isAbsent(error)) throw new TargetUnavailableError(`Herdr at ${target.socketPath} is not usable: ${describe(error)}`, target);
+      // The endpoint is gone, so any Herdr this process started earlier is dead: whatever answers next is not that one.
+      this.started.delete(target.socketPath);
       if (!target.autoStart || !target.herdrSession) {
         throw new TargetUnavailableError(`Herdr is not running at ${target.socketPath} (${describe(error)}). ${target.autoStartDisabledReason ?? "Auto-start is off for this target"}`, target);
       }
