@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   herdrAgentRestartRpc,
   herdrChatReadyRpc,
+  herdrDuplicatesArchiveRpc,
   herdrFoldersSuggestRpc,
   herdrOverviewRpc,
   herdrWorkspaceCreateRpc,
@@ -288,17 +289,23 @@ function AgentRow({ agent, theme, styles, navigation, onChanged }: {
   }, [onChanged, paseoAgentId, navigation, paseo, ready, agent, label, toast]);
   // Extra chats bound to this terminal make "tap an agent" ambiguous; the row's own chat is never archived.
   const duplicates = duplicateChatsToArchive(agent);
+  const archiveOnServer = useRpc(herdrDuplicatesArchiveRpc);
   const archiveDuplicates = useMutation({
     // The row is up to one refetch old: archive only what a fresh overview still lists as duplicates of the same owner.
+    // The fresh check never starts Herdr, and a degraded answer (Herdr down, chat list unavailable) archives nothing.
+    // The server then re-reads the owner just before archiving (compare-and-archive), which closes most of the
+    // window between this check and the archive calls; a daemon without that RPC fails the tap and archives nothing.
     mutationFn: async () => {
-      const plan = freshDuplicatesToArchive(agent, (await fetchOverview({})).workspaces);
-      if (plan.skip) return { skip: plan.skip, failure: null };
-      const results = await Promise.allSettled(plan.archive.map((id) => paseo.agents.ref(id).archive()));
-      return { skip: null, failure: archiveFailureMessage(results) };
+      const plan = freshDuplicatesToArchive(agent, await fetchOverview({ noAutoStart: true }));
+      if (plan.skip) return { plan, failure: null };
+      if (!agent.paseoAgentId) return { plan: { skip: "owner-changed" as const, archive: [] as [] }, failure: null };
+      const result = await archiveOnServer({ terminalId: agent.terminalId, paneId: agent.paneId, ownerId: agent.paseoAgentId, ids: plan.archive });
+      if (result.skip) return { plan: { skip: result.skip, archive: [] as [] }, failure: null };
+      return { plan: null, failure: archiveFailureMessage(result.archived.length + result.failures.length, result.failures) };
     },
-    onSuccess: ({ skip, failure }) => {
+    onSuccess: ({ plan, failure }) => {
       onChanged();
-      if (skip) toast.show(duplicateArchiveSkippedMessage(skip), { variant: "info" });
+      if (plan) toast.show(duplicateArchiveSkippedMessage(plan), { variant: "info" });
       else if (failure) toast.error(failure);
     },
     onError: (error) => toast.error(`Couldn't check the chats before archiving: ${errorMessage(error)}`),

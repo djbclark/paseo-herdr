@@ -1,13 +1,13 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { decodePluginPersistence, herdrChats, registerManagementRpcs, type ManagementDeps } from "../server/rpc.js";
 import { persistenceOf } from "../server/binding.js";
 import { createResolver } from "../server/harness/resolve.js";
 import { ompAdapter } from "../server/harness/omp/adapter.js";
 import { makeFakeAdapter } from "./fake-harness.js";
-import { herdrAgentRestartRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrDiagnosticsRpc, herdrDuplicatesArchiveRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type HerdrTarget } from "../shared/rpc.js";
 import { FakeHerdr } from "./fake-herdr.js";
 import { HerdrClient } from "../server/herdr/client.js";
 
@@ -170,6 +170,36 @@ it("reports Herdr unavailable without failing the overview", async () => {
   expect(result).toMatchObject({ connection: { status: "unavailable", error: "Herdr is not running" }, workspaces: [], chatError: null });
 });
 
+it("an overview asked not to auto-start hands ensureReady a connect-only target, and a normal one keeps the target's auto-start", async () => {
+  seed();
+  const seen: boolean[] = [];
+  const { call } = setup({
+    readTarget: async () => ({ target: { ...target(fake.socketPath), autoStart: true }, ompEnabled: true }),
+    ensureReady: async (x) => { seen.push(x.autoStart); return { target: x, version: "0.9.3", autoStarted: false }; },
+  });
+  await call(herdrOverviewRpc, {}, list([]));
+  await call(herdrOverviewRpc, { noAutoStart: true }, list([]));
+  expect(seen).toEqual([true, false]);
+});
+
+it("parses an overview row and a diagnostics report from a daemon that lacks duplicateChatIds / autoStarted, filling safe defaults", () => {
+  const { duplicateChatIds: _dupes, ...oldRow } = {
+    terminalId: "t", paneId: "p", name: null, title: null, kind: null, harness: null, provider: null, status: "idle", cwd: null,
+    paseoAgentId: "a", duplicateChatIds: ["x"], attachCommand: "herdr", attach: null, inputReady: null, canRestart: false,
+  };
+  const overview = herdrOverviewRpc.output.parse({
+    target: { socketPath: "/s", herdrSession: null, source: "default", autoStart: false, autoStartDisabledReason: null }, ompEnabled: true,
+    connection: { status: "connected", version: "0.9.3", autoStarted: false }, chatError: null,
+    workspaces: [{ workspaceId: "w", number: 1, label: "w", focused: true, cwd: null, status: "idle", tabs: [{ tabId: "t", number: 1, label: "t", focused: true, status: "idle", agents: [oldRow] }] }],
+  });
+  expect(overview.workspaces[0]!.tabs[0]!.agents[0]!.duplicateChatIds).toEqual([]);
+  const diagnostics = herdrDiagnosticsRpc.output.parse({
+    pluginVersion: "1", target: { socketPath: "/s", herdrSession: null, source: "default", autoStart: false }, ompEnabled: true,
+    herdr: { connected: true, version: "0.9.3", error: null }, companion: { state: "current" }, agents: [], counts: { agents: 0, inputReady: 0, readOnly: 0, unknown: 0 },
+  });
+  expect(diagnostics.herdr.autoStarted).toBe(false);
+});
+
 it("reports Herdr unavailable if it disconnects after readiness", async () => {
   seed();
   fake.replyError("agent.list", "unavailable", "Herdr disconnected");
@@ -234,6 +264,111 @@ it("two live chats on one terminal keep the newest as paseoAgentId and report th
   expect(row.paseoAgentId).toBe("newer");
   expect(row.duplicateChatIds).toEqual(["older"]);
   expect(herdrOverviewRpc.output.safeParse(result).success).toBe(true);
+});
+
+describe("herdr.duplicates.archive (server compare-and-archive)", () => {
+  const chats = () => [
+    chatWith("older", "omp", "t-p1", { updatedAt: "2026-10-13T09:00:00Z" }),
+    chatWith("oldest", "omp", "t-p1", { updatedAt: "2026-10-13T08:00:00Z" }),
+    chatWith("newer", "omp", "t-p1", { updatedAt: "2026-10-13T10:00:00Z" }),
+  ];
+  function paseoWith(entries: unknown[], failing: string[] = []) {
+    const archived: string[] = [];
+    const api = {
+      agents: {
+        list: async () => ({ entries: entries.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null, prevCursor: null } }),
+        ref: (id: string) => ({ archive: async () => { if (failing.includes(id)) throw new Error(`busy ${id}`); archived.push(id); } }),
+      },
+    };
+    return { api, archived };
+  }
+  const input = (over: object = {}) => ({ terminalId: "t-p1", paneId: "p1", ownerId: "newer", ids: ["older", "oldest"], ...over });
+
+  it("archives the shown duplicates while the owner is unchanged, and reports each failed archive", async () => {
+    seed();
+    const { call } = setup();
+    const ok = paseoWith(chats());
+    expect(await call(herdrDuplicatesArchiveRpc, input(), ok.api)).toEqual({ skip: null, archived: ["older", "oldest"], failures: [] });
+    expect(ok.archived).toEqual(["older", "oldest"]);
+    const partial = paseoWith(chats(), ["oldest"]);
+    expect(await call(herdrDuplicatesArchiveRpc, input(), partial.api)).toEqual({ skip: null, archived: ["older"], failures: [{ id: "oldest", error: "busy oldest" }] });
+  });
+
+  it("archives nothing when another chat became the owner since the list was shown, even though the shown ids are still duplicates", async () => {
+    seed();
+    const { call } = setup();
+    // `older` got a reply after the client's fresh check: it is now the newest, so the shown owner `newer` is a duplicate.
+    const entries = [chatWith("older", "omp", "t-p1", { updatedAt: "2026-10-13T11:00:00Z" }), chatWith("oldest", "omp", "t-p1", { updatedAt: "2026-10-13T08:00:00Z" }), chatWith("newer", "omp", "t-p1")];
+    const paseo = paseoWith(entries);
+    expect(await call(herdrDuplicatesArchiveRpc, input(), paseo.api)).toEqual({ skip: "owner-changed", archived: [], failures: [] });
+    expect(paseo.archived).toEqual([]);
+  });
+
+  it("archives only ids that are still duplicates of this terminal, never the owner or another terminal's chat", async () => {
+    seed();
+    const { call } = setup();
+    const paseo = paseoWith([...chats(), chatWith("other-terminal", "omp", "t-p2")]);
+    expect(await call(herdrDuplicatesArchiveRpc, input({ ids: ["older", "newer", "other-terminal", "gone"] }), paseo.api)).toEqual({ skip: null, archived: ["older"], failures: [] });
+    expect(await call(herdrDuplicatesArchiveRpc, input({ ids: ["newer", "gone"] }), paseo.api)).toEqual({ skip: "none-left", archived: [], failures: [] });
+    expect(paseo.archived).toEqual(["older"]);
+  });
+
+  it("never archives the owner even when the client sends its id, and a chat listed twice across pages is one chat", async () => {
+    seed();
+    const { call } = setup();
+    // `newer` appears on both pages, as when the list order shifts while paging; the older copy has a stale timestamp.
+    const pages = [[...chats().slice(0, 2), chatWith("newer", "omp", "t-p1", { updatedAt: "2026-10-13T07:00:00Z" })], [chats()[2]!]];
+    const archived: string[] = [];
+    const api = { agents: {
+      list: async (q: { page?: { cursor?: string } }) => {
+        const index = q.page?.cursor ? 1 : 0;
+        return { entries: pages[index]!.map((agent) => ({ agent })), pageInfo: { hasMore: index === 0, nextCursor: index === 0 ? "c1" : null, prevCursor: null } };
+      },
+      ref: (id: string) => ({ archive: async () => { archived.push(id); } }),
+    } };
+    expect(await call(herdrDuplicatesArchiveRpc, input({ ids: ["newer", "older", "oldest"] }), api)).toEqual({ skip: null, archived: ["older", "oldest"], failures: [] });
+    expect(archived).toEqual(["older", "oldest"]);
+    const deduped = await herdrChats({ agents: { ...api.agents, list: api.agents.list } } as never, [ompAdapter]);
+    expect(deduped.filter((chat) => chat.agentId === "newer")).toHaveLength(1);
+    expect(deduped.find((chat) => chat.agentId === "newer")!.lastActivityAt).toBe("2026-10-13T10:00:00Z");
+  });
+
+  it("turns a synchronous throw from ref() for one id into that id's failure while the others are archived", async () => {
+    seed();
+    const { call } = setup();
+    const archived: string[] = [];
+    const api = { agents: {
+      list: async () => ({ entries: chats().map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null, prevCursor: null } }),
+      ref: (id: string) => { if (id === "older") throw new Error("ref rejected older"); return { archive: async () => { archived.push(id); } }; },
+    } };
+    expect(await call(herdrDuplicatesArchiveRpc, input(), api)).toEqual({ skip: null, archived: ["oldest"], failures: [{ id: "older", error: "ref rejected older" }] });
+    expect(archived).toEqual(["oldest"]);
+  });
+
+  it("archives nothing when the pane is gone or is a different pane", async () => {
+    seed();
+    const { call } = setup();
+    const paseo = paseoWith(chats());
+    expect(await call(herdrDuplicatesArchiveRpc, input({ terminalId: "t-gone" }), paseo.api)).toMatchObject({ skip: "agent-gone" });
+    expect(await call(herdrDuplicatesArchiveRpc, input({ paneId: "p9" }), paseo.api)).toMatchObject({ skip: "agent-gone" });
+    expect(paseo.archived).toEqual([]);
+  });
+
+  it("fails closed with the real reason when Paseo's chat list is unavailable or Herdr isn't ready, and never lets Herdr be started", async () => {
+    seed();
+    const seen: boolean[] = [];
+    const { call } = setup({
+      readTarget: async () => ({ target: { ...target(fake.socketPath), autoStart: true }, ompEnabled: true }),
+      ensureReady: async (x) => { seen.push(x.autoStart); return { target: x, version: "0.9.3", autoStarted: false }; },
+    });
+    const paseo = paseoWith(chats());
+    const noList = { agents: { ...paseo.api.agents, list: async () => { throw new Error("boom"); } } };
+    await expect(call(herdrDuplicatesArchiveRpc, input(), noList)).rejects.toThrow(/Paseo's chat list is unavailable \(boom\)/);
+    const down = setup({ ensureReady: async () => { throw new Error("Herdr is not running"); } });
+    await expect(down.call(herdrDuplicatesArchiveRpc, input(), paseo.api)).rejects.toThrow("Herdr is not running");
+    expect(seen).toEqual([false]);
+    expect(paseo.archived).toEqual([]);
+  });
 });
 
 it("a saved fallback chat keeps its provider after the pane is detected as a specific kind", async () => {

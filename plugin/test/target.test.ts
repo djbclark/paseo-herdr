@@ -59,10 +59,37 @@ describe("TargetReadiness", () => {
     expect(spawnServer).toHaveBeenCalledWith("paseo", { HOME: "/h" });
     expect(ready.startedHere(named.socketPath)).toBe(true);
   });
+  it("forgets an earlier start when a later ping finds the endpoint absent, so autoStarted follows the current Herdr", async () => {
+    let phase: "start" | "down" | "shell" = "start";
+    const { ready } = rig(async (n) => {
+      if (phase === "start") { if (n < 2) throw errno("ENOENT"); return "0.9.4"; }
+      if (phase === "down") throw errno("ECONNREFUSED");
+      return "0.9.4";
+    });
+    const connectOnly = { ...named, autoStart: false, autoStartDisabledReason: "Auto-start is off for this target" };
+    await expect(ready.ensureReady(named)).resolves.toMatchObject({ autoStarted: true });
+    phase = "down";
+    await expect(ready.ensureReady(connectOnly)).rejects.toBeInstanceOf(TargetUnavailableError);
+    expect(ready.startedHere(named.socketPath)).toBe(false);
+    phase = "shell";
+    await expect(ready.ensureReady(connectOnly)).resolves.toMatchObject({ version: "0.9.4", autoStarted: false });
+  });
   it("coalesces concurrent calls into one start", async () => {
     const { ready, spawnServer } = rig(async (n) => { if (n < 3) throw errno("ECONNREFUSED"); return "0.9.3"; });
     await Promise.all([ready.ensureReady(named), ready.ensureReady(named), ready.ensureReady(named)]);
     expect(spawnServer).toHaveBeenCalledOnce();
+  });
+  it("keeps a no-start caller and an auto-start caller on the same socket in separate runs, in either order", async () => {
+    const connectOnly = { ...named, autoStart: false, autoStartDisabledReason: "This check never starts Herdr" };
+    for (const order of ["start-first", "check-first"] as const) {
+      const { ready, spawnServer } = rig(async (n) => { if (n < 3) throw errno("ENOENT"); return "0.9.3"; });
+      const calls = order === "start-first" ? [ready.ensureReady(named), ready.ensureReady(connectOnly)] : [ready.ensureReady(connectOnly), ready.ensureReady(named)];
+      const [start, check] = order === "start-first" ? await Promise.allSettled(calls) : (await Promise.allSettled(calls)).reverse();
+      expect(start).toMatchObject({ status: "fulfilled", value: { autoStarted: true } });
+      expect(check).toMatchObject({ status: "rejected" });
+      expect(String((check as PromiseRejectedResult).reason.message)).toContain("This check never starts Herdr");
+      expect(spawnServer).toHaveBeenCalledOnce();
+    }
   });
   it("never starts on permission, protocol or version errors", async () => {
     for (const error of [errno("EACCES"), new HerdrError("bad_request", "nope"), new Error("herdr request timed out")]) {

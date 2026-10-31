@@ -5,7 +5,7 @@ import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin
 
 // Derived from the SDK: Paseo's compiler can't resolve @getpaseo/client in an install without node_modules.
 type PaseoApi = PluginHandlerContext["paseo"];
-import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrDiagnosticsRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type CompanionStatus, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
+import { herdrAgentRestartRpc, herdrChatReadyRpc, herdrDiagnosticsRpc, herdrDuplicatesArchiveRpc, herdrFoldersSuggestRpc, herdrOverviewRpc, herdrTargetRpc, herdrWorkspaceCreateRpc, type CompanionStatus, type HerdrTarget, type FolderSuggestion, type OverviewAgent, type OverviewTab, type OverviewWorkspace } from "../shared/rpc.js";
 import { parseBinding, sameRef, sessionRefOf, type Binding } from "./binding.js";
 import { expandHome, suggestFolders } from "./folders.js";
 import { restartAgent } from "./restart.js";
@@ -102,7 +102,8 @@ export interface HerdrChat {
 
 /** Every unarchived Paseo chat owned by one of the registered harness providers. */
 export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAdapter[]): Promise<HerdrChat[]> {
-  const chats: HerdrChat[] = [];
+  // Keyed by agent id: a list whose order shifts between pages can return one chat twice; the newest copy wins.
+  const chats = new Map<string, HerdrChat>();
   const byProvider = new Map(harnesses.map((adapter) => [`herdr-${adapter.id}`, adapter]));
   let cursor: string | undefined;
   for (let page = 0; page < 50; page++) {
@@ -113,13 +114,15 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
       if (!adapter || !persistence) continue;
       try {
         const binding = parseBinding({ version: persistence.version, data: persistence.data as never }, adapter);
-        chats.push({
+        const chat: HerdrChat = {
           agentId: agent.id, herdrSession: binding.herdrSession, terminalId: binding.terminalId, harness: adapter.label,
           harnessId: adapter.id, sessionRef: binding.sessionRef,
           title: agent.title ?? null, cwd: agent.cwd,
           lastActivityAt: activityTime(agent.lastUserMessageAt, agent.updatedAt),
           ...(binding.occupant ? { occupant: { pid: binding.occupant.pid, tty: binding.occupant.tty } } : {}),
-        });
+        };
+        const seen = chats.get(chat.agentId);
+        if (!seen || timestamp(chat.lastActivityAt) > timestamp(seen.lastActivityAt)) chats.set(chat.agentId, chat);
       } catch {
         // Foreign or corrupt persistence: ignore.
       }
@@ -127,7 +130,7 @@ export async function herdrChats(paseo: PaseoApi, harnesses: readonly HarnessAda
     if (!result.pageInfo.hasMore || !result.pageInfo.nextCursor) break;
     cursor = result.pageInfo.nextCursor;
   }
-  return chats;
+  return [...chats.values()];
 }
 
 const chatKey = (herdrSession: string | null, terminalId: string) => `${herdrSession ?? ""}\0${terminalId}`;
@@ -305,12 +308,12 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
     return suggestFolders(query, home(), known);
   });
 
-  server.handle(herdrOverviewRpc, async (_input, { paseo }) => {
+  server.handle(herdrOverviewRpc, async ({ noAutoStart }, { paseo }) => {
     const { target, ompEnabled, enabled: enabledFor } = await deps.readTarget();
     const enabled = (adapterId: string) => enabledFor?.(adapterId) ?? true;
     const [chatResult, readyResult] = await Promise.allSettled([
       herdrChats(paseo, deps.harnesses),
-      deps.ensureReady(target),
+      deps.ensureReady(noAutoStart ? { ...target, autoStart: false, autoStartDisabledReason: "This check never starts Herdr" } : target),
     ]);
     const chats = chatResult.status === "fulfilled" ? chatResult.value : [];
     const chatError = chatResult.status === "rejected" ? errorMessage(chatResult.reason) : null;
@@ -411,6 +414,33 @@ export function registerManagementRpcs(server: Pick<PluginServerContext, "handle
       herdr = { ...herdr, error: errorMessage(error) };
     }
     return buildDiagnostics({ pluginVersion: PLUGIN_VERSION, target, ompEnabled, herdr, companion, agents });
+  });
+
+  server.handle(herdrDuplicatesArchiveRpc, async ({ terminalId, paneId, ownerId, ids }, { paseo }) => {
+    const { target } = await deps.readTarget();
+    // A button tap must not spawn Herdr: an unreachable Herdr fails the call with its real reason.
+    await deps.ensureReady({ ...target, autoStart: false, autoStartDisabledReason: "This check never starts Herdr" });
+    const socket = target.socketPath;
+    const agents = await listPaneTargets(targets(socket));
+    let chats: HerdrChat[];
+    try { chats = await herdrChats(paseo, deps.harnesses); }
+    catch (error) { throw new Error(`Paseo's chat list is unavailable (${errorMessage(error)}), so the chats can't be checked.`); }
+    const live = new Map(agents.map((candidate): [string, AgentInfo] => [candidate.terminal_id, candidate]));
+    const reconciled = reconcileChats(chats, live, target, resolver, await paneProcesses(chats, live, target, resolver, (method, params) => request(socket, method, params)));
+    if (live.get(terminalId)?.pane_id !== paneId) return { skip: "agent-gone" as const, archived: [], failures: [] };
+    const bound = reconciled.get(chatKey(target.herdrSession, terminalId));
+    if (bound?.owner.agentId !== ownerId) return { skip: "owner-changed" as const, archived: [], failures: [] };
+    const stillDuplicates = new Set(bound.duplicates.map((chat) => chat.agentId));
+    // Defence in depth: the owner is never a duplicate, whatever the chat list looked like.
+    const wanted = [...new Set(ids)].filter((id) => id !== ownerId && stillDuplicates.has(id));
+    if (wanted.length === 0) return { skip: "none-left" as const, archived: [], failures: [] };
+    // `async` turns a synchronous throw from ref()/archive() into that id's failure instead of rejecting the whole call.
+    const results = await Promise.allSettled(wanted.map(async (id) => paseo.agents.ref(id).archive()));
+    return {
+      skip: null,
+      archived: wanted.filter((_id, index) => results[index]!.status === "fulfilled"),
+      failures: results.flatMap((result, index) => (result.status === "rejected" ? [{ id: wanted[index]!, error: errorMessage(result.reason) }] : [])),
+    };
   });
 
   server.handle(herdrAgentRestartRpc, async ({ terminalId, paneId }, { paseo }) => {

@@ -15,14 +15,18 @@ export interface DiagnosticsInput {
 }
 
 /**
- * Replace each occurrence of the home directory with `~`, so a pasted report doesn't carry the user name.
+ * Replace each occurrence of the home directory with `~`, so a pasted report shows the home directory as `~`.
  * Only whole path segments match: `/Users/bobby` is not under `/Users/bob`, and `/mnt/Users/bob` isn't either.
+ * A path segment ends at `/`, whitespace, a quote, a closing bracket or one of `:;,|>`; a `.` ends it only at the
+ * end of the text or before whitespace (a sentence full stop), so `/Users/bob.old` stays a different directory.
+ * The match is case-sensitive (a case-insensitive one would redact a different directory on a case-sensitive
+ * volume), and it does not rewrite `file://` URLs or `/System/Volumes/Data/...` firmlink paths.
  */
 export function abbreviateHome(text: string, home: string): string {
   const root = home.replace(/\/+$/, "");
   if (root === "") return text;
   const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`(?<![\\w.\\-/])${escaped}(?=$|[/\\s'"\`:;,)\\]])`, "g"), "~");
+  return text.replace(new RegExp(`(?<![\\w.\\-/])${escaped}(?=$|[/\\s'"\`:;,|>)\\]}]|\\.(?:$|\\s))`, "g"), "~");
 }
 
 /**

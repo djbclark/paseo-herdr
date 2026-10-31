@@ -104,19 +104,27 @@ interface DuplicateRow {
 
 export type DuplicateArchivePlan =
   | { skip: null; archive: string[] }
+  | { skip: "herdr-unavailable" | "chats-unavailable"; archive: []; detail: string }
   | { skip: "agent-gone" | "owner-changed" | "none-left"; archive: [] };
+
+/** The part of a fresh `herdr.overview` answer the archive re-check reads. */
+interface FreshOverview {
+  connection: { status: "connected" } | { status: "unavailable"; error: string };
+  chatError: string | null;
+  workspaces: readonly { tabs: readonly { agents: readonly DuplicateRow[] }[] }[];
+}
 
 /**
  * Re-check an "Archive duplicate chats" tap against a fresh overview before archiving anything. Only ids
  * the user was shown AND the fresh row still lists as duplicates are archived, and only when the same
  * terminal and pane still has the same owner chat: if the owner changed (another chat became the newest)
- * the shown list may now contain the chat in use, so nothing is archived.
+ * the shown list may now contain the chat in use, so nothing is archived. A degraded overview (Herdr
+ * unreachable, or Paseo's chat list unavailable so every row looks chat-less) archives nothing and says why.
  */
-export function freshDuplicatesToArchive(
-  shown: DuplicateRow,
-  workspaces: readonly { tabs: readonly { agents: readonly DuplicateRow[] }[] }[],
-): DuplicateArchivePlan {
-  const fresh = workspaces
+export function freshDuplicatesToArchive(shown: DuplicateRow, overview: FreshOverview): DuplicateArchivePlan {
+  if (overview.connection.status === "unavailable") return { skip: "herdr-unavailable", archive: [], detail: overview.connection.error };
+  if (overview.chatError !== null) return { skip: "chats-unavailable", archive: [], detail: overview.chatError };
+  const fresh = overview.workspaces
     .flatMap((workspace) => workspace.tabs.flatMap((tab) => tab.agents))
     .find((agent) => agent.terminalId === shown.terminalId && agent.paneId === shown.paneId);
   if (!fresh) return { skip: "agent-gone", archive: [] };
@@ -127,8 +135,12 @@ export function freshDuplicatesToArchive(
 }
 
 /** Toast text when the re-check archived nothing. */
-export function duplicateArchiveSkippedMessage(skip: Exclude<DuplicateArchivePlan["skip"], null>): string {
-  switch (skip) {
+export function duplicateArchiveSkippedMessage(plan: Exclude<DuplicateArchivePlan, { skip: null }>): string {
+  switch (plan.skip) {
+    case "herdr-unavailable":
+      return `Nothing archived: Herdr couldn't be reached to check the chats (${plan.detail}).`;
+    case "chats-unavailable":
+      return `Nothing archived: Paseo's chat list is unavailable, so the chats can't be checked (${plan.detail}).`;
     case "agent-gone":
       return "Nothing archived: this agent is no longer listed.";
     case "owner-changed":
@@ -139,13 +151,12 @@ export function duplicateArchiveSkippedMessage(skip: Exclude<DuplicateArchivePla
 }
 
 /**
- * Toast text for a partly failed archive, with the first rejection's reason; null when every archive
- * worked (or none was tried).
+ * Toast text for a partly failed archive, with the first failure's reason; null when every archive
+ * worked (or none was tried). `total` is the number of chats the server tried to archive.
  */
-export function archiveFailureMessage(results: readonly PromiseSettledResult<unknown>[]): string | null {
-  const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-  if (rejected.length === 0) return null;
-  return `Couldn't archive ${rejected.length} of ${results.length} duplicate chats: ${errorMessage(rejected[0]!.reason)}`;
+export function archiveFailureMessage(total: number, failures: readonly { error: string }[]): string | null {
+  if (failures.length === 0) return null;
+  return `Couldn't archive ${failures.length} of ${total} duplicate chats: ${failures[0]!.error}`;
 }
 
 /** Button text for archiving `count` duplicate chats. */

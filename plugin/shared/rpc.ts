@@ -62,7 +62,7 @@ export const overviewAgentSchema = z.object({
    * Other live chats bound to the same terminal (F4): the newest chat owns the row, and the
    * client may archive these duplicates. The server never archives from a read RPC.
    */
-  duplicateChatIds: z.array(z.string()),
+  duplicateChatIds: z.array(z.string()).default([]),
   attachCommand: z.string(),
   /**
    * Runs the attach without a shell (absolute `herdr` path + args), for a Paseo terminal. Null when the
@@ -117,14 +117,23 @@ export const herdrTargetRpc = defineRpc({
 
 export const herdrOverviewRpc = defineRpc({
   name: "herdr.overview",
-  input: z.object({}),
+  input: z.object({
+    /**
+     * Check readiness without ever starting Herdr, whatever the target's auto-start says. The archive re-check
+     * sets it, so tapping a button can't spawn a server. A daemon that predates it ignores it and may start Herdr.
+     */
+    noAutoStart: z.boolean().optional(),
+  }),
   output: z.object({
     target: herdrTargetSchema,
     ompEnabled: z.boolean(),
     connection: connectionSchema,
     /**
      * OMP input companion install state; the client warns on anything but `current` while OMP is enabled.
-     * The server always sends it; it is optional so a client newer than the running daemon still shows the overview (without a banner).
+     * The server always sends it. The client parses every overview against this schema, so a field the running daemon
+     * lacks fails the whole call unless it is optional or defaulted. Only `companion` and each agent's `duplicateChatIds`
+     * are tolerant here (a daemon without them still shows the overview, without a banner or duplicate cleanup), and
+     * `herdr.autoStarted` in the diagnostics; any other newer required field still breaks a client against an older daemon.
      */
     companion: companionStatusSchema.optional(),
     /** Empty when the connection is unavailable. */
@@ -155,7 +164,7 @@ export const diagnosticsSchema = z.object({
     /** Herdr's version from its ping; null when it couldn't be reached. */
     version: z.string().nullable(),
     /** True when this plugin started Herdr (this report may be what started it, so `connected` is the state after that start); false when Herdr was already running or couldn't be reached. */
-    autoStarted: z.boolean(),
+    autoStarted: z.boolean().default(false),
     /** Why Herdr was unreachable or couldn't be listed (cut to 300 characters); null when fine. */
     error: z.string().nullable(),
   }),
@@ -192,6 +201,24 @@ export const herdrChatReadyRpc = defineRpc({
   name: "herdr.chat.ready",
   input: z.object({ terminalId: z.string() }),
   output: z.object({ flushed: z.number().int() }),
+});
+
+/**
+ * Archive the duplicate chats the user was shown for one terminal, after the server re-reads the owner chat
+ * (compare-and-archive): nothing is archived unless `ownerId` is still the terminal's owner, and only ids that are
+ * still its live duplicates are. Never starts Herdr. Archived chats stay restorable from Paseo's archive.
+ * The server's check and its archive calls are separate steps, so a reply that lands between them still wins.
+ */
+export const herdrDuplicatesArchiveRpc = defineRpc({
+  name: "herdr.duplicates.archive",
+  input: z.object({ terminalId: z.string(), paneId: z.string(), ownerId: z.string(), ids: z.array(z.string()) }),
+  output: z.object({
+    /** Why nothing was archived; null when the check passed (individual archives may still have failed). */
+    skip: z.enum(["agent-gone", "owner-changed", "none-left"]).nullable(),
+    archived: z.array(z.string()),
+    /** Reasons for the ids whose archive call rejected. */
+    failures: z.array(z.object({ id: z.string(), error: z.string() })),
+  }),
 });
 
 export const herdrWorkspaceCreateRpc = defineRpc({

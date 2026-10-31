@@ -92,8 +92,8 @@ const describe = (error: unknown) => (error instanceof HerdrError ? `${error.cod
 /**
  * Makes targets reachable. Ping first; start only when the endpoint is absent/unreachable (never on a
  * protocol/version/permission error) and only when `target.autoStart`. Concurrent calls for the same
- * socket path share one start. Readiness is bounded; failure throws `TargetUnavailableError`.
- * Remembers which socket paths it started so the UI can say so. Never stops Herdr.
+ * socket path and `autoStart` setting share one run. Readiness is bounded; failure throws `TargetUnavailableError`.
+ * Remembers which socket paths it started so the UI can say so, and forgets one when a ping finds the endpoint absent. Never stops Herdr.
  */
 export class TargetReadiness {
   private readonly started = new Set<string>();
@@ -102,10 +102,12 @@ export class TargetReadiness {
   constructor(private readonly deps: TargetReadinessDeps) {}
 
   ensureReady(target: HerdrTarget): Promise<ReadyTarget> {
-    const existing = this.inflight.get(target.socketPath);
+    // A no-start caller must never join an auto-start run (and get its no-start error back), nor the reverse.
+    const key = `${target.autoStart ? "start" : "check"}\0${target.socketPath}`;
+    const existing = this.inflight.get(key);
     if (existing) return existing;
-    const run = this.run(target).finally(() => this.inflight.delete(target.socketPath));
-    this.inflight.set(target.socketPath, run);
+    const run = this.run(target).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, run);
     return run;
   }
 
@@ -129,6 +131,9 @@ export class TargetReadiness {
     } catch (error) {
       if (error instanceof TargetUnavailableError) throw error;
       if (!isAbsent(error)) throw new TargetUnavailableError(`Herdr at ${target.socketPath} is not usable: ${describe(error)}`, target);
+      // The endpoint is gone, so any Herdr this process started earlier is dead: whatever answers next is not that one.
+      // A no-start check leaves that to the auto-start run in flight for this socket, which may have just spawned the Herdr about to answer.
+      if (target.autoStart || !this.inflight.has(`start\0${target.socketPath}`)) this.started.delete(target.socketPath);
       if (!target.autoStart || !target.herdrSession) {
         throw new TargetUnavailableError(`Herdr is not running at ${target.socketPath} (${describe(error)}). ${target.autoStartDisabledReason ?? "Auto-start is off for this target"}`, target);
       }
